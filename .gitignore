@@ -1,0 +1,24 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+.env
+.env.*
+.wrangler/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# Fonts (licensing not yet confirmed for redistribution — fetch at build/deploy time instead)
+assets/fonts/
+
+# OS
+.DS_Store

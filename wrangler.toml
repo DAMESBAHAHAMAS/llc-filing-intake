@@ -1,0 +1,14 @@
+name = "llc-worker"
+main = "llc-worker.js"
+compatibility_date = "2026-07-03"
+workers_dev = true
+# account_id = ""   # required if this Cloudflare login has access to more than one account
+
+# Secrets are NOT stored here. Set each of the following via the
+# Cloudflare dashboard or `wrangler secret put <NAME>` before deploying:
+#   ANTHROPIC_API_KEY
+#   RENDER_PROXY_URL
+#   ZOHO_CLIENT_ID
+#   ZOHO_CLIENT_SECRET
+#   ZOHO_REFRESH_TOKEN
+#   CLIQ_WEBHOOK_URL   (optional — safe no-op if unset)
