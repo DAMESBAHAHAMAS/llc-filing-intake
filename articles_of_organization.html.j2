@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Articles of Organization — {{ llc_name }}</title>
+<style>
+  @font-face {
+    font-family: "Oswald";
+    src: url("./assets/fonts/Oswald-Regular.ttf") format("truetype");
+    font-weight: 400;
+    font-style: normal;
+  }
+  @font-face {
+    font-family: "Oswald";
+    src: url("./assets/fonts/Oswald-SemiBold.ttf") format("truetype");
+    font-weight: 600;
+    font-style: normal;
+  }
+  @font-face {
+    font-family: "Roboto";
+    src: url("./assets/fonts/Roboto-Regular.ttf") format("truetype");
+    font-weight: 400;
+    font-style: normal;
+  }
+  @font-face {
+    font-family: "Roboto";
+    src: url("./assets/fonts/Roboto-Bold.ttf") format("truetype");
+    font-weight: 700;
+    font-style: normal;
+  }
+  @font-face {
+    font-family: "DM Mono";
+    src: url("./assets/fonts/DMMono-Regular.ttf") format("truetype");
+    font-weight: 400;
+    font-style: normal;
+  }
+  @font-face {
+    font-family: "DM Mono";
+    src: url("./assets/fonts/DMMono-Medium.ttf") format("truetype");
+    font-weight: 500;
+    font-style: normal;
+  }
+
+  @page {
+    size: 210mm 297mm;
+    margin: 25mm 20mm 20mm 20mm;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    font-family: "Roboto", sans-serif;
+    font-size: 10.5pt;
+    color: #113A57;
+    margin: 0;
+  }
+
+  p {
+    orphans: 3;
+    widows: 3;
+    line-height: 1.4;
+  }
+
+  .doc-header {
+    text-align: center;
+    margin-bottom: 18px;
+  }
+
+  .doc-header .seal {
+    width: 60px;
+    height: 60px;
+    margin-bottom: 8px;
+  }
+
+  .doc-header h1 {
+    font-family: "Oswald", sans-serif;
+    font-size: 16pt;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #113A57;
+    margin: 0 0 4px 0;
+  }
+
+  .doc-header .subheading {
+    font-family: "Roboto", sans-serif;
+    font-size: 10pt;
+    font-style: italic;
+    color: #0087D4;
+    margin: 0;
+  }
+
+  .article {
+    margin-top: 20px;
+  }
+
+  h2.article-heading {
+    font-family: "Oswald", sans-serif;
+    font-size: 13pt;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #113A57;
+    border-bottom: 1.5px solid #0087D4;
+    padding-bottom: 4px;
+    margin: 0 0 10px 0;
+    break-after: avoid;
+  }
+
+  .two-col {
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .two-col .col {
+    width: 48%;
+  }
+
+  .label {
+    font-family: "DM Mono", monospace;
+    font-size: 8pt;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: #0087D4;
+    margin: 0 0 2px 0;
+  }
+
+  .statutory {
+    margin-top: 10px;
+  }
+
+  table.authorized-persons {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 8px;
+  }
+
+  table.authorized-persons col.col-title {
+    width: 15%;
+  }
+
+  table.authorized-persons col.col-name {
+    width: 35%;
+  }
+
+  table.authorized-persons col.col-address {
+    width: 50%;
+  }
+
+  table.authorized-persons thead th {
+    font-family: "DM Mono", monospace;
+    font-size: 8pt;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    background: #113A57;
+    color: #FFFFFF;
+    padding: 6px 8px;
+    text-align: left;
+  }
+
+  table.authorized-persons tbody td {
+    font-family: "Roboto", sans-serif;
+    font-size: 10pt;
+    color: #113A57;
+    border-bottom: 1px solid rgba(17, 58, 87, 0.15);
+    padding: 6px 8px;
+  }
+
+  .table-key {
+    font-family: "DM Mono", monospace;
+    font-size: 8pt;
+    color: #113A57;
+    margin-top: 6px;
+  }
+
+  .attachment-notice {
+    font-style: italic;
+    color: #0087D4;
+    margin-top: 8px;
+  }
+
+  .provisions-block {
+    background: rgba(0, 135, 212, 0.06);
+    border-left: 3px solid #0087D4;
+    padding: 10px 12px;
+    margin-top: 8px;
+  }
+
+  .muted {
+    color: rgba(17, 58, 87, 0.55);
+  }
+
+  .signature-block {
+    border-top: 1px solid rgba(17, 58, 87, 0.3);
+    padding-top: 12px;
+    margin-top: 20px;
+  }
+
+  .signature-label {
+    font-family: "DM Mono", monospace;
+    font-size: 8pt;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: #113A57;
+    margin: 0 0 4px 0;
+  }
+
+  .zs-anchor {
+    font-size: 4pt;
+    color: rgba(255, 255, 255, 0.01);
+  }
+
+  .continuation {
+    page-break-before: always;
+  }
+
+  .continuation .subheading {
+    font-family: "Roboto", sans-serif;
+    font-size: 10pt;
+    font-style: italic;
+    color: #0087D4;
+    margin: 0 0 10px 0;
+  }
+</style>
+</head>
+<body>
+
+<header class="doc-header">
+  <img src="./assets/florida_seal.png" alt="Florida Department of State Seal" class="seal">
+  <h1>Articles of Organization for Florida Limited Liability Company</h1>
+  <p class="subheading">Pursuant to Chapter 605, Florida Statutes</p>
+</header>
+
+<section class="article" id="article-i">
+  <h2 class="article-heading">Article I — Name</h2>
+  <!-- llc_name must contain LLC, L.L.C., or Limited Liability Company — enforced at intake, not here. -->
+  <p>The name of the Limited Liability Company is: {{ llc_name }}</p>
+</section>
+
+<section class="article" id="article-ii">
+  <h2 class="article-heading">Article II — Address</h2>
+  <div class="two-col">
+    <div class="col">
+      <p class="label">Principal Office Address</p>
+      <p>{{ principal_address }}</p>
+    </div>
+    <div class="col">
+      <p class="label">Mailing Address</p>
+      <p>{{ mailing_address }}</p>
+    </div>
+  </div>
+</section>
+
+<section class="article" id="article-iii">
+  <h2 class="article-heading">Article III — Registered Agent</h2>
+  <p>{{ registered_agent_name }}</p>
+  <p>{{ registered_agent_florida_address }}</p>
+  <p class="statutory">Having been named as registered agent and to accept service of process for the above stated limited liability company at the place designated in this certificate, I hereby accept the appointment as registered agent and agree to act in this capacity. I further agree to comply with the provisions of all statutes relating to the proper and complete performance of my duties, and I am familiar with and accept the obligations of my position as registered agent as provided for in Chapter 605, F.S.</p>
+
+  <div class="signature-block">
+    <p class="signature-label">Registered Agent's Signature (REQUIRED)</p>
+    {# Zoho Sign text-tag anchors must render as literal braces in the output HTML for Zoho Sign's text scanner — not resolved as Jinja variables #}
+    <span class="zs-anchor">{{ '{{zs_agent_signature}}' }}</span>
+    <span class="zs-anchor">{{ '{{zs_agent_printed_name}}' }}</span>
+  </div>
+</section>
+
+<section class="article" id="article-iv">
+  <h2 class="article-heading">Article IV — Authorized Persons</h2>
+  <table class="authorized-persons">
+    <colgroup>
+      <col class="col-title">
+      <col class="col-name">
+      <col class="col-address">
+    </colgroup>
+    <thead>
+      <tr>
+        <th>Title</th>
+        <th>Name</th>
+        <th>Address</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for person in authorized_persons[:4] %}
+      <tr>
+        <td>{{ person.article_iv_title }}</td>
+        <td>{{ person.name }}</td>
+        <td>{{ person.address }}</td>
+      </tr>
+      {% endfor %}
+      {% if authorized_persons|length < 4 %}
+        {% for i in range(4 - authorized_persons|length) %}
+        <tr>
+          <td>&nbsp;</td>
+          <td>&nbsp;</td>
+          <td>&nbsp;</td>
+        </tr>
+        {% endfor %}
+      {% endif %}
+    </tbody>
+  </table>
+  <p class="table-key">"AMBR" = Authorized Member | "MGR" = Manager</p>
+  {% if authorized_persons|length > 4 %}
+  <p class="attachment-notice">Additional authorized persons are listed on the attached continuation page. See Article IV — Continued (Attachment).</p>
+  {% endif %}
+</section>
+
+{% if authorized_persons|length > 4 %}
+<section class="article continuation" id="article-iv-continued">
+  <h2 class="article-heading">Article IV — Continued (Attachment)</h2>
+  <p class="subheading">Continuation of Article IV for {{ llc_name }}</p>
+  <table class="authorized-persons">
+    <colgroup>
+      <col class="col-title">
+      <col class="col-name">
+      <col class="col-address">
+    </colgroup>
+    <thead>
+      <tr>
+        <th>Title</th>
+        <th>Name</th>
+        <th>Address</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for person in authorized_persons[4:] %}
+      <tr>
+        <td>{{ person.article_iv_title }}</td>
+        <td>{{ person.name }}</td>
+        <td>{{ person.address }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+<section class="article" id="article-v">
+  <h2 class="article-heading">Article V — Effective Date</h2>
+  {% if effective_date_option == "Immediate" %}
+  <p>The Limited Liability Company's existence shall be effective upon the date of filing.</p>
+  {% elif effective_date_option in ("Future", "Backdated") %}
+  <p>Effective date: {{ effective_date }}</p>
+  <p>Your first Annual Report will be due by {{ annual_report_due_date }}.</p>
+  {% endif %}
+</section>
+
+<section class="article" id="article-vi">
+  <h2 class="article-heading">Article VI — Other Provisions</h2>
+  {% if other_provisions %}
+  <div class="provisions-block">
+    <p>{{ other_provisions }}</p>
+  </div>
+  {% else %}
+  <p class="muted">No other provisions.</p>
+  {% endif %}
+</section>
+
+<section class="article" id="required-signature">
+  <h2 class="article-heading">Signature</h2>
+  <p class="statutory">This document is executed in accordance with section 605.0203(1)(b), Florida Statutes. I am aware that any false information submitted in a document to the Department of State constitutes a third degree felony as provided for in s.817.155, F.S.</p>
+
+  <div class="signature-block">
+    <p class="signature-label">Signature of Authorized Person / Authorized Representative</p>
+    {# Zoho Sign text-tag anchors must render as literal braces in the output HTML for Zoho Sign's text scanner — not resolved as Jinja variables #}
+    <span class="zs-anchor">{{ '{{zs_authorized_signature}}' }}</span>
+    <span class="zs-anchor">{{ '{{zs_authorized_printed_name}}' }}</span>
+    <span class="zs-anchor">{{ '{{zs_date_signed}}' }}</span>
+  </div>
+</section>
+
+</body>
+</html>
