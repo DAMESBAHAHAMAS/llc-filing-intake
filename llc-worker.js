@@ -16,12 +16,22 @@
  *   is left unset — this is intentional so this file can be
  *   deployed today and the webhook wired in later.
  *
+ * UPDATED 2026-07-10:
+ * - Added scheduled() + keepRenderWarm() — a cron trigger
+ *   (every 10 minutes, see wrangler.toml) that GETs /health on
+ *   both Render free-tier services this project depends on
+ *   (llc-pdf-generator, sunbiz-proxy) so they never cold-start
+ *   mid-request. Additive only; does not touch any HTTP route.
+ *
  * ROUTES
  * GET  /health          → Health check
  * POST /check           → LLC name check (Sunbiz + Claude AI)
  * POST /lead            → Name check lead capture → Zoho CRM
  * POST /guide-lead      → Formation Guide lead → Zoho CRM
  * POST /intake          → LLC intake form → Zoho CRM Contact + Deal
+ *
+ * CRON
+ * Every 10 minutes       → keepRenderWarm() — Render keep-alive
  *
  * ENVIRONMENT VARIABLES (set in Cloudflare dashboard)
  * ANTHROPIC_API_KEY
@@ -525,10 +535,49 @@ async function handleIntake(request, env) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// RENDER KEEP-ALIVE
+// Pings Render free-tier services every 10 minutes so they
+// never spin down. See MASTER_PROJECT_RULES.md.
+// Additive only — does not touch existing routes.
+// ─────────────────────────────────────────────────────────────
+
+const RENDER_TARGETS = [
+  "https://llc-pdf-generator.onrender.com/health",
+  "https://sunbiz-proxy.onrender.com/health",
+];
+
+async function keepRenderWarm() {
+  const results = await Promise.allSettled(
+    RENDER_TARGETS.map(async (url) => {
+      const started = Date.now();
+      const res = await fetch(url, {
+        method: "GET",
+        headers: { "User-Agent": "llc-worker-keepalive" },
+      });
+      return { url, status: res.status, ms: Date.now() - started };
+    })
+  );
+
+  for (const r of results) {
+    if (r.status === "fulfilled") {
+      console.log(
+        `keep-alive OK: ${r.value.url} → ${r.value.status} in ${r.value.ms}ms`
+      );
+    } else {
+      console.log(`keep-alive FAILED: ${r.reason}`);
+    }
+  }
+}
+
 /* ══════════════════════════════════════════════════════════
    MAIN FETCH HANDLER (unchanged)
 ══════════════════════════════════════════════════════════ */
 export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(keepRenderWarm());
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;

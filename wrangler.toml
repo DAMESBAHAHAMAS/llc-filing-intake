@@ -2,12 +2,28 @@ name = "llc-worker"
 main = "llc-worker.js"
 compatibility_date = "2026-07-03"
 workers_dev = true
+preview_urls = false
 # account_id = ""   # required if this Cloudflare login has access to more than one account
 
-# Secrets are NOT stored here. Set each of the following via the
+[triggers]
+crons = ["*/10 * * * *"]
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+
+# Restored 2026-07-10: this was already live on the dashboard as a plain
+# (non-secret) environment variable — the previous wrangler.toml didn't
+# mirror it, so the first deploy from this file nearly wiped it. Keep this
+# in sync with the dashboard going forward.
+[vars]
+RENDER_PROXY_URL = "https://sunbiz-proxy.onrender.com/api/sunbiz/check"
+
+# True secrets are NOT stored here. Set each of the following via the
 # Cloudflare dashboard or `wrangler secret put <NAME>` before deploying:
 #   ANTHROPIC_API_KEY
-#   RENDER_PROXY_URL
 #   ZOHO_CLIENT_ID
 #   ZOHO_CLIENT_SECRET
 #   ZOHO_REFRESH_TOKEN
