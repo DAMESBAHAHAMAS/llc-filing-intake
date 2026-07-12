@@ -237,18 +237,42 @@ Return ONLY the JSON object. No explanation. No markdown.`;
 /* ══════════════════════════════════════════════════════════
    ROUTE: POST /lead
    Name Check Lead Capture → Zoho CRM Lead
-   (unchanged)
+
+   Accepts the "name_review_action" event schema. Only `email` is
+   required — every other field is optional and is simply omitted
+   from the Zoho Description when absent. A missing analytics field
+   must never cause a lead to be rejected.
 ══════════════════════════════════════════════════════════ */
 async function handleLead(request, env) {
   const body = await request.json();
-  const { email, name, searched_name, risk_level, verdict } = body;
+  const {
+    email, lead_source, searched_name, backup_name,
+    review_result, recommendation_level, similar_entities_count,
+    entities_summary, action_type, session_id, visitor_id,
+  } = body;
 
   if (!email) {
     return errorJson("Email is required", 400);
   }
 
-  const [firstName, ...lastParts] = (name || "").split(" ");
-  const lastName = lastParts.join(" ") || "";
+  const received_at = new Date().toISOString(); // server-stamped — never trust a client clock
+
+  const nameReviewNote = recommendation_level && recommendation_level !== "name_available"
+    ? "Similar names are common and do not mean your name will be rejected. Florida requires your name to be distinguishable — our review confirms this before filing."
+    : "";
+
+  const description = [
+    action_type ? `[${action_type}]` : null,
+    `Searched: ${searched_name || ""}`,
+    backup_name ? `Backup: ${backup_name}` : null,
+    `Result: ${review_result || ""} (${recommendation_level || ""})`,
+    typeof similar_entities_count === "number" ? `Similar entities: ${similar_entities_count}` : null,
+    entities_summary ? `Details: ${entities_summary}` : null,
+    nameReviewNote || null,
+    session_id ? `Session: ${session_id}` : null,
+    visitor_id ? `Visitor: ${visitor_id}` : null,
+    `Received: ${received_at}`,
+  ].filter(Boolean).join(" | ");
 
   try {
     const token = await getZohoAccessToken(env);
@@ -264,11 +288,11 @@ async function handleLead(request, env) {
         body: JSON.stringify({
           data: [
             {
-              First_Name: firstName || "",
-              Last_Name: lastName || email.split("@")[0],
+              First_Name: "",
+              Last_Name: email.split("@")[0],
               Email: email,
-              Lead_Source: "LLC Name Check",
-              Description: `Searched: ${searched_name || ""} | Risk: ${risk_level || ""} | ${verdict || ""}`,
+              Lead_Source: lead_source || "LLC Name Check",
+              Description: description,
             },
           ],
         }),
@@ -448,8 +472,8 @@ async function handleIntake(request, env) {
               Mobile: body.phone || "",
 
               /* LLC fields */
-              Account_Name: body.llc_name.trim(),
-              Title: "LLC Member",
+              Account_Name: { name: body.llc_name.trim() },
+              Owners_Job_Title: "LLC Member",
 
               /* Address — uses principal if mailing_same is true */
               Mailing_Street: body.mailing_same
@@ -497,7 +521,7 @@ async function handleIntake(request, env) {
       Stage: "Intake Received",
       Amount: packageAmounts[pkg] || 0,
       Lead_Source: "LLC Intake Form",
-      Account_Name: body.llc_name.trim(),
+      Account_Name: { name: body.llc_name.trim() },
       Description: summary,
       Closing_Date: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
         .toISOString()
@@ -507,6 +531,8 @@ async function handleIntake(request, env) {
     if (contactId) {
       dealBody.Contact_Name = { id: contactId };
     }
+
+    dealBody.Manual_Review_Required = Boolean(body.manual_review_required);
 
     const dealRes = await fetch(
       "https://www.zohoapis.com/crm/v2/Deals",
