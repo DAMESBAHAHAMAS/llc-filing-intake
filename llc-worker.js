@@ -411,8 +411,13 @@ async function handleIntake(request, env) {
               First_Name: body.first_name ? body.first_name.trim() : "",
               Last_Name: body.last_name ? body.last_name.trim() : "Unknown",
               Email: body.email.trim(),
-              Phone: body.phone || "",
+              // Numbers collected here are personal/individual contact
+              // numbers, not business or office lines — default to Mobile.
+              // Populate Phone only when a number is explicitly identified
+              // as a business/office number (no such signal exists in this
+              // payload today).
               Mobile: body.phone || "",
+              Company_Name: body.llc_name ? body.llc_name.trim() : "",
               Lead_Source: "LLC Intake Form (In Progress)",
               Description: `In-progress intake. Working name: ${body.llc_name || "not yet entered"}`,
             },
@@ -468,11 +473,13 @@ async function handleIntake(request, env) {
               First_Name: body.first_name ? body.first_name.trim() : "",
               Last_Name: body.last_name ? body.last_name.trim() : "Unknown",
               Email: body.email ? body.email.trim() : "",
-              Phone: body.phone || "",
+              // See intake_partial branch above for why Phone is omitted
+              // and Mobile is the sole destination for this number today.
               Mobile: body.phone || "",
 
               /* LLC fields */
               Account_Name: { name: body.llc_name.trim() },
+              Company_Name: body.llc_name.trim(),
               Owners_Job_Title: "LLC Member",
 
               /* Address — uses principal if mailing_same is true */
