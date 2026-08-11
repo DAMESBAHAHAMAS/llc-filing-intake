@@ -1,0 +1,4 @@
+Gate 1 (skeleton deploy) intentionally ships with zero migration files.
+The business schema (filing_sessions, filing_events, crm_sync_queue) is
+added in the next phase, after Supabase connectivity is proven live via
+GET /health. See DEPLOY.md.
