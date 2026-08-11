@@ -4,17 +4,26 @@ Gate 1 scope: connectivity skeleton only — Express, a `pg` pool (max 5), and
 `GET /health`. No business schema yet (see `migrations/.gitkeep`). This
 doc covers deploying exactly that. It will grow as later phases land.
 
-## 1. Get the Supabase connection string
+## 1. Get the Supabase connection string — SESSION POOLER, not direct, not transaction
 
-Supabase dashboard → your project (`cedwebrzbpjwusbshdiu`) → **Project
-Settings → Database → Connection string**. Use the **direct connection**
-(port 5432), not the pooled/PgBouncer URI (port 6543) — this service
-manages its own small pool (`max: 5`) and direct is the right mode for
-that at this scale. It looks like:
+Supabase dashboard → your project → **Project Settings → Database →
+Connection string**. Supabase offers three modes; this service requires
+the **session pooler**, specifically:
 
 ```
-postgres://postgres:[YOUR-PASSWORD]@db.cedwebrzbpjwusbshdiu.supabase.co:5432/postgres
+postgres://postgres.<project-ref>:[YOUR-PASSWORD]@aws-<region>.pooler.supabase.com:5432/postgres
 ```
+
+| Mode | Host / port | Use it? |
+|---|---|---|
+| **Session pooler** | `aws-<region>.pooler.supabase.com:5432` | ✅ **Use this one** |
+| Direct connection | `db.<project-ref>.supabase.co:5432` | ❌ No — IPv6-only, unreliable from hosted runtimes like Render |
+| Transaction pooler | `aws-<region>.pooler.supabase.com:6543` | ❌ No — disables prepared statements and session state, which will break `SELECT ... FOR UPDATE SKIP LOCKED` job-claiming in the sync worker (added in a later phase) and this project's own migration-locking |
+
+Get the port and host right — 5432 on the *pooler* hostname, not 5432 on
+the *direct* hostname and not 6543 on the pooler hostname. All three are
+easy to mix up because two of them share a port number and two of them
+share a hostname.
 
 If the project shows as **paused** in the dashboard, click **Resume**
 before doing anything below — a paused project fails connections with a
@@ -71,7 +80,7 @@ repo root and create a service named `llc-data-spine` with root directory
 
 | Key | Value |
 |---|---|
-| `DATABASE_URL` | The connection string from step 1 (same one, direct/5432) |
+| `DATABASE_URL` | The connection string from step 1 (session pooler, port 5432 on the pooler host) |
 | `PORT` | Leave unset — Render injects this automatically |
 | `PGSSL_DISABLE` | Leave unset |
 
@@ -83,8 +92,17 @@ directly into the Render dashboard's environment variable UI.
 Once deployed, `curl -s https://<your-service>.onrender.com/health`
 should return the same `db: "connected"` shape as step 2. If it instead
 shows `db: "error"`, check (in order): Supabase project not paused →
-`DATABASE_URL` set correctly on the Render service → Supabase's own
-dashboard for any active incident.
+`DATABASE_URL` set correctly on the Render service, **using the session
+pooler host/port from step 1** (a direct or transaction-pooler string
+pasted in here will misbehave in ways that look like a code bug) →
+Supabase's own dashboard for any active incident.
+
+`GET /ready` returns the same DB check but as a real HTTP status (503
+when `db: "error"`, 200 when connected) — `/health` deliberately always
+returns 200 so Render's health check doesn't restart the service over a
+transient DB blip. Use `/ready` for your own manual verification and for
+anything (like the future sync worker) that needs to gate on the DB
+actually being reachable.
 
 ---
 
