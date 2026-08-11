@@ -27,6 +27,7 @@
  * GET  /health          → Health check
  * POST /check           → LLC name check (Sunbiz + Claude AI)
  * POST /lead            → Name check lead capture → Zoho CRM
+ * POST /contact         → Contact page form → Zoho CRM Lead
  * POST /guide-lead      → Formation Guide lead → Zoho CRM
  * POST /intake          → LLC intake form → Zoho CRM Contact + Deal
  *
@@ -292,6 +293,66 @@ async function handleLead(request, env) {
               Last_Name: email.split("@")[0],
               Email: email,
               Lead_Source: lead_source || "LLC Name Check",
+              Description: description,
+            },
+          ],
+        }),
+      }
+    );
+
+    const crmData = await crmRes.json();
+    return json({ success: true, crm: crmData });
+  } catch (err) {
+    return errorJson("CRM write failed: " + err.message);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════
+   ROUTE: POST /contact
+   Contact Page Form → Zoho CRM Lead
+
+   Mirrors /lead's pattern. Only `email` is required — every
+   other field is optional and is simply omitted from the Zoho
+   Description when absent. A missing field must never cause a
+   contact submission to be rejected.
+══════════════════════════════════════════════════════════ */
+async function handleContact(request, env) {
+  const body = await request.json();
+  const { first_name, last_name, email, phone, topic, page_url } = body;
+
+  if (!email) {
+    return errorJson("Email is required", 400);
+  }
+
+  const received_at = new Date().toISOString(); // server-stamped — never trust a client clock
+
+  const description = [
+    topic ? `Topic: ${topic}` : null,
+    phone ? `Phone: ${phone}` : null,
+    page_url ? `Submitted from: ${page_url}` : null,
+    `Received: ${received_at}`,
+  ]
+    .filter(Boolean)
+    .join(" | ");
+
+  try {
+    const token = await getZohoAccessToken(env);
+
+    const crmRes = await fetch(
+      "https://www.zohoapis.com/crm/v2/Leads",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Zoho-oauthtoken ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          data: [
+            {
+              First_Name: first_name ? first_name.trim() : "",
+              Last_Name: last_name ? last_name.trim() : email.split("@")[0],
+              Email: email,
+              Lead_Source: "Contact Form",
               Description: description,
             },
           ],
@@ -626,7 +687,7 @@ export default {
       return json({
         status: "ok",
         service: "llc-worker",
-        routes: ["/health", "/check", "/lead", "/guide-lead", "/intake"],
+        routes: ["/health", "/check", "/lead", "/contact", "/guide-lead", "/intake"],
       });
     }
 
@@ -638,6 +699,11 @@ export default {
     /* Route: Name check lead */
     if (path === "/lead" && method === "POST") {
       return handleLead(request, env);
+    }
+
+    /* Route: Contact page form */
+    if (path === "/contact" && method === "POST") {
+      return handleContact(request, env);
     }
 
     /* Route: Formation guide lead */
