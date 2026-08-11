@@ -67,11 +67,12 @@ tracks:
   position stopped implying priority once the register went live — read the
   Severity/Blocks columns for that.
 - **`llc-filing-intake/DECISIONS.md`** (this repo) — architecture and
-  process decisions for the data-spine build and beyond. Schema: `# | Date |
-  Decision | Context / Reason | Supersedes`. **Immutable:** every field,
-  once published. A reversed or changed decision is a **new, appended**
-  entry whose `Supersedes` column names the entry it replaces — the
-  original stays exactly as written.
+  process decisions for the data-spine build and beyond. Format: one `##
+  <date> — <decision>` heading per entry, with **Rationale** and
+  **Supersedes** fields underneath. **Immutable:** every entry, once
+  published. A reversed or changed decision is a **new, appended** entry
+  whose **Supersedes** field names the entry it replaces — the original
+  stays exactly as written.
 
 **Re-verification trigger:** in any session where `main` has moved since the
 last one, re-verify every OPEN P0/P1 row in `GAPS.md` against the current
