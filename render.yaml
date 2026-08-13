@@ -1,0 +1,28 @@
+# Render Blueprint for the NEW data-spine service only.
+#
+# The existing PDF service (render_pdf.py / Flask+gunicorn) was created
+# manually in the Render dashboard before this file existed and is
+# intentionally NOT declared here — adding it retroactively risks Render's
+# Blueprint sync trying to adopt/relink a service it didn't create. Leave
+# it as a separately-managed dashboard service.
+#
+# If Render's Blueprint deploy (New > Blueprint, point at this repo) picks
+# this up cleanly, use it. If it doesn't fit your Render account/plan
+# setup, DEPLOY.md documents the equivalent manual dashboard settings.
+
+services:
+  - type: web
+    name: llc-data-spine
+    runtime: node
+    plan: starter
+    rootDir: server
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: PORT
+        value: 3000
+      - key: PGSSL_DISABLE
+        sync: false

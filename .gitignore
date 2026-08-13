@@ -6,7 +6,9 @@ yarn-error.log*
 .npm/
 .env
 .env.*
+!.env.example
 .wrangler/
+dist/
 
 # Python
 __pycache__/
