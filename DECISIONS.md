@@ -290,3 +290,22 @@ accumulate.
 **Supersedes:** the original table-format `DECISIONS.md` (same 16 decisions
 carried forward here, content-preserved, reformatted only — see this repo's
 git history, commit `b358b80`, for the original table version).
+
+---
+
+## 2026-08-13 — Render service deploys on Starter ($7/month), always-on, from the start — not free tier
+
+**Rationale:** decided ahead of the original "free tier now, upgrade before
+Stripe" plan. Deploying always-on from day one avoids the spin-down risk
+entirely rather than accepting it temporarily and remembering to upgrade
+later. `render.yaml` (`plan: free` → `plan: starter`) and `DEPLOY.md`'s
+service-settings table and "before Stripe goes live" section updated to
+match — the free-tier spin-down caveats there no longer apply. The Cron Job
+sweeper backstop and poller-interval-tuning items from that section remain
+valid regardless of plan tier (an always-on plan doesn't guarantee zero
+restarts) and were kept, reframed as general hardening rather than a
+tier-upgrade migration step.
+
+**Supersedes:** the 2026-08-11 entry above ("Render service starts on the
+free tier now; upgrade to a paid Starter (always-on) instance before Stripe
+goes live") — that entry stays exactly as written; this is the update.
