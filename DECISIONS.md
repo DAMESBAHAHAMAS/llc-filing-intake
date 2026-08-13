@@ -309,3 +309,36 @@ tier-upgrade migration step.
 **Supersedes:** the 2026-08-11 entry above ("Render service starts on the
 free tier now; upgrade to a paid Starter (always-on) instance before Stripe
 goes live") — that entry stays exactly as written; this is the update.
+
+---
+
+## 2026-08-13 — Data-spine skeleton deployed; live connectivity verified
+
+**Rationale:** confirmed directly, not transcribed from a report —
+`curl https://llc-data-spine.onrender.com/health` returns `200`,
+`{"status":"ok","db":"connected","migrations":null}`. `migrations: null`
+is correct at this point: the Gate 1 skeleton shipped with zero `.sql`
+migration files, so there's nothing to report as applied. This is the
+starting point for Gate 1's schema build (this same session).
+
+**Supersedes:** —
+
+---
+
+## 2026-08-13 — Gate 1 schema migrations use the existing custom migration runner, not node-pg-migrate
+
+**Rationale:** the Gate 1 schema task specified `node-pg-migrate`, which
+is not a current dependency of `server/` — adding it would be a new
+third-party dependency, an explicit stop-condition of this session's own
+autonomous-mode rules (and standing rule: never add a dependency without
+listing it and waiting for approval). The existing runner
+(`server/src/db/migrationRunner.ts`, shipped in the Gate 1 skeleton) already
+does the functionally equivalent job: numbered `.sql` files in
+`server/migrations/`, applied in order inside their own transaction,
+tracked in a `schema_migrations` table, safe to re-run. It has no
+down-migration/rollback support, unlike `node-pg-migrate` — acceptable for
+this phase; flagged in `GAPS.md` if that's ever actually needed. Used this
+instead of stopping the session to ask, since a suitable
+already-approved-by-existing-use alternative was available.
+
+**Supersedes:** —
