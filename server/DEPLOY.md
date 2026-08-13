@@ -74,7 +74,7 @@ repo root and create a service named `llc-data-spine` with root directory
 | Build Command | `npm install && npm run build` |
 | Start Command | `npm start` |
 | Health Check Path | `/health` |
-| Plan | Free (see §5 before this goes live with real customers) |
+| Plan | Starter ($7/month), always-on — not Free. Decided 2026-08-12, see DECISIONS.md. |
 
 ## 4. Set environment variables on the Render service
 
@@ -106,22 +106,23 @@ actually being reachable.
 
 ---
 
-## Before Stripe goes live — do not skip this
+## Sync-worker hardening — before Stripe goes live
 
-The free Render plan spins the service down after inactivity. The
-in-process poller that will retry queued CRM syncs (added in a later
-phase) stops running while the service is asleep, so a failed sync can
-sit queued until the next inbound request wakes the service back up.
-That's acceptable during development with no real customers. It is
-**not** acceptable once Stripe payments are live — a stuck sync at that
-point means a paying customer's CRM record silently lags.
+This service deploys on Render's **Starter plan (always-on, no
+spin-down)** from the start — decided 2026-08-12, see DECISIONS.md. The
+free-tier spin-down risk this section originally warned about (the
+in-process poller that will retry queued CRM syncs going to sleep with
+the service, letting a failed sync sit stuck until the next inbound
+request) does not apply here.
 
-Before accepting real payments:
-1. Upgrade this Render service to a paid, always-on instance plan.
-2. Add a Render **Cron Job** (separate from this web service) that hits
+Two items remain worth doing before accepting real payments, regardless
+of plan tier — an always-on plan doesn't guarantee zero restarts, and
+a stuck sync once Stripe is live means a paying customer's CRM record
+silently lags:
+1. Add a Render **Cron Job** (separate from this web service) that hits
    an endpoint to sweep and retry any `crm_sync_queue` rows stuck beyond
    a threshold — a backstop independent of the in-process poller, for
-   the case where the always-on instance still restarts/redeploys mid-cycle.
-3. Confirm the poller interval env var (added when the sync worker
+   the case where the service still restarts or redeploys mid-cycle.
+2. Confirm the poller interval env var (added when the sync worker
    ships) is tuned appropriately for production, not left at a
    development-friendly default.
