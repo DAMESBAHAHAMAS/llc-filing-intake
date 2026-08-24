@@ -93,6 +93,7 @@ export const realZohoClient: ZohoClient = {
               Phone: snapshot.phone ?? undefined,
               Company: snapshot.entity_name_primary ?? undefined,
               Lead_Source: "Data Spine — session_sync",
+              filing_session_id: (snapshot.filing_session_id as string | undefined) ?? undefined,
             },
           ],
           duplicate_check_fields: ["Email"],
