@@ -2,14 +2,35 @@ import "dotenv/config";
 import express from "express";
 import { healthRouter } from "./routes/health.js";
 import { sessionRouter } from "./routes/session.js";
+import { checkoutRouter } from "./routes/checkout.js";
+import { stripeWebhookRouter } from "./routes/webhooksStripe.js";
+import { registeredAgentRouter } from "./routes/registeredAgent.js";
+import { nameCheckRouter } from "./routes/nameCheck.js";
+import { einExpressRouter } from "./routes/einExpress.js";
 import { pool } from "./db/pool.js";
 import { realZohoClient } from "./zoho/client.js";
 import { runOnce } from "./sync/worker.js";
+import { runOnce as runFulfillmentOnce } from "./fulfillment/fulfillmentWorker.js";
 
 const app = express();
+
+// Stripe webhook signature verification needs the RAW request bytes.
+// express.raw() is scoped by PATH to only this route (not app-wide) —
+// otherwise it would consume the body stream for every other JSON route
+// too, leaving express.json() below nothing to parse. This MUST still
+// come before the global express.json() (frozen rule: raw-body
+// middleware only on the webhook route, JSON everywhere else). For any
+// path other than /api/webhooks/stripe this layer is a no-op passthrough.
+app.use("/api/webhooks/stripe", express.raw({ type: "application/json" }));
+app.use(stripeWebhookRouter);
+
 app.use(express.json());
 app.use(healthRouter);
 app.use(sessionRouter);
+app.use(checkoutRouter);
+app.use(registeredAgentRouter);
+app.use(nameCheckRouter);
+app.use(einExpressRouter);
 
 const port = Number(process.env.PORT ?? 3000);
 app.listen(port, () => {
@@ -33,4 +54,22 @@ if (pollerIntervalMs > 0) {
     });
   }, pollerIntervalMs);
   console.log(`CRM sync poller running every ${pollerIntervalMs}ms`);
+}
+
+/**
+ * Fulfillment poller (Gate 2) — claims orders.fulfillment_status='ready'
+ * rows and drives them through PDF generation (see
+ * fulfillment/fulfillmentWorker.ts for exactly how far this goes today:
+ * PDF generation + filing_documents persistence, stopping at
+ * 'requires_review' rather than a fabricated fax-transmission success).
+ * Same in-process-poller limitation as the CRM sync poller above.
+ */
+const fulfillmentPollerIntervalMs = Number(process.env.FULFILLMENT_POLLER_INTERVAL_MS ?? 30_000);
+if (fulfillmentPollerIntervalMs > 0) {
+  setInterval(() => {
+    runFulfillmentOnce(pool, `fulfillment-poller-${process.pid}`).catch((err) => {
+      console.error("[fulfillment poller] tick failed", err);
+    });
+  }, fulfillmentPollerIntervalMs);
+  console.log(`Fulfillment poller running every ${fulfillmentPollerIntervalMs}ms`);
 }
