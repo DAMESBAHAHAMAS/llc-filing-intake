@@ -426,3 +426,83 @@ accepted gap in the historical record, not something a later migration
 should silently paper over.
 
 **Supersedes:** —
+
+---
+
+## 2026-09-09 — Stripe catalog drift: real Products/Prices for this exact business already exist in Stripe test mode, with zero reference anywhere in this repo
+
+**Rationale/finding:** before designing the Offer Master (needed to satisfy
+the frozen rule "browser sends line-item identifiers only, server resolves
+against an approved commercial catalog"), I checked the connected Stripe
+account via the Stripe MCP tools rather than assuming none existed. The
+connected account (`acct_1ChHmZDo01bXdbWS`, "Damian Knowles", **test
+mode**) already has a full, coherent product catalog for this exact
+business, with a consistent `offer_sku`/`offer_version`/`crm_intent`
+metadata convention someone clearly designed on purpose: DIY state fee
+($125), DIY service/processing fee ($4, flat — not a computed
+percentage), DIY Certificate of Status ($5, "standard and included"),
+DIY certified-copy add-on ($30, optional), FastTrack ($499, single
+bundled Price), Premium ($999, single bundled Price), EIN Filing ($299),
+EIN Filing Express/same-day ($449, **flagged in its own Stripe metadata
+as `pricing_status: PLACEHOLDER_PENDING_DAMIAN_CONFIRMATION`**),
+Registered Agent 3-year service ($100), and a Company Credentials Kit
+($89, "launch price, thin margin by design" per an earlier, now-inactive
+$147 price on the same product). An earlier, cruder single combined DIY
+price ($129) exists but is inactive — superseded by the itemized
+125+4+5=$134 breakdown, evidence this catalog was iterated on
+deliberately, not thrown together. None of this — no Price ID, no
+product ID, no amount — appears anywhere in `llc-filing-intake` or
+`florida-business-launchpad` at any commit. This is the same shape of
+finding as the Supabase schema drift above: real, thought-through
+commercial work done directly against a third-party console, never
+captured in this repo. Confirmed test mode (`livemode: false`) before
+touching anything — no risk of live financial exposure either way, and
+no live Stripe object was created or modified to make this finding.
+
+**Action taken:** `server/migrations/0012_offer_master.sql` creates an
+`offers` table (the Offer Master called for in the Gate 2 brief — offer
+code + version as a real row, not just a price field; `internal_cost_cents`
+apparently unset, was left `NULL` rather than fabricated — an early
+Gate 2 build decision boundary, see below) and seeds it with these
+**real, discovered** Price/Product IDs — no new Stripe objects were
+created to populate it. `EIN_FILING_EXPRESS` is seeded `status='draft'`,
+not `'active'` — mechanically un-sellable until a human flips it — because
+Stripe's own metadata already flags that exact price as unconfirmed; I
+am not the one who gets to confirm it. This also supplies concrete
+evidence toward two of the five decision boundaries this task named
+(logged as evidence, not resolution — still reporting both as open,
+since finding an existing artifact isn't the same as an explicit
+confirmation): the DIY processing-fee mechanism (boundary #2) already
+exists as a flat $4 line item rather than a computed surcharge; and
+boundary #5 (is the $5 Certificate of Status inside or on top of
+FastTrack/Premium) is sharper now that FastTrack/Premium are confirmed
+single, non-itemized bundled Prices with no separate cert-of-status line
+wired to either — so it's genuinely unanswered, not merely undocumented.
+
+**Supersedes:** —
+
+---
+
+## 2026-09-09 — `crm_sync_queue` extended (not duplicated) for order→Deal jobs; fulfillment (PDF+fax) uses `orders`' own state machine, not a queue table
+
+**Rationale:** the Gate 2 brief explicitly left "reuse the existing
+`crm_sync_queue` pattern or extend it for PDF+fulfillment jobs, your
+call, log the choice" open. Decision: `crm_sync_queue` gets one new
+nullable `order_id` column (`server/migrations/0013_...sql`) and one new
+`sync_type` (`'order_deal'`) — the existing claim query
+(`FOR UPDATE SKIP LOCKED`), backoff schedule, and dead-letter handling
+(all already built and tested in Gate 1) are reused as-is; the worker's
+`ZohoClient` interface and `recordOutcome` gain an order-keyed path
+alongside the existing session-keyed one, rather than standing up a
+second, parallel queue implementation for what is functionally the same
+"retry an external call with backoff" problem. Fulfillment (PDF
+generation + fax transmission) is different in kind — it's not a single
+external call to retry, it's a multi-step pipeline (render PDF, persist
+`filing_documents`, transmit fax, poll delivery) — and the schema already
+anticipated this: `orders.fulfillment_status`/`fulfillment_run_after`/
+`fulfillment_attempts` (migration 0010, reconstructed above) are a
+purpose-built claim/backoff state machine on the `orders` row itself, so
+`fulfillment/fulfillmentWorker.ts` claims directly off `orders` rather
+than through any queue table.
+
+**Supersedes:** —
