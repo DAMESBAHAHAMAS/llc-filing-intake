@@ -23,6 +23,32 @@ export interface ZohoSyncResult {
 
 export interface ZohoClient {
   syncSession(payloadSnapshot: Record<string, unknown>): Promise<ZohoSyncResult>;
+  /**
+   * Gate 2: order-scoped jobs (sync_type='order_deal' or 'abandoned_cart'
+   * in crm_sync_queue). `kind` distinguishes the two — a paid order
+   * creates exactly one Deal; an abandoned/failed checkout only ever
+   * touches the Lead, never a Deal (frozen CRM sequencing rule).
+   */
+  syncOrderEvent(payload: OrderSyncPayload): Promise<ZohoSyncResult>;
+}
+
+export interface OrderSyncPayload {
+  kind: "paid_deal" | "abandoned_cart";
+  order: {
+    order_id: string;
+    filing_session_id: string;
+    product: string;
+    crm_intent: string;
+    total_cents: number;
+    failure_reason?: string | null;
+  };
+  filing_session: {
+    email?: string | null;
+    full_name?: string | null;
+    phone?: string | null;
+    entity_name_primary?: string | null;
+    crm_lead_id?: string | null;
+  };
 }
 
 async function getZohoAccessToken(): Promise<string> {
@@ -54,8 +80,19 @@ async function getZohoAccessToken(): Promise<string> {
 
 /**
  * Real implementation. sync_type is always "session_sync" today (see
- * routes/session.ts) — this decides Lead vs. Deal from the snapshot
- * itself rather than requiring the caller to pick a sync_type.
+ * routes/session.ts) — Lead upsert ONLY.
+ *
+ * GATE 2 P0 SECURITY FIX (2026-09-09, see DECISIONS.md): this used to
+ * also create a Deal whenever payload_snapshot.payment_status was "paid"
+ * or "completed" — but that field came straight from
+ * filing_sessions.payment_status, which (until the companion fix in
+ * routes/session.ts, same commit) was directly client-writable. A client
+ * could set payment_status: "paid" on POST /api/session/stage and this
+ * code would create a real Zoho Deal with no actual payment ever having
+ * happened — exactly what the frozen CRM sequencing rule exists to
+ * prevent ("Deal only after a verified Stripe webhook, never at
+ * intake"). Deal creation is now EXCLUSIVELY syncOrderEvent's job below,
+ * triggered only by the verified webhook's order_deal queue job.
  */
 export const realZohoClient: ZohoClient = {
   async syncSession(snapshot): Promise<ZohoSyncResult> {
@@ -72,8 +109,6 @@ export const realZohoClient: ZohoClient = {
       // email exists — but fail safely rather than send Zoho a bad payload.
       return { ok: false, error: "no email in payload_snapshot" };
     }
-
-    const isPaid = snapshot.payment_status === "paid" || snapshot.payment_status === "completed";
 
     try {
       const leadRes = await fetch("https://www.zohoapis.com/crm/v2/Leads/upsert", {
@@ -111,44 +146,79 @@ export const realZohoClient: ZohoClient = {
         data?: Array<{ details?: { id?: string }; code?: string }>;
       };
       const leadId = leadData.data?.[0]?.details?.id;
+      return { ok: true, leadId };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  },
 
-      if (!isPaid || !leadId) {
-        return { ok: true, leadId };
+  /**
+   * Gate 2 order-scoped sync. "paid_deal" creates exactly one Deal
+   * (idempotency is the webhook's stripe_webhook_events.id check plus
+   * this job existing at all — see routes/webhooksStripe.ts — not a
+   * second dedup here) linked to the existing Lead by email when one is
+   * known. "abandoned_cart" never creates or touches a Deal — it only
+   * updates the existing Lead so sales can see the drop-off, per the
+   * frozen rule that a failed payment fires an abandoned-cart signal,
+   * never a Deal.
+   */
+  async syncOrderEvent(payload: OrderSyncPayload): Promise<ZohoSyncResult> {
+    let token: string;
+    try {
+      token = await getZohoAccessToken();
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+
+    const email = payload.filing_session.email;
+    if (!email) {
+      return { ok: false, error: "no email on filing_session for order sync" };
+    }
+
+    try {
+      if (payload.kind === "abandoned_cart") {
+        const leadRes = await fetch("https://www.zohoapis.com/crm/v2/Leads/upsert", {
+          method: "POST",
+          headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            data: [
+              {
+                Email: email,
+                Lead_Status: "Abandoned Checkout",
+                Description: `Checkout abandoned/failed for order ${payload.order.order_id}: ${payload.order.failure_reason ?? "unknown reason"}`,
+                filing_session_id: payload.order.filing_session_id,
+              },
+            ],
+            duplicate_check_fields: ["Email"],
+          }),
+        });
+        if (leadRes.status === 401) return { ok: false, httpStatus: 401, error: "Zoho returned 401" };
+        if (!leadRes.ok) return { ok: false, httpStatus: leadRes.status, error: `Zoho Lead upsert (abandoned cart) failed: ${leadRes.status}` };
+        const leadData = (await leadRes.json()) as { data?: Array<{ details?: { id?: string } }> };
+        return { ok: true, leadId: leadData.data?.[0]?.details?.id };
       }
 
-      // Paid — convert to a Deal. (Gate 1: create a Deal linked to the
-      // lead's info; a real "convert" API call is a later refinement.)
+      // kind === "paid_deal"
       const dealRes = await fetch("https://www.zohoapis.com/crm/v2/Deals", {
         method: "POST",
-        headers: {
-          Authorization: `Zoho-oauthtoken ${token}`,
-          "Content-Type": "application/json",
-        },
+        headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({
           data: [
             {
-              Deal_Name: `${snapshot.entity_name_primary || email} — LLC Filing`,
+              Deal_Name: `${payload.filing_session.entity_name_primary || email} — ${payload.order.product}`,
               Stage: "Payment Received",
-              Amount: typeof snapshot.order_total_cents === "number" ? snapshot.order_total_cents / 100 : 0,
-              Lead_Source: "Data Spine — session_sync",
+              Amount: payload.order.total_cents / 100,
+              Lead_Source: "Data Spine — order_deal",
+              filing_session_id: payload.order.filing_session_id,
             },
           ],
         }),
       });
-
-      if (dealRes.status === 401) {
-        return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal creation", leadId };
-      }
-      if (!dealRes.ok) {
-        return { ok: false, httpStatus: dealRes.status, error: `Zoho Deal create failed: ${dealRes.status}`, leadId };
-      }
-
-      const dealData = (await dealRes.json()) as {
-        data?: Array<{ details?: { id?: string } }>;
-      };
+      if (dealRes.status === 401) return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal creation" };
+      if (!dealRes.ok) return { ok: false, httpStatus: dealRes.status, error: `Zoho Deal create failed: ${dealRes.status}` };
+      const dealData = (await dealRes.json()) as { data?: Array<{ details?: { id?: string } }> };
       const dealId = dealData.data?.[0]?.details?.id;
-
-      return { ok: true, leadId, dealId };
+      return { ok: true, dealId };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }

@@ -18,6 +18,9 @@ const alwaysSucceedClient: ZohoClient = {
   async syncSession() {
     return { ok: true, leadId: "drain" };
   },
+  async syncOrderEvent() {
+    return { ok: true, leadId: "drain", dealId: "drain" };
+  },
 };
 async function drainQueueBacklog() {
   await runOnce(pool, alwaysSucceedClient, "test-drain");
@@ -53,6 +56,16 @@ function makeFlakyClient(failFirstNCalls: number, failureKind: "401" | "timeout"
         return { ok: false, error: `simulated timeout / network error (call ${calls})` };
       }
       return { ok: true, leadId: `fake-lead-call-${calls}` };
+    },
+    async syncOrderEvent(_payload) {
+      calls++;
+      if (calls <= failFirstNCalls) {
+        if (failureKind === "401") {
+          return { ok: false, httpStatus: 401, error: `simulated 401 (call ${calls})` };
+        }
+        return { ok: false, error: `simulated timeout / network error (call ${calls})` };
+      }
+      return { ok: true, dealId: `fake-deal-call-${calls}` };
     },
   };
 }

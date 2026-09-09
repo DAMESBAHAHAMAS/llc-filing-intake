@@ -1,10 +1,11 @@
 import type { Pool } from "pg";
-import type { ZohoClient, ZohoSyncResult } from "../zoho/client.js";
+import type { OrderSyncPayload, ZohoClient, ZohoSyncResult } from "../zoho/client.js";
 import { backoffForAttempt, isDeadLetter } from "./backoff.js";
 
 export interface ClaimedJob {
   id: number;
   filing_session_id: string;
+  order_id: string | null;
   sync_type: string;
   payload_snapshot: Record<string, unknown>;
   attempts: number;
@@ -41,7 +42,7 @@ export async function claimNextJob(pool: Pool, lockedBy: string): Promise<Claime
       `UPDATE crm_sync_queue
        SET status = 'processing', locked_at = now(), locked_by = $2
        WHERE id = $1
-       RETURNING id, filing_session_id, sync_type, payload_snapshot, attempts, max_attempts`
+       RETURNING id, filing_session_id, order_id, sync_type, payload_snapshot, attempts, max_attempts`
     , [jobId, lockedBy]);
 
     await client.query("COMMIT");
@@ -62,18 +63,22 @@ export async function claimNextJob(pool: Pool, lockedBy: string): Promise<Claime
  * "the attempt"). Any other failure (including a second 401) is recorded
  * as a normal failed attempt.
  */
-async function syncWithOneFreeAuthRetry(
-  client: ZohoClient,
-  payload: Record<string, unknown>
-): Promise<ZohoSyncResult> {
-  const first = await client.syncSession(payload);
+function dispatchSync(client: ZohoClient, job: ClaimedJob): Promise<ZohoSyncResult> {
+  if (job.sync_type === "order_deal" || job.sync_type === "abandoned_cart") {
+    return client.syncOrderEvent(job.payload_snapshot as unknown as OrderSyncPayload);
+  }
+  return client.syncSession(job.payload_snapshot);
+}
+
+async function syncWithOneFreeAuthRetry(client: ZohoClient, job: ClaimedJob): Promise<ZohoSyncResult> {
+  const first = await dispatchSync(client, job);
   if (first.ok || first.httpStatus !== 401) {
     return first;
   }
-  // Free retry — a fresh token is pulled inside syncSession() itself on
-  // every call (see zoho/client.ts), so simply calling again is the
+  // Free retry — a fresh token is pulled inside the client method itself
+  // on every call (see zoho/client.ts), so simply calling again is the
   // "immediate token refresh + retry."
-  return client.syncSession(payload);
+  return dispatchSync(client, job);
 }
 
 /**
@@ -95,6 +100,15 @@ async function recordOutcome(pool: Pool, job: ClaimedJob, result: ZohoSyncResult
          WHERE id = $1`,
         [job.id]
       );
+      if (job.order_id && result.dealId) {
+        // Order-scoped job (paid_deal): the Deal belongs to the order,
+        // not the session — orders.crm_deal_id is the one place a Deal
+        // ID for THIS order is recorded, satisfying "exactly one Deal
+        // per paid filing session" without overloading
+        // filing_sessions.crm_deal_id (which Gate 1 already uses for a
+        // different, session-level purpose).
+        await client.query(`UPDATE orders SET crm_deal_id = $2 WHERE order_id = $1`, [job.order_id, result.dealId]);
+      }
       await client.query(
         `UPDATE filing_sessions
          SET crm_lead_id = COALESCE($2, crm_lead_id),
@@ -102,7 +116,7 @@ async function recordOutcome(pool: Pool, job: ClaimedJob, result: ZohoSyncResult
              crm_sync_status = 'synced',
              crm_last_synced_at = now()
          WHERE filing_session_id = $1`,
-        [job.filing_session_id, result.leadId ?? null, result.dealId ?? null]
+        [job.filing_session_id, result.leadId ?? null, job.order_id ? null : result.dealId ?? null]
       );
     } else {
       const newAttempts = job.attempts + 1;
@@ -148,7 +162,7 @@ export async function processOne(pool: Pool, zohoClient: ZohoClient, lockedBy: s
   const job = await claimNextJob(pool, lockedBy);
   if (!job) return false;
 
-  const result = await syncWithOneFreeAuthRetry(zohoClient, job.payload_snapshot);
+  const result = await syncWithOneFreeAuthRetry(zohoClient, job);
   await recordOutcome(pool, job, result);
   return true;
 }

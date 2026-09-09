@@ -9,6 +9,23 @@ export const sessionRouter = Router();
  * Server-defined whitelist of session fields a client may set. Never
  * derived from request body keys — values are parameterized, but which
  * *columns* can be touched is fixed here, not client-controlled.
+ *
+ * GATE 2 P0 SECURITY FIX (2026-09-09, see DECISIONS.md): payment_status,
+ * crm_lead_id, crm_deal_id, crm_sync_status, crm_last_synced_at,
+ * pdf_generated_at, and pdf_storage_ref were REMOVED from this list.
+ * They are exclusively written by server-side workers (the CRM sync
+ * worker, the Stripe webhook handler, the fulfillment worker) via direct
+ * SQL, never through this public HTTP endpoint. Before this fix, a
+ * client could POST payment_status: "paid" here directly, and the Gate 1
+ * sync worker (zoho/client.ts realZohoClient.syncSession) would read
+ * exactly that field to decide whether to create a Zoho Deal — i.e. a
+ * forged field on this endpoint could create a real Deal with no actual
+ * payment. filing_sessions.payment_status already carried a Postgres
+ * column COMMENT (migration 0009) claiming this fix already existed; it
+ * did not, until now. See the corresponding fix in zoho/client.ts
+ * (syncSession no longer creates Deals at all — that is now exclusively
+ * the webhook-triggered order_deal path's job, per the frozen CRM
+ * sequencing rule: Deal only after a verified Stripe webhook).
  */
 const SESSION_FIELDS = [
   "email",
@@ -19,14 +36,7 @@ const SESSION_FIELDS = [
   "entity_name_backup",
   "name_check_results",
   "order_total_cents",
-  "payment_status",
   "payment_ref",
-  "pdf_generated_at",
-  "pdf_storage_ref",
-  "crm_lead_id",
-  "crm_deal_id",
-  "crm_sync_status",
-  "crm_last_synced_at",
   "utm_source",
   "utm_medium",
   "utm_campaign",
