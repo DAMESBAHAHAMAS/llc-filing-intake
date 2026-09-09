@@ -342,3 +342,87 @@ instead of stopping the session to ask, since a suitable
 already-approved-by-existing-use alternative was available.
 
 **Supersedes:** —
+
+---
+
+## 2026-09-09 — Schema/migration drift: 8 migrations (0004–0011) existed live in Supabase with zero corresponding files or application code anywhere in git
+
+**Rationale/finding:** starting Gate 2 (payment/fulfillment build) on a new
+branch (`feat/gate2-backend`, off `main` at `ac3930e`), I queried the live
+Supabase project (`rtivwkqsuuvbkvdudgnd`) directly via the Supabase MCP
+tools before writing any code, per this repo's own rule 4 (never trust a
+filename/route/comment — verify the executing state). `schema_migrations`
+on the live project had 11 rows, not the 3 that `server/migrations/`
+contains on `main` or on `feat/data-spine`:
+
+```
+0001_filing_sessions                              2026-08-13
+0002_filing_events                                2026-08-13
+0003_crm_sync_queue                                2026-08-13
+0004_filing_sessions_filing_data                  2026-08-27
+0005_registered_agent_acceptance                  2026-08-27
+0006_orders                                        2026-08-28
+0007_orders_payment_status_crm_deal               2026-08-28
+0008_stripe_webhook_events                         2026-08-28
+0009_filing_sessions_payment_status_non_authoritative  2026-08-28
+0010_orders_fulfillment_status                     2026-09-01
+0011_fulfillment_transmissions                     2026-09-01
+```
+
+Migrations 0004–0011 added exactly the 5 undocumented tables (`orders`,
+`stripe_webhook_events`, `filing_documents`, `fulfillment_transmissions`,
+`registered_agent_acceptances`) plus `filing_sessions.filing_data` and
+`filing_sessions.registered_agent_status`, with column/table `COMMENT`s
+that explicitly name application files that do not exist in this repo at
+any commit (`webhook/stripeWebhookService.ts`,
+`fulfillment/fulfillmentWorker.ts`, `server/src/pdf/types.ts`). This is
+strong evidence a prior planning pass designed this schema and applied it
+directly to Supabase (outside git, outside the migration runner) as
+forward documentation of intended Gate 2 code, then neither the `.sql`
+files nor the code were ever committed. No concurrent session conflict —
+`git fetch` shows only the already-known stale `feat/data-spine` branch;
+nothing new was pushed by anyone else.
+
+**Action taken:** wrote `server/migrations/0004_*.sql` through
+`0011_*.sql`, named to match the `schema_migrations.version` strings
+exactly (so the existing migration runner recognizes them as already
+applied and skips them — no re-execution against the live DB, no risk of
+"already exists" errors). Full column/constraint/index/FK fidelity was
+verified two ways before committing: (1) `list_tables` (verbose) plus raw
+`pg_constraint`/`pg_indexes` queries against the live project, compared
+column-by-column; (2) the exact concatenated content of all 11 files run
+against a throwaway `migration_test_gate2` schema on the *same* live
+project (via `execute_sql`, wrapped in `CREATE SCHEMA` / `DROP SCHEMA
+CASCADE`, never touching `public`), with the resulting column sets
+diffed against the live `public` schema and found identical. This is a
+best-effort reconstruction, not a recovered original: the exact original
+grouping of a few individually-optional statements (e.g., which of the
+two duplicate `checkout_status`-indexing statements landed in which file)
+is inferred, not recoverable, since the real files never existed. This
+does not affect correctness — nothing here is being re-run against the
+live database, only recorded for git history and for reproducing the
+schema in a fresh environment.
+
+**Secondary finding, same investigation:** every table in `public`
+(including the three tables in migrations 0001–0003, which contain no
+`ENABLE ROW LEVEL SECURITY` statement) has `rls_enabled = true` live, with
+**zero** rows in `pg_policies`. This was not done via any migration file
+either — almost certainly a manual dashboard action (Supabase's Security
+Advisor flags public tables without RLS). With no policies and RLS
+enabled, only a role with `BYPASSRLS` (e.g., the `postgres` role used by
+the session-pooler connection string per standing rule 9) can read/write
+at all — which matches Gate 1's `POST /api/session/stage` working
+correctly today, so this is not currently a live blocker. Standing rule 9
+already forbids building against Supabase Auth, and RLS policies here
+would functionally require an `auth.uid()`-shaped identity model this
+project doesn't have — so no policies were authored. To stop compounding
+the drift, the *new* tables created in 0005/0006/0008/0011 above do
+include an explicit `ALTER TABLE ... ENABLE ROW LEVEL SECURITY;` (matching
+live state, now captured in git), but 0001–0003 were left exactly as
+originally written per this repo's immutability rule for already-applied
+migrations — the live RLS-enabled-with-no-policies state on those three
+tables remains real but uncaptured in any file, which is a permanent,
+accepted gap in the historical record, not something a later migration
+should silently paper over.
+
+**Supersedes:** —
