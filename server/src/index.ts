@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import { corsMiddleware } from "./middleware/cors.js";
 import { healthRouter } from "./routes/health.js";
 import { sessionRouter } from "./routes/session.js";
 import { pool } from "./db/pool.js";
@@ -7,6 +8,8 @@ import { realZohoClient } from "./zoho/client.js";
 import { runOnce } from "./sync/worker.js";
 
 const app = express();
+
+app.use(corsMiddleware);
 app.use(express.json());
 app.use(healthRouter);
 app.use(sessionRouter);
