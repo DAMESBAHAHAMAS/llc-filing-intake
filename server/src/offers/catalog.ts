@@ -46,3 +46,41 @@ export async function getActiveOfferByCode(pool: Pool, offerCode: string): Promi
   const rows = await resolveActiveOffers(pool, [offerCode]);
   return rows[0] ?? null;
 }
+
+/** An active offer as the storefront is allowed to see it. Deliberately
+ *  omits stripe_product_id/stripe_price_id and internal_cost_cents — the
+ *  browser never needs them, and the Price ID in particular is the thing
+ *  that actually determines the charge, so there is no reason to publish
+ *  it to a surface that must never influence pricing. */
+export interface PublicOffer {
+  offer_code: string;
+  offer_version: string;
+  display_name: string;
+  unit_amount_cents: number;
+  currency: string;
+  inclusions: unknown;
+  exclusions: unknown;
+}
+
+/**
+ * Every currently-sellable offer, for the storefront to RENDER from.
+ *
+ * This exists to close a specific, already-observed failure: before it,
+ * the packages page hardcoded its own prices, and those prices had
+ * drifted badly from the Offer Master — the page advertised EIN at $75
+ * while the catalog would have charged $299, and three add-ons it sold
+ * had no offer at all. Rendering from this endpoint means the displayed
+ * price and the charged price come from the same row, so they cannot
+ * disagree. The browser still only ever SENDS offer_code identifiers
+ * (POST /api/checkout/create) — this endpoint is display-only and
+ * confers no pricing authority on the client.
+ */
+export async function listActiveOffers(pool: Pool): Promise<PublicOffer[]> {
+  const { rows } = await pool.query<PublicOffer>(
+    `SELECT offer_code, offer_version, display_name, unit_amount_cents, currency, inclusions, exclusions
+       FROM offers
+      WHERE status = 'active'
+      ORDER BY unit_amount_cents ASC`
+  );
+  return rows;
+}

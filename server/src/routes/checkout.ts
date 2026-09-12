@@ -130,7 +130,11 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         filingSessionId,
         lineItems: lineItemSnapshots.map((li) => ({ price: li.stripe_price_id, quantity: li.quantity })),
         successUrl: `${frontendBaseUrl}/checkout/success?filing_session_id=${encodeURIComponent(filingSessionId)}&order_id=${encodeURIComponent(orderId)}&stripe_session_id={CHECKOUT_SESSION_ID}`,
-        cancelUrl: `${frontendBaseUrl}/checkout/cancelled?filing_session_id=${encodeURIComponent(filingSessionId)}&order_id=${encodeURIComponent(orderId)}`,
+        // /checkout/cancel — matches the route the frontend actually
+        // registers (App.tsx). This previously read "/checkout/cancelled",
+        // which no frontend route serves, so every customer who abandoned
+        // Stripe Checkout would have landed on the 404 page.
+        cancelUrl: `${frontendBaseUrl}/checkout/cancel?filing_session_id=${encodeURIComponent(filingSessionId)}&order_id=${encodeURIComponent(orderId)}`,
         customerEmail: session.rows[0].email ?? undefined,
       });
 

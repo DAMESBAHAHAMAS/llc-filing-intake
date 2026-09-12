@@ -8,6 +8,7 @@ import { stripeWebhookRouter } from "./routes/webhooksStripe.js";
 import { registeredAgentRouter } from "./routes/registeredAgent.js";
 import { nameCheckRouter } from "./routes/nameCheck.js";
 import { einExpressRouter } from "./routes/einExpress.js";
+import { offersRouter } from "./routes/offers.js";
 import { pool } from "./db/pool.js";
 import { realZohoClient } from "./zoho/client.js";
 import { runOnce } from "./sync/worker.js";
@@ -43,6 +44,7 @@ app.use(checkoutRouter);
 app.use(registeredAgentRouter);
 app.use(nameCheckRouter);
 app.use(einExpressRouter);
+app.use(offersRouter);
 
 const port = Number(process.env.PORT ?? 3000);
 app.listen(port, () => {
