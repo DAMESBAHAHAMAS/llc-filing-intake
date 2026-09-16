@@ -137,15 +137,17 @@ export async function createCheckoutSession(
   }
 
   let currentStage: string | null;
+  let crmDealId: string | null;
   try {
-    const existing = await pool.query<{ current_stage: string | null }>(
-      "SELECT current_stage FROM filing_sessions WHERE filing_session_id = $1",
+    const existing = await pool.query<{ current_stage: string | null; crm_deal_id: string | null }>(
+      "SELECT current_stage, crm_deal_id FROM filing_sessions WHERE filing_session_id = $1",
       [filingSessionId]
     );
     if (!existing.rowCount) {
       return { ok: false, reason: "session_not_ready" };
     }
     currentStage = existing.rows[0].current_stage;
+    crmDealId = existing.rows[0].crm_deal_id;
   } catch (err) {
     return { ok: false, reason: "session_lookup_failed", detail: describeError(err) };
   }
@@ -204,6 +206,7 @@ export async function createCheckoutSession(
       filingSessionId,
       crmIntent,
       orderId,
+      crmDealId,
     });
 
     await pool.query(

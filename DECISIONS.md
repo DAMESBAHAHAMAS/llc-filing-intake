@@ -605,3 +605,81 @@ service ids explicitly the next time either is touched, so future sessions
 don't have to re-derive this from scratch.
 
 **Supersedes:** —
+
+## 2026-09-16 — Registered-agent acceptance email provider is Resend, via its SDK — an explicit exception to the "plain fetch, no SDK" default
+
+**Rationale:** GOVERNANCE.md rule 5 requires listing a new third-party
+dependency and waiting for approval before adding it; every other outbound
+integration in this codebase (Zoho, Telnyx) deliberately uses plain `fetch`
+instead of a vendor SDK for exactly this reason. Resend is the one
+exception, added on direct instruction naming both the provider and the
+SDK explicitly — not a new default for future integrations. `emailSender.ts`
+now requires `RESEND_API_KEY` and `RESEND_FROM_EMAIL`; `realEmailSender`
+still fails clearly (never throws past its own boundary) when either is
+unset, same posture as every other "fails clearly until configured"
+integration here. `buildRegisteredAgentAcceptanceEmail` now returns `html`
+alongside the existing `subject`/`text` — same content, styled rendering.
+
+**Files:** `server/src/registeredAgent/emailSender.ts`, `server/.env.example`,
+`server/package.json` (new dependency: `resend`).
+
+**Supersedes:** —
+
+## 2026-09-16 — crm_deal_id linkage: Stripe metadata carries it from checkout creation to the payment webhook, which updates orders.crm_deal_id and enqueues an async Deal-stage update
+
+**Rationale:** `orders.crm_deal_id` (migration 0007) has been unused since
+it was added — "a CRM Deal sync was drafted concurrently ... and was not
+adopted" (that migration's own comment). This gives it a real, working path
+without inlining a Zoho call in the payment-confirmation transaction
+(GOVERNANCE.md #1: every Zoho write is queued and processed asynchronously,
+never inline with the request that triggered it):
+
+1. `checkoutService.ts` now reads `filing_sessions.crm_deal_id` (a
+   pre-existing column, migration 0001, currently always NULL — nothing
+   populates it yet, see below) when creating a Checkout Session, and
+   `stripeCheckoutClient.ts` carries it as Stripe metadata
+   (`metadata.crm_deal_id`), alongside the existing `filing_session_id` /
+   `crm_intent` / `order_id` metadata fields.
+2. `stripeWebhookService.ts`, inside the existing payment-confirmation
+   transaction, reads `metadata.crm_deal_id` back from the live-re-fetched
+   Stripe session (never trusts the webhook event body for this any more
+   than it does for payment status) and, when present, writes it onto
+   `orders.crm_deal_id` and enqueues a `crm_sync_queue` job
+   (`sync_type = 'deal_stage_update'`).
+3. `zoho/client.ts`'s `syncSession` — called generically by `sync/worker.ts`
+   for every job regardless of `sync_type`, which the worker never passes
+   through — recognizes this job by a `job_type: "deal_stage_update"`
+   marker in its own payload and issues a `PUT` against the *existing*
+   Deal id, never the Lead-upsert/Deal-create path `session_sync` jobs use.
+   This is what makes the enqueue actually functional rather than a queue
+   row the worker would silently mishandle.
+
+**Two gaps this does NOT close, both flagged rather than guessed at:**
+- **Nothing populates `filing_sessions.crm_deal_id` yet.** The Cloudflare
+  Worker (`llc-worker.js`) still creates the Deal at intake time and
+  returns `deal_id` to the frontend, which discards it today. Until the
+  frontend captures that id and sends it to `POST /api/session/stage`
+  (already in `SESSION_FIELDS`'s whitelist — no backend change needed for
+  that part), every real order's `metadata.crm_deal_id` will be absent and
+  this whole path is a no-op (`crm_result: "no_crm_deal_yet"` in
+  `filing_events`) — plumbing proven correct, not yet exercised in
+  production.
+- **No confirmed "this means paid" Zoho Stage value exists.**
+  `GATE2-ZOHO-CONNECTIVITY-STATUS.md`'s `MAPPING_MISMATCH` finding is still
+  unresolved — only `Stage: "Closed Lost"` is confirmed live for this org's
+  pipeline, and it doesn't mean paid. `ZOHO_DEAL_STAGE_ON_PAYMENT` is left
+  unset in `.env.example` deliberately: until it's set to a value confirmed
+  against the live picklist, a known `crm_deal_id` is still written onto
+  the order, but no stage-update job is queued
+  (`crm_result: "crm_deal_id_set_but_target_stage_unconfigured"`) — a
+  guessed value would only enqueue a job that dead-letters against Zoho's
+  own `INVALID_DATA` error after burning its retry budget.
+
+**Files:** `server/src/checkout/checkoutService.ts`,
+`server/src/checkout/stripeCheckoutClient.ts`,
+`server/src/webhook/stripeWebhookService.ts`, `server/src/zoho/client.ts`,
+`server/.env.example`. No migration — reuses `filing_sessions.crm_deal_id`
+(0001), `orders.crm_deal_id` (0007), and `crm_sync_queue` (0003) as they
+already exist.
+
+**Supersedes:** —

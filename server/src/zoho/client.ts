@@ -25,6 +25,25 @@ export interface ZohoClient {
   syncSession(payloadSnapshot: Record<string, unknown>): Promise<ZohoSyncResult>;
 }
 
+/** Payload shape for a crm_sync_queue job with sync_type =
+ *  'deal_stage_update' (webhook/stripeWebhookService.ts, enqueued at
+ *  payment confirmation when orders.crm_deal_id is known). The worker
+ *  (sync/worker.ts) is deliberately job-shape-agnostic — it always calls
+ *  syncSession(payload_snapshot) regardless of sync_type — so syncSession
+ *  itself is what tells this apart from an ordinary session_sync
+ *  payload, by this marker field rather than by the sync_type column
+ *  (which the worker never passes through to the client). */
+export interface DealStageUpdatePayload {
+  job_type: "deal_stage_update";
+  crm_deal_id: string;
+  target_stage: string;
+  [key: string]: unknown;
+}
+
+export function isDealStageUpdatePayload(snapshot: Record<string, unknown>): snapshot is DealStageUpdatePayload {
+  return snapshot.job_type === "deal_stage_update";
+}
+
 async function getZohoAccessToken(): Promise<string> {
   const clientId = process.env.ZOHO_CLIENT_ID;
   const clientSecret = process.env.ZOHO_CLIENT_SECRET;
@@ -87,6 +106,37 @@ export const realZohoClient: ZohoClient = {
       token = await getZohoAccessToken();
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+
+    if (isDealStageUpdatePayload(snapshot)) {
+      // Updates the EXISTING Deal by id (PUT, not POST) — the opposite
+      // problem from the "never create a duplicate Deal" concern
+      // elsewhere in this file: this path only ever runs when
+      // orders.crm_deal_id is already known (webhook/stripeWebhookService.ts
+      // only enqueues this job when it is), so there is no Lead-upsert
+      // step here at all, on purpose — updating a Deal's stage has
+      // nothing to do with the session's Lead record.
+      try {
+        const res = await fetch(`https://www.zohoapis.com/crm/v2/Deals/${encodeURIComponent(snapshot.crm_deal_id)}`, {
+          method: "PUT",
+          headers: {
+            Authorization: `Zoho-oauthtoken ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ data: [{ Stage: snapshot.target_stage }] }),
+        });
+
+        if (res.status === 401) {
+          return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal stage update" };
+        }
+        if (!res.ok) {
+          const body = await res.text().catch(() => "");
+          return { ok: false, httpStatus: res.status, error: `Zoho Deal stage update failed (${res.status}): ${body}` };
+        }
+        return { ok: true, dealId: snapshot.crm_deal_id };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
     }
 
     const email = snapshot.email as string | undefined;

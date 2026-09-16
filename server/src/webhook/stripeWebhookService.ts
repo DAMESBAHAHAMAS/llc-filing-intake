@@ -225,31 +225,57 @@ export async function processStripeWebhookEvent(
       ]
     );
 
-    // CRM (Gate 2 §9): Zoho's live account is ZOHOONE_TRIAL_EXPIRED and,
-    // separately, Deal-at-checkout was never built (a draft of it was
-    // discarded during Gate 2 checkout integration — see
-    // GATE2-CHECKOUT-INTEGRATION-STATUS.md §0/§9) — orders.crm_deal_id is
-    // therefore always NULL today. Zoho availability is never a
-    // prerequisite for the payment confirmation above, which has already
-    // been written by this point regardless of what happens below (and
-    // commits together with it — a Zoho outage was never on this
-    // transaction's critical path before, and still isn't: this block
-    // makes no network call, only a plain INSERT recording that no call
-    // was made or possible).
+    // CRM (Gate 2 §9, extended): orders.crm_deal_id is populated from
+    // Stripe Checkout Session metadata.crm_deal_id — set at session
+    // creation from filing_sessions.crm_deal_id, when one was already
+    // known (checkout/stripeCheckoutClient.ts, checkoutService.ts).
+    // Nothing populates filing_sessions.crm_deal_id today (see that
+    // column's own comment, migration 0001) — this makes the plumbing
+    // correct for when something does; it does not itself create that
+    // link. Never calls Zoho directly from inside this transaction — a
+    // Zoho outage must never block or roll back a payment confirmation.
+    // Instead this enqueues a crm_sync_queue job (GOVERNANCE.md #1: every
+    // Zoho write is queued and processed asynchronously, never inline),
+    // processed by the existing sync/worker.ts. zoho/client.ts's
+    // syncSession recognizes this job by its job_type marker and issues a
+    // PUT against the EXISTING Deal id — never the Lead-upsert/Deal-create
+    // path used by session_sync jobs, so this can never create a second
+    // Deal for the same order.
     //
-    // realZohoClient.syncSession (zoho/client.ts, unmodified by this task)
-    // has no "update this specific Deal by id" capability — it only ever
-    // creates a new Deal when isPaid is true. Calling it here with a
-    // crm_deal_id already set would risk creating a SECOND Deal for the
-    // same order, violating the explicit "do not create duplicate Deals"
-    // requirement. So: if a crm_deal_id is ever present (dead code today,
-    // written for when Deal-at-checkout exists), this deliberately does
-    // NOT call syncSession — it records that an update is needed but not
-    // yet possible with the current client, rather than faking success or
-    // risking a duplicate create.
-    const crmResult = order.crm_deal_id
-      ? "crm_deal_update_not_implemented" // exists but realZohoClient can't update-by-id yet
-      : "no_crm_deal_yet"; // Deal-at-checkout not built — nothing to update
+    // target_stage is env-configurable rather than hardcoded because the
+    // one confirmed-live picklist value for this org today is
+    // Stage: "Closed Lost" (GATE2-ZOHO-CONNECTIVITY-STATUS.md's
+    // MAPPING_MISMATCH finding) — "Payment Received" (this file's own
+    // prior dead code) is NOT a real stage in the live org, and no
+    // confirmed "this means paid" stage exists yet either. Deliberately
+    // NOT defaulted to a guessed value: a wrong-but-plausible-looking
+    // stage string would enqueue a job that dead-letters against Zoho's
+    // own INVALID_DATA error after silently burning the retry budget,
+    // which is worse than not enqueueing at all. Until
+    // ZOHO_DEAL_STAGE_ON_PAYMENT is set to a value confirmed against the
+    // live picklist, a known crm_deal_id is still written onto the order
+    // (that part is always correct), but no stage-update job is queued.
+    const crmDealId = retrieved.metadata?.crm_deal_id ?? null;
+    const targetStage = process.env.ZOHO_DEAL_STAGE_ON_PAYMENT;
+    let crmResult: string;
+    if (crmDealId) {
+      await client.query(`UPDATE orders SET crm_deal_id = $2 WHERE order_id = $1`, [order.order_id, crmDealId]);
+      if (targetStage) {
+        await client.query(
+          `INSERT INTO crm_sync_queue (filing_session_id, sync_type, payload_snapshot) VALUES ($1, $2, $3)`,
+          [
+            order.filing_session_id,
+            "deal_stage_update",
+            JSON.stringify({ job_type: "deal_stage_update", crm_deal_id: crmDealId, target_stage: targetStage }),
+          ]
+        );
+        crmResult = "deal_stage_update_enqueued";
+      } else {
+        crmResult = "crm_deal_id_set_but_target_stage_unconfigured"; // ZOHO_DEAL_STAGE_ON_PAYMENT unset — see .env.example
+      }
+    } else {
+      crmResult = "no_crm_deal_yet"; // filing_sessions.crm_deal_id was never set — nothing to update
+    }
     await client.query(
       `INSERT INTO filing_events (filing_session_id, event_type, payload) VALUES ($1, $2, $3)`,
       [order.filing_session_id, "payment_confirmed", { order_id: order.order_id, stripe_session_id: sessionId, crm_result: crmResult }]

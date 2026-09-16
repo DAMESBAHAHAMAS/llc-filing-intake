@@ -4,15 +4,15 @@
  * for tests) — this project's existing pattern for "an outbound
  * integration this service doesn't own the credentials for yet."
  *
- * No transactional email provider exists anywhere in this codebase or
- * llc-worker.js today (audited before writing this — see
- * GATE2-REGISTERED-AGENT-ACCEPTANCE-STATUS.md §1). realEmailSender below
- * is honest about that: it fails clearly rather than pretending to send.
- * Provisioning a real provider (Resend/SES/Postmark/etc.) and its
- * credentials is an infrastructure decision outside this task's scope —
- * dropping one in means implementing the `send` call in the block marked
- * below, nothing else in this module needs to change.
+ * Provider: Resend, via its official SDK — a deliberate, explicit
+ * exception to GOVERNANCE.md rule 5 ("no third-party dependency without
+ * listing it and waiting for approval"), per direct instruction (see
+ * DECISIONS.md). Every other outbound integration in this codebase
+ * (Zoho, Stripe's own webhook verification aside, Telnyx) uses plain
+ * `fetch` specifically to avoid this kind of dependency — this module is
+ * the one deliberate exception, not a new default.
  */
+import { Resend } from "resend";
 
 export interface RegisteredAgentAcceptanceEmailInput {
   toEmail: string;
@@ -26,6 +26,11 @@ export interface RegisteredAgentAcceptanceEmailInput {
 export interface EmailSendResult {
   ok: boolean;
   error?: string;
+  /** The provider's own id for this send, when available — useful for
+   *  support/forensics ("did this specific email actually go out").
+   *  Not persisted anywhere today; acceptanceService.ts's callers don't
+   *  read it, but it's here for whoever wires that up next. */
+  providerMessageId?: string;
 }
 
 export interface EmailSender {
@@ -35,47 +40,109 @@ export interface EmailSender {
 /** Dedicated transactional template, §10 of the locked schema. Deliberately
  *  does NOT include the filing session, addresses beyond the registered
  *  agent's own, member/manager names, or any other customer PII — only
- *  what a registered agent needs to decide whether to accept. */
+ *  what a registered agent needs to decide whether to accept. text and
+ *  html render the identical content — html is not a separate message,
+ *  just a styled rendering of the same subject/body for clients that
+ *  render it, with text as the universal fallback. */
 export function buildRegisteredAgentAcceptanceEmail(input: RegisteredAgentAcceptanceEmailInput): {
   subject: string;
   text: string;
+  html: string;
 } {
   const expiresLabel = input.expiresAt.toISOString().slice(0, 10);
-  return {
-    subject: `Action required: Registered Agent designation for ${input.llcName}`,
-    text: [
-      `Hi ${input.toName},`,
-      "",
-      `You have been designated as the Registered Agent for ${input.llcName}, a Florida LLC.`,
-      `Registered agent address on file: ${input.registeredAgentFloridaAddress}`,
-      "",
-      "As registered agent, you would be responsible for accepting legal and state correspondence on the company's behalf at this address.",
-      "",
-      "Please review and respond to this designation here:",
-      input.acceptanceUrl,
-      "",
-      `This link expires on ${expiresLabel} and can only be used once.`,
-      "If you were not expecting this designation, you may decline it using the same link.",
-    ].join("\n"),
-  };
+  const subject = `Action required: Registered Agent designation for ${input.llcName}`;
+  const text = [
+    `Hi ${input.toName},`,
+    "",
+    `You have been designated as the Registered Agent for ${input.llcName}, a Florida LLC.`,
+    `Registered agent address on file: ${input.registeredAgentFloridaAddress}`,
+    "",
+    "As registered agent, you would be responsible for accepting legal and state correspondence on the company's behalf at this address.",
+    "",
+    "Please review and respond to this designation here:",
+    input.acceptanceUrl,
+    "",
+    `This link expires on ${expiresLabel} and can only be used once.`,
+    "If you were not expecting this designation, you may decline it using the same link.",
+  ].join("\n");
+
+  const html = `
+    <div style="font-family: sans-serif; line-height: 1.5; color: #333;">
+      <h2>Registered Agent Designation Notice</h2>
+      <p>Hi ${escapeHtml(input.toName)},</p>
+      <p>You have been designated as the Registered Agent for <strong>${escapeHtml(input.llcName)}</strong>, a Florida LLC.</p>
+      <p>Registered agent address on file: ${escapeHtml(input.registeredAgentFloridaAddress)}</p>
+      <p>As registered agent, you would be responsible for accepting legal and state correspondence on the company's behalf at this address.</p>
+      <p style="margin: 24px 0;">
+        <a href="${input.acceptanceUrl}"
+           style="background-color: #0066cc; color: #ffffff; padding: 12px 20px; text-decoration: none; border-radius: 4px; display: inline-block;">
+          Review &amp; Respond
+        </a>
+      </p>
+      <p style="font-size: 12px; color: #666;">
+        Or copy and paste this link into your browser:<br>
+        <a href="${input.acceptanceUrl}">${input.acceptanceUrl}</a>
+      </p>
+      <p style="font-size: 12px; color: #666;">
+        This link expires on ${expiresLabel} and can only be used once. If you were not expecting this designation, you may decline it using the same link.
+      </p>
+    </div>
+  `;
+
+  return { subject, text, html };
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+let resendSingleton: Resend | null = null;
+/** Lazy singleton, same rationale as checkout/stripeCheckoutClient.ts's
+ *  getStripe(): fails clearly when actually called without a key, rather
+ *  than crashing the whole process at import time. */
+function getResend(): Resend {
+  if (resendSingleton) return resendSingleton;
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    throw new Error("RESEND_API_KEY is not set. See .env.example.");
+  }
+  resendSingleton = new Resend(apiKey);
+  return resendSingleton;
 }
 
 export const realEmailSender: EmailSender = {
   async sendRegisteredAgentAcceptanceEmail(input) {
-    const provider = process.env.EMAIL_PROVIDER_API_KEY;
-    if (!provider) {
+    const from = process.env.RESEND_FROM_EMAIL;
+    if (!process.env.RESEND_API_KEY || !from) {
       return {
         ok: false,
-        error: "No email provider configured (EMAIL_PROVIDER_API_KEY unset) — registered-agent acceptance email not sent",
+        error:
+          "Resend not configured (RESEND_API_KEY / RESEND_FROM_EMAIL unset) — registered-agent acceptance email not sent",
       };
     }
-    // Real provider call goes here (Resend/SES/Postmark/etc.), using
-    // buildRegisteredAgentAcceptanceEmail(input) for subject/text. Left
-    // unimplemented deliberately — no provider or credentials exist yet
-    // (see module comment); every path above this point (token minting,
-    // status transitions, the acceptance page, idempotency, auditing) is
-    // real and works today regardless of which provider eventually goes
-    // here.
-    return { ok: false, error: "realEmailSender has no provider implementation yet" };
+
+    const { subject, text, html } = buildRegisteredAgentAcceptanceEmail(input);
+
+    try {
+      const { data, error } = await getResend().emails.send({
+        from,
+        to: [input.toEmail],
+        subject,
+        text,
+        html,
+      });
+
+      if (error) {
+        return { ok: false, error: `Resend send failed: ${error.message}` };
+      }
+      return { ok: true, providerMessageId: data?.id };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
   },
 };

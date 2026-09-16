@@ -9,6 +9,16 @@ export interface CreateCheckoutSessionInput {
    *  orders.stripe_checkout_session_id -> orders lookup the webhook
    *  actually uses — see webhook/stripeWebhookService.ts). */
   orderId: string;
+  /** The Zoho Deal this filing session is already associated with
+   *  (filing_sessions.crm_deal_id — Gate 1, migration 0001), when one
+   *  exists. Carried through Stripe metadata so the webhook can write it
+   *  onto orders.crm_deal_id and enqueue a Deal-stage update at the
+   *  moment payment is confirmed, without a second DB round-trip back to
+   *  filing_sessions inside that transaction. Nothing populates
+   *  filing_sessions.crm_deal_id today (see checkoutService.ts's own
+   *  comment) — this is the plumbing for when something does, not a
+   *  currently-exercised path. */
+  crmDealId?: string | null;
 }
 
 export interface CreateCheckoutSessionResult {
@@ -58,7 +68,7 @@ export function getStripe(): Stripe {
 }
 
 export const realStripeCheckoutClient: StripeCheckoutClient = {
-  async createCheckoutSession({ lineItems, filingSessionId, crmIntent, orderId }) {
+  async createCheckoutSession({ lineItems, filingSessionId, crmIntent, orderId, crmDealId }) {
     const session = await getStripe().checkout.sessions.create({
       mode: "payment",
       line_items: lineItems,
@@ -82,6 +92,10 @@ export const realStripeCheckoutClient: StripeCheckoutClient = {
         filing_session_id: filingSessionId,
         crm_intent: crmIntent,
         order_id: orderId,
+        // Stripe metadata values must be strings and the object can't
+        // hold an explicit undefined — omitted entirely when there's no
+        // Deal yet, rather than sent as the literal string "null".
+        ...(crmDealId ? { crm_deal_id: crmDealId } : {}),
       },
     });
     return { id: session.id, url: session.url };
