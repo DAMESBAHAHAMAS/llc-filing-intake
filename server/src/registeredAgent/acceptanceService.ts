@@ -3,6 +3,7 @@ import { formatAddress } from "../pdf/formatAddress.js";
 import { generateAcceptanceToken, hashToken } from "./token.js";
 import type { EmailSender } from "./emailSender.js";
 import { buildRegisteredAgentAcceptanceEmail } from "./emailSender.js";
+import { isFilingDataFulfillmentReady, markOrderFulfillmentReady } from "../fulfillment/fulfillmentGate.js";
 import {
   ACCEPTANCE_LINK_TTL_MS,
   ACCEPTED,
@@ -67,15 +68,22 @@ async function getFilingSession(
   return rows[0] ?? null;
 }
 
-/** Writes only the agent_* keys FilingSessionRecord already defines
- *  (pdf/types.ts) — never the agent's email, which has no place in the
- *  PDF context and lives solely on registered_agent_acceptances. Reads
- *  the row FOR UPDATE first so a concurrent request can't clobber the
- *  rest of filing_data with a stale read. */
+/** Writes the agent_* keys FilingSessionRecord already defines
+ *  (pdf/types.ts). The agent's email is normally never written here —
+ *  it has no place in the PDF context and lives solely on
+ *  registered_agent_acceptances — with one deliberate exception: when
+ *  called from recordOwnAgentSelection (pre-payment, before any
+ *  registered_agent_acceptances row exists yet), agent.email is passed
+ *  and persisted as agent_email so the post-payment send
+ *  (reissueOwnAgentAcceptance, triggered from stripeWebhookService.ts)
+ *  has a durable place to recover it from. Existing callers
+ *  (setDamianAsRegisteredAgent, initiateOwnAgentAcceptance) omit email
+ *  and are unaffected. Reads the row FOR UPDATE first so a concurrent
+ *  request can't clobber the rest of filing_data with a stale read. */
 async function mergeAgentFieldsIntoFilingData(
   pool: Pool,
   filingSessionId: string,
-  agent: Omit<RegisteredAgentInfo, "email">,
+  agent: Omit<RegisteredAgentInfo, "email"> & { email?: string },
   agentChoice: "damian" | "own"
 ): Promise<void> {
   const client = await pool.connect();
@@ -95,6 +103,7 @@ async function mergeAgentFieldsIntoFilingData(
       agent_city: agent.city,
       agent_state: agent.state,
       agent_zip: agent.zip,
+      ...(agent.email ? { agent_email: agent.email } : {}),
     };
     await client.query("UPDATE filing_sessions SET filing_data = $2 WHERE filing_session_id = $1", [
       filingSessionId,
@@ -164,6 +173,30 @@ export interface DamianPathResult {
   status: "accepted";
 }
 
+/**
+ * Re-evaluates a single already-paid order's fulfillment_status after a
+ * registered_agent_status change to 'accepted' — the other half of the
+ * gate fulfillmentGate.ts's decideFulfillmentStatus applies at payment
+ * time. Writes orders.fulfillment_status only via markOrderFulfillmentReady
+ * (fulfillment/fulfillmentGate.ts), the one shared place that column is
+ * ever written from (see that module's comment). A no-op for an unpaid
+ * order (nothing to unblock yet — payment confirmation will make its own
+ * decision when it happens) or one already 'ready'/past it.
+ */
+async function reevaluateFulfillmentAfterAcceptance(pool: Pool, filingSessionId: string): Promise<void> {
+  const { rows } = await pool.query<{ order_id: string; payment_status: string; fulfillment_status: string; filing_data: unknown }>(
+    `SELECT o.order_id, o.payment_status, o.fulfillment_status, f.filing_data
+     FROM orders o
+     JOIN filing_sessions f ON f.filing_session_id = o.filing_session_id
+     WHERE o.filing_session_id = $1`,
+    [filingSessionId]
+  );
+  const order = rows[0];
+  if (!order || order.payment_status !== "paid" || order.fulfillment_status !== "not_ready") return;
+  if (!isFilingDataFulfillmentReady(order.filing_data)) return;
+  await markOrderFulfillmentReady(pool, order.order_id, "registered_agent_accepted", filingSessionId);
+}
+
 /** §5 of the locked schema. No email, ever. */
 export async function setDamianAsRegisteredAgent(pool: Pool, filingSessionId: string): Promise<DamianPathResult> {
   await supersedeOpenAcceptanceRequests(pool, filingSessionId, "switched_to_damian");
@@ -178,7 +211,49 @@ export async function setDamianAsRegisteredAgent(pool: Pool, filingSessionId: st
     reason: "damian_path",
     registered_agent_name: DAMIAN_REGISTERED_AGENT.name,
   });
+  // Covers switching an already-paid order from "own" to "damian" (e.g.
+  // an outside agent declined and the customer switched) — otherwise an
+  // order that was blocked on outside-agent acceptance would stay
+  // 'not_ready' forever even though the new choice needs no acceptance.
+  await reevaluateFulfillmentAfterAcceptance(pool, filingSessionId);
   return { status: "accepted" };
+}
+
+export interface RecordOwnAgentSelectionResult {
+  status: "pending";
+  validationErrors?: string[];
+}
+
+/**
+ * §3 of the locked schema, persistence half only. Validates and writes
+ * agent_choice="own" plus the agent's fields (including email — see
+ * mergeAgentFieldsIntoFilingData's comment) into filing_data, but does
+ * NOT send the acceptance email or create a registered_agent_acceptances
+ * row. Used by POST /registered-agent/select so the choice is captured
+ * and blocking-validated before the customer reaches Stripe Checkout;
+ * the actual email send is deferred to reissueOwnAgentAcceptance, called
+ * once payment is confirmed (stripeWebhookService.ts) — so a customer
+ * who never completes checkout never causes a third party to be emailed.
+ */
+export async function recordOwnAgentSelection(
+  pool: Pool,
+  filingSessionId: string,
+  agent: RegisteredAgentInfo
+): Promise<RecordOwnAgentSelectionResult> {
+  await mergeAgentFieldsIntoFilingData(
+    pool,
+    filingSessionId,
+    { name: agent.name, street: agent.street, unit: agent.unit, city: agent.city, state: agent.state, zip: agent.zip, email: agent.email },
+    "own"
+  );
+  await setRegisteredAgentStatus(pool, filingSessionId, "pending");
+
+  const errors = validateRegisteredAgentInfo(agent);
+  const session = await getFilingSession(pool, filingSessionId);
+  const llcName = (session?.filing_data?.["llc_name"] as string | undefined) ?? "";
+  if (!llcName.trim()) errors.push("llc_name must be set before selecting a registered agent");
+
+  return { status: "pending", validationErrors: errors.length ? errors : undefined };
 }
 
 export interface InitiateOwnAgentDeps {
@@ -289,7 +364,11 @@ export async function reissueOwnAgentAcceptance(
     `SELECT * FROM registered_agent_acceptances WHERE filing_session_id = $1 ORDER BY created_at DESC LIMIT 1`,
     [filingSessionId]
   );
-  const lastEmail = lastRow.rows[0]?.registered_agent_email;
+  // No registered_agent_acceptances row exists yet the first time this
+  // runs post-payment (recordOwnAgentSelection never creates one — see
+  // its own comment) — fall back to agent_email, written into filing_data
+  // for exactly this bridge by mergeAgentFieldsIntoFilingData.
+  const lastEmail = lastRow.rows[0]?.registered_agent_email ?? (data["agent_email"] as string | undefined);
   const agent: RegisteredAgentInfo = {
     name: (data["agent_name"] as string) ?? "",
     email: lastEmail ?? "",
@@ -434,6 +513,18 @@ export async function acceptRegisteredAgent(
       { acceptance_record_id: record.id, accepted_ip: acceptedIp },
     ]);
     await client.query("COMMIT");
+    // Best-effort, post-commit: the acceptance itself is already durable
+    // regardless of what happens here. Run outside this transaction (own
+    // pool query, not `client`) so a slow/failing check never holds the
+    // accept response open — the RA-facing page must not show an error
+    // for something that already succeeded. A failure here just means an
+    // already-paid order stays 'not_ready' a little longer than it
+    // should; nothing is lost, and it can be re-evaluated later.
+    try {
+      await reevaluateFulfillmentAfterAcceptance(pool, record.filing_session_id);
+    } catch (err) {
+      console.error(`Fulfillment re-evaluation failed for filing_session_id=${record.filing_session_id}:`, err);
+    }
     return { ok: true, filingSessionId: record.filing_session_id };
   } catch (err) {
     await client.query("ROLLBACK");

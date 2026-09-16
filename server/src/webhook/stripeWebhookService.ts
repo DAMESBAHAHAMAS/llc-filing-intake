@@ -3,6 +3,8 @@ import type Stripe from "stripe";
 import { describeError } from "../db/describeError.js";
 import type { StripeCheckoutClient } from "../checkout/stripeCheckoutClient.js";
 import type { ZohoClient } from "../zoho/client.js";
+import { decideFulfillmentStatus, type FulfillmentStatus } from "../fulfillment/fulfillmentGate.js";
+import { reissueOwnAgentAcceptance, type InitiateOwnAgentDeps } from "../registeredAgent/acceptanceService.js";
 
 export type WebhookProcessingResult =
   | "paid"
@@ -12,14 +14,7 @@ export type WebhookProcessingResult =
   | "amount_or_currency_mismatch"
   | "already_paid_noop";
 
-/** Mirrors the CHECK constraint on orders.fulfillment_status (migration 0010). */
-export type FulfillmentStatus =
-  | "not_ready"
-  | "ready"
-  | "in_progress"
-  | "transmitted"
-  | "failed"
-  | "requires_review";
+export type { FulfillmentStatus };
 
 interface OrderRow {
   order_id: string;
@@ -30,25 +25,6 @@ interface OrderRow {
   currency: string;
   crm_deal_id: string | null;
   product: string;
-}
-
-/**
- * Minimal, intentionally shallow fulfillment-readiness check — NOT a
- * substitute for the PDF composer's own validation
- * (pdf/composeArticlesOfOrganizationContext.ts), which remains the
- * authority on whether filing_data is complete enough to actually
- * generate Articles of Organization. This only needs to distinguish
- * "structurally absent" (the case Gate 2's own checkout gate — stage !==
- * 'complete' — should already prevent, but this is the payment-side
- * backstop for it) from "present enough to hand to the next stage." Full
- * field-level validation belongs to whatever consumes filing_data next
- * (PDF generation, and eventually Sunbiz transmission), not to this
- * payment-triggered gate.
- */
-function isFilingDataFulfillmentReady(filingData: unknown): boolean {
-  if (!filingData || typeof filingData !== "object") return false;
-  const llcName = (filingData as Record<string, unknown>).llc_name;
-  return typeof llcName === "string" && llcName.trim().length > 0;
 }
 
 /**
@@ -75,7 +51,8 @@ export async function processStripeWebhookEvent(
   pool: Pool,
   stripeClient: StripeCheckoutClient,
   zohoClient: ZohoClient,
-  event: Stripe.Event
+  event: Stripe.Event,
+  registeredAgentDeps: InitiateOwnAgentDeps
 ): Promise<{
   claimed: boolean;
   result?: WebhookProcessingResult;
@@ -197,6 +174,7 @@ export async function processStripeWebhookEvent(
   // left unfinished on failure; the same reasoning applies here).
   const client = await pool.connect();
   let fulfillmentStatus: FulfillmentStatus;
+  let shouldSendRegisteredAgentEmail = false;
   try {
     await client.query("BEGIN");
 
@@ -212,13 +190,15 @@ export async function processStripeWebhookEvent(
     // moment — checkoutService.ts) and actually paying, and FOR UPDATE
     // additionally blocks a concurrent POST /api/session/stage from
     // racing to clear filing_data while this decision is being made.
-    const sessionRow = await client.query<{ filing_data: unknown }>(
-      `SELECT filing_data FROM filing_sessions WHERE filing_session_id = $1 FOR UPDATE`,
+    const sessionRow = await client.query<{ filing_data: unknown; registered_agent_status: string | null }>(
+      `SELECT filing_data, registered_agent_status FROM filing_sessions WHERE filing_session_id = $1 FOR UPDATE`,
       [order.filing_session_id]
     );
     const filingData = sessionRow.rows[0]?.filing_data ?? null;
-    const ready = isFilingDataFulfillmentReady(filingData);
-    fulfillmentStatus = ready ? "ready" : "requires_review";
+    const registeredAgentStatus = sessionRow.rows[0]?.registered_agent_status ?? null;
+    const decision = decideFulfillmentStatus(filingData, registeredAgentStatus);
+    fulfillmentStatus = decision.status;
+    shouldSendRegisteredAgentEmail = decision.reason === "fulfillment_blocked_awaiting_registered_agent";
 
     await client.query(
       `UPDATE orders
@@ -232,13 +212,15 @@ export async function processStripeWebhookEvent(
     // this is the fulfillment signal itself, not a restatement of the
     // payment event. An operator (or, later, a fulfillment worker)
     // watching filing_events for 'fulfillment_ready' sees exactly the
-    // trigger this task exists to create; 'fulfillment_blocked_missing_filing_data'
-    // is the requires_review case's own record of *why*.
+    // trigger this task exists to create; the two "blocked" reasons are
+    // that record of *why* — either filing_data was missing/invalid at
+    // this exact moment, or (fulfillmentGate.ts) a third-party
+    // registered agent has been chosen but hasn't accepted yet.
     await client.query(
       `INSERT INTO filing_events (filing_session_id, event_type, payload) VALUES ($1, $2, $3)`,
       [
         order.filing_session_id,
-        ready ? "fulfillment_ready" : "fulfillment_blocked_missing_filing_data",
+        decision.reason,
         { order_id: order.order_id, stripe_session_id: sessionId },
       ]
     );
@@ -290,6 +272,36 @@ export async function processStripeWebhookEvent(
     throw new Error(`Payment confirmation transaction failed: ${describeError(err)}`);
   } finally {
     client.release();
+  }
+
+  // Third-party registered agent: the acceptance email fires HERE, only
+  // once payment is durably confirmed and committed — never at selection
+  // time (POST /registered-agent/select, pre-checkout, only persists the
+  // choice — registeredAgent/acceptanceService.ts's recordOwnAgentSelection).
+  // Deliberately outside the transaction above: this makes a real network
+  // call, and a slow or failing email provider must never hold open (or
+  // roll back) the payment-confirmation transaction. Reuses
+  // reissueOwnAgentAcceptance as-is (registeredAgent/acceptanceService.ts,
+  // §7) rather than a parallel send path — it already does exactly
+  // "pull the agent's persisted name/email/address back out of
+  // filing_data and send," which is exactly what a first send after
+  // payment needs too. A send failure here is recorded by that function
+  // itself (registered_agent_status -> 'email_failed', a filing_events
+  // row) rather than thrown, so it never turns into a Stripe-visible 500:
+  // payment_status is already safely 'paid' by this point, and a 500
+  // here would make Stripe redeliver an event that will now permanently
+  // hit the already_paid_noop guard above without ever retrying this
+  // step. An operator uses POST /registered-agent/retry to recover an
+  // email_failed order manually until a background retry exists.
+  if (shouldSendRegisteredAgentEmail) {
+    try {
+      await reissueOwnAgentAcceptance(pool, order.filing_session_id, registeredAgentDeps);
+    } catch (err) {
+      console.error(
+        `Registered-agent acceptance email failed for filing_session_id=${order.filing_session_id}:`,
+        describeError(err)
+      );
+    }
   }
 
   return { claimed: true, result: "paid", orderId: order.order_id, fulfillmentStatus };

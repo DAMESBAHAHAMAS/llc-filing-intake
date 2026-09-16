@@ -8,7 +8,25 @@ import type {
   StripeCheckoutClient,
 } from "../../src/checkout/stripeCheckoutClient.js";
 import type { ZohoClient, ZohoSyncResult } from "../../src/zoho/client.js";
+import type { InitiateOwnAgentDeps } from "../../src/registeredAgent/acceptanceService.js";
 import type Stripe from "stripe";
+
+/**
+ * No test in this file exercises the "own" (third-party) registered-agent
+ * path, so this fake email sender is never actually invoked — it exists
+ * only to satisfy processStripeWebhookEvent's dependency, same DI pattern
+ * as fakeStripeClient/fakeZohoClient above. See
+ * registeredAgent/acceptanceService.test.ts for coverage of the email
+ * send itself (reissueOwnAgentAcceptance).
+ */
+const fakeRegisteredAgentDeps: InitiateOwnAgentDeps = {
+  emailSender: {
+    async sendRegisteredAgentAcceptanceEmail() {
+      throw new Error("not expected to be called by this suite — no 'own' agent_choice fixture here");
+    },
+  },
+  appBaseUrl: "https://example.test",
+};
 
 /**
  * Runs against the real Supabase dev instance, same convention as every
@@ -148,7 +166,7 @@ describe("A. Happy path: verified payment marks the order paid", () => {
     const { client: zoho, calls: zohoCalls } = fakeZohoClient();
 
     const event = fakeEvent("evt_happy", "checkout.session.completed", stripeSessionId);
-    const outcome = await processStripeWebhookEvent(pool, stripe, zoho, event);
+    const outcome = await processStripeWebhookEvent(pool, stripe, zoho, event, fakeRegisteredAgentDeps);
 
     expect(outcome).toEqual({ claimed: true, result: "paid", orderId, fulfillmentStatus: "ready" });
     // Zoho is never called — crm_deal_id is null (Deal-at-checkout not
@@ -198,13 +216,13 @@ describe("B. Idempotency: the same event.id is never processed twice", () => {
 
     const event = fakeEvent("evt_dup", "checkout.session.completed", stripeSessionId);
 
-    const first = await processStripeWebhookEvent(pool, stripe, zoho, event);
+    const first = await processStripeWebhookEvent(pool, stripe, zoho, event, fakeRegisteredAgentDeps);
     expect(first).toEqual({ claimed: true, result: "paid", orderId, fulfillmentStatus: "ready" });
     expect(retrieveCalls.length).toBe(1);
 
     // Stripe redelivers the identical event object/id (its normal retry
     // behavior) — this must be recognized and skipped, not reprocessed.
-    const second = await processStripeWebhookEvent(pool, stripe, zoho, event);
+    const second = await processStripeWebhookEvent(pool, stripe, zoho, event, fakeRegisteredAgentDeps);
     expect(second).toEqual({ claimed: false });
     expect(retrieveCalls.length).toBe(1); // Stripe was not called again
 
@@ -221,7 +239,7 @@ describe("C. Unhandled event type: acknowledged, no state change", () => {
     });
     const { client: zoho } = fakeZohoClient();
 
-    const outcome = await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_other", "payment_intent.created", stripeSessionId));
+    const outcome = await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_other", "payment_intent.created", stripeSessionId), fakeRegisteredAgentDeps);
     expect(outcome).toEqual({ claimed: true, result: "ignored_unhandled_event_type" });
     expect(retrieveCalls.length).toBe(0);
 
@@ -238,7 +256,7 @@ describe("D. Unknown order_id: never marks an unrelated order paid", () => {
     const { client: zoho } = fakeZohoClient();
 
     const bogusSessionId = `cs_test_fake_${randomUUID()}`;
-    const outcome = await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_unknown", "checkout.session.completed", bogusSessionId));
+    const outcome = await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_unknown", "checkout.session.completed", bogusSessionId), fakeRegisteredAgentDeps);
     expect(outcome).toEqual({ claimed: true, result: "order_not_found" });
     expect(retrieveCalls.length).toBe(0);
   });
@@ -256,7 +274,7 @@ describe("E. Unpaid Checkout: order remains pending", () => {
     }));
     const { client: zoho } = fakeZohoClient();
 
-    const outcome = await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_unpaid", "checkout.session.completed", stripeSessionId));
+    const outcome = await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_unpaid", "checkout.session.completed", stripeSessionId), fakeRegisteredAgentDeps);
     expect(outcome).toEqual({ claimed: true, result: "payment_not_confirmed", orderId });
 
     const { rows } = await pool.query("SELECT payment_status, fulfillment_status FROM orders WHERE order_id = $1", [orderId]);
@@ -280,7 +298,7 @@ describe("F. Amount/currency mismatch: order remains pending, flagged", () => {
     }));
     const { client: zoho } = fakeZohoClient();
 
-    const outcome = await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_mismatch", "checkout.session.completed", stripeSessionId));
+    const outcome = await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_mismatch", "checkout.session.completed", stripeSessionId), fakeRegisteredAgentDeps);
     expect(outcome).toEqual({ claimed: true, result: "amount_or_currency_mismatch", orderId });
 
     const { rows } = await pool.query("SELECT payment_status FROM orders WHERE order_id = $1", [orderId]);
@@ -300,7 +318,7 @@ describe("G. Already-paid guard: a second, distinct event for an already-paid or
     }));
     const { client: zoho } = fakeZohoClient();
 
-    const outcome = await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_already_paid", "checkout.session.completed", stripeSessionId));
+    const outcome = await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_already_paid", "checkout.session.completed", stripeSessionId), fakeRegisteredAgentDeps);
     expect(outcome).toEqual({ claimed: true, result: "already_paid_noop", orderId });
     expect(retrieveCalls.length).toBe(0); // doesn't even need to re-verify with Stripe
   });
@@ -315,7 +333,7 @@ describe("H. Stripe verification failure: safely retryable, never falsely marks 
     const { client: zoho } = fakeZohoClient();
     const event = fakeEvent("evt_retry", "checkout.session.completed", stripeSessionId);
 
-    await expect(processStripeWebhookEvent(pool, failingStripe, zoho, event)).rejects.toThrow(
+    await expect(processStripeWebhookEvent(pool, failingStripe, zoho, event, fakeRegisteredAgentDeps)).rejects.toThrow(
       /simulated transient Stripe API error/
     );
 
@@ -337,7 +355,7 @@ describe("H. Stripe verification failure: safely retryable, never falsely marks 
       currency: "usd",
       metadata: null,
     }));
-    const retryOutcome = await processStripeWebhookEvent(pool, recoveredStripe, zoho, event);
+    const retryOutcome = await processStripeWebhookEvent(pool, recoveredStripe, zoho, event, fakeRegisteredAgentDeps);
     expect(retryOutcome).toEqual({ claimed: true, result: "paid", orderId, fulfillmentStatus: "ready" });
 
     const { rows: finalRows } = await pool.query("SELECT payment_status FROM orders WHERE order_id = $1", [orderId]);
@@ -357,7 +375,7 @@ describe("I. CRM: never faked, never duplicated, payment stays authoritative reg
     }));
     const { client: zoho, calls } = fakeZohoClient();
 
-    await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_crm_none", "checkout.session.completed", stripeSessionId));
+    await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_crm_none", "checkout.session.completed", stripeSessionId), fakeRegisteredAgentDeps);
     expect(calls.length).toBe(0);
 
     const { rows } = await pool.query(
@@ -379,7 +397,7 @@ describe("I. CRM: never faked, never duplicated, payment stays authoritative reg
     }));
     const { client: zoho, calls } = fakeZohoClient();
 
-    await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_crm_existing", "checkout.session.completed", stripeSessionId));
+    await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_crm_existing", "checkout.session.completed", stripeSessionId), fakeRegisteredAgentDeps);
     expect(calls.length).toBe(0); // never calls syncSession — would risk creating a duplicate Deal
 
     const { rows } = await pool.query(
@@ -409,7 +427,7 @@ describe("I. CRM: never faked, never duplicated, payment stays authoritative reg
       },
     };
 
-    const outcome = await processStripeWebhookEvent(pool, stripe, throwingZoho, fakeEvent("evt_crm_zoho_down", "checkout.session.completed", stripeSessionId));
+    const outcome = await processStripeWebhookEvent(pool, stripe, throwingZoho, fakeEvent("evt_crm_zoho_down", "checkout.session.completed", stripeSessionId), fakeRegisteredAgentDeps);
     expect(outcome).toEqual({ claimed: true, result: "paid", orderId, fulfillmentStatus: "ready" });
 
     const { rows } = await pool.query("SELECT payment_status FROM orders WHERE order_id = $1", [orderId]);
@@ -438,7 +456,8 @@ describe("J. Fulfillment bridge: paid + filing_data -> fulfillment_status", () =
       pool,
       stripe,
       zoho,
-      fakeEvent("evt_missing_filing_data", "checkout.session.completed", stripeSessionId)
+      fakeEvent("evt_missing_filing_data", "checkout.session.completed", stripeSessionId),
+      fakeRegisteredAgentDeps
     );
     expect(outcome).toEqual({ claimed: true, result: "paid", orderId, fulfillmentStatus: "requires_review" });
 
@@ -471,7 +490,7 @@ describe("J. Fulfillment bridge: paid + filing_data -> fulfillment_status", () =
     }));
     const { client: zoho } = fakeZohoClient();
 
-    await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_incomplete_filing_data", "checkout.session.completed", stripeSessionId));
+    await processStripeWebhookEvent(pool, stripe, zoho, fakeEvent("evt_incomplete_filing_data", "checkout.session.completed", stripeSessionId), fakeRegisteredAgentDeps);
 
     const { rows } = await pool.query("SELECT fulfillment_status FROM orders WHERE order_id = $1", [orderId]);
     expect(rows[0].fulfillment_status).toBe("requires_review");
@@ -489,8 +508,8 @@ describe("J. Fulfillment bridge: paid + filing_data -> fulfillment_status", () =
     const { client: zoho } = fakeZohoClient();
     const event = fakeEvent("evt_fulfillment_dup", "checkout.session.completed", stripeSessionId);
 
-    await processStripeWebhookEvent(pool, stripe, zoho, event);
-    await processStripeWebhookEvent(pool, stripe, zoho, event); // Stripe's own redelivery of the same event.id
+    await processStripeWebhookEvent(pool, stripe, zoho, event, fakeRegisteredAgentDeps);
+    await processStripeWebhookEvent(pool, stripe, zoho, event, fakeRegisteredAgentDeps); // Stripe's own redelivery of the same event.id
     expect(retrieveCalls.length).toBe(1); // second delivery never reaches fulfillment logic at all
 
     const { rows } = await pool.query(

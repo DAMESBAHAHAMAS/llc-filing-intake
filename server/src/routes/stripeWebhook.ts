@@ -5,6 +5,7 @@ import { getStripe, realStripeCheckoutClient } from "../checkout/stripeCheckoutC
 import { realZohoClient } from "../zoho/client.js";
 import { processStripeWebhookEvent } from "../webhook/stripeWebhookService.js";
 import { describeError } from "../db/describeError.js";
+import { realEmailSender } from "../registeredAgent/emailSender.js";
 
 export const stripeWebhookRouter = Router();
 
@@ -64,7 +65,10 @@ stripeWebhookRouter.post(
     }
 
     try {
-      const outcome = await processStripeWebhookEvent(pool, realStripeCheckoutClient, realZohoClient, event);
+      const outcome = await processStripeWebhookEvent(pool, realStripeCheckoutClient, realZohoClient, event, {
+        emailSender: realEmailSender,
+        appBaseUrl: process.env.APP_BASE_URL ?? "",
+      });
       res.status(200).json({ received: true, ...outcome });
     } catch (err) {
       // A verification/DB failure mid-processing — 500 so Stripe retries

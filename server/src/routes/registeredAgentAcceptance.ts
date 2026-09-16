@@ -5,7 +5,7 @@ import {
   acceptRegisteredAgent,
   declineRegisteredAgent,
   getAcceptancePageData,
-  initiateOwnAgentAcceptance,
+  recordOwnAgentSelection,
   reissueOwnAgentAcceptance,
   setDamianAsRegisteredAgent,
 } from "../registeredAgent/acceptanceService.js";
@@ -62,7 +62,12 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
       state: typeof body.state === "string" ? body.state : "",
       zip: typeof body.zip === "string" ? body.zip : "",
     };
-    const result = await initiateOwnAgentAcceptance(pool, filingSessionId, agent, initiateDeps());
+    // Persistence + validation only — no acceptance email here. The
+    // email sends once payment is confirmed (stripeWebhookService.ts
+    // calls reissueOwnAgentAcceptance), not at selection time, so a
+    // customer who never completes checkout never causes a third-party
+    // agent to be emailed. See recordOwnAgentSelection's own comment.
+    const result = await recordOwnAgentSelection(pool, filingSessionId, agent);
     res.status(200).json(result);
   } catch (err) {
     res.status(500).json({ error: "registered agent selection failed", detail: describeError(err) });
