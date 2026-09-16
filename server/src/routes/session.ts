@@ -18,9 +18,27 @@ const SESSION_FIELDS = [
   "entity_name_primary",
   "entity_name_backup",
   "name_check_results",
+  // Canonical structured filing data (llc_name, addresses, registered
+  // agent, authorized persons, effective date, other provisions, signer)
+  // — migration 0004. Shape is server/src/pdf/types.ts's
+  // FilingSessionRecord. `pg` JSON.stringify's a plain object bound to a
+  // jsonb column automatically, same as name_check_results above already
+  // relies on.
+  "filing_data",
   "order_total_cents",
-  "payment_status",
   "payment_ref",
+  // "payment_status" deliberately NOT in this whitelist — Gate 2 payment-
+  // authority security fix (GATE2-PAYMENT-AUTHORITY-STATUS.md). This
+  // column predates orders.payment_status and had no legitimate
+  // pre-payment purpose (confirmed: the frontend never sends it, nothing
+  // outside zoho/client.ts's now-fixed isPaid check ever read it) — but
+  // it fed directly into Zoho Deal "Payment Received" creation with zero
+  // verification. The canonical, sole payment authority is
+  // orders.payment_status, set only by the verified Stripe webhook
+  // (webhook/stripeWebhookService.ts). This column itself is left in
+  // place (not dropped — migration 0009 marks it NON-AUTHORITATIVE) in
+  // case anything historical reads it, but nothing may ever write to it
+  // through this endpoint again.
   "pdf_generated_at",
   "pdf_storage_ref",
   "crm_lead_id",
@@ -61,9 +79,12 @@ function extractPatch(body: Record<string, unknown>): SessionPatch {
  *
  * A sync job is only enqueued once an email exists (either already on
  * the session or provided in this call) — there is no Zoho entity to
- * sync to before that. The worker decides Lead vs. Deal from
- * payload_snapshot (e.g. a paid payment_status means "convert to
- * Deal"), so this endpoint only needs one generic sync_type.
+ * sync to before that. Every job enqueued from here is a plain Lead
+ * upsert (zoho/client.ts) — this endpoint's snapshot can never trigger a
+ * Deal conversion, by design (Gate 2 payment-authority security fix,
+ * GATE2-PAYMENT-AUTHORITY-STATUS.md): a filing session's own data is not
+ * a payment authority. Deal creation/update is reserved for a caller
+ * that can prove the payment came from the verified Stripe webhook.
  */
 sessionRouter.post("/api/session/stage", async (req, res) => {
   const body = (req.body ?? {}) as Record<string, unknown>;

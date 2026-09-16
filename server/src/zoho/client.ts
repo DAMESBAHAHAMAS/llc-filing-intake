@@ -53,6 +53,29 @@ async function getZohoAccessToken(): Promise<string> {
 }
 
 /**
+ * Gate 2 payment-authority security fix
+ * (GATE2-PAYMENT-AUTHORITY-STATUS.md): whether to convert to a Deal must
+ * NEVER be decided from anything that traces back to a raw
+ * filing_sessions row — that table's payment_status column is
+ * client-writable history (routes/session.ts's SESSION_FIELDS no longer
+ * even accepts it, but the column itself isn't dropped, and this
+ * function must not trust it regardless of that).
+ *
+ * `verified_paid` is deliberately NOT a filing_sessions column and never
+ * will be — routes/session.ts's snapshot is `SELECT * FROM
+ * filing_sessions`, so it can never contain this key by construction.
+ * The only way this is ever `true` is a caller that deliberately sets it
+ * after confirming payment through the verified Stripe webhook path
+ * (webhook/stripeWebhookService.ts) — which does not call syncSession at
+ * all today (see that file's CRM comment: orders.crm_deal_id is always
+ * null, so there's nothing yet to convert/update). This is the extension
+ * point for when that changes, not a currently-exercised path.
+ */
+export function isVerifiedPaidSnapshot(snapshot: Record<string, unknown>): boolean {
+  return snapshot.verified_paid === true;
+}
+
+/**
  * Real implementation. sync_type is always "session_sync" today (see
  * routes/session.ts) — this decides Lead vs. Deal from the snapshot
  * itself rather than requiring the caller to pick a sync_type.
@@ -73,7 +96,7 @@ export const realZohoClient: ZohoClient = {
       return { ok: false, error: "no email in payload_snapshot" };
     }
 
-    const isPaid = snapshot.payment_status === "paid" || snapshot.payment_status === "completed";
+    const isPaid = isVerifiedPaidSnapshot(snapshot);
 
     try {
       const leadRes = await fetch("https://www.zohoapis.com/crm/v2/Leads/upsert", {

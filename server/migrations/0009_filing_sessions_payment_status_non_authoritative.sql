@@ -1,0 +1,24 @@
+-- Gate 2 payment-authority security fix (GATE2-PAYMENT-AUTHORITY-STATUS.md).
+--
+-- filing_sessions.payment_status (migration 0001, Gate 1) was found to be
+-- client-writable via POST /api/session/stage's field whitelist, and its
+-- value flowed unverified into Zoho Deal "Payment Received" creation
+-- (zoho/client.ts). Both holes are closed in application code (routes/
+-- session.ts's SESSION_FIELDS no longer accepts payment_status;
+-- zoho/client.ts's Deal-conversion check no longer reads it at all).
+--
+-- This column is NOT dropped or renamed — a real column read is a much
+-- smaller, more reversible surface than a client-writable payment
+-- authority, and nothing has yet proven safe to delete against (an
+-- audit found zero rows currently pdf/registeredAgent/webhook code
+-- reading it, and zero live rows with it set, but "unused today" isn't
+-- the same guarantee as "provably fine to drop"). This comment is the
+-- durable, schema-level record that it must never be trusted as such
+-- again, regardless of what future code might be tempted to do with it.
+--
+-- The canonical, sole payment authority is orders.payment_status,
+-- written only by the verified Stripe webhook
+-- (webhook/stripeWebhookService.ts) — see that table's own comment
+-- (migration 0006).
+COMMENT ON COLUMN filing_sessions.payment_status IS
+  'NON-AUTHORITATIVE / legacy (Gate 1). Not client-writable since Gate 2''s payment-authority security fix — POST /api/session/stage no longer accepts this field. Never trust this column for payment, CRM, fulfillment, or Order-state decisions. The canonical payment field is orders.payment_status, set only by the verified Stripe webhook.';

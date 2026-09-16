@@ -342,3 +342,266 @@ instead of stopping the session to ask, since a suitable
 already-approved-by-existing-use alternative was available.
 
 **Supersedes:** —
+
+---
+
+## 2026-09-01 — Sunbiz-fulfillment bridge: trigger lives inside the Stripe webhook transaction, on `orders.fulfillment_status`, transmission not yet connected
+
+**Rationale:** GATE2-STRIPE-WEBHOOK-STATUS.md §17 named this the explicit
+handoff point ("`orders.payment_status = 'paid'` is currently a terminal
+state with no further automation... the natural next Gate 2 task is exactly
+what this one calls out as its own handoff point"). The requirement: create
+a reliable, idempotent, server-side signal that a paid order is ready for
+Sunbiz fulfillment, without transmitting anything to Sunbiz yet and without
+the frontend or any client-supplied value ever influencing it.
+
+Design chosen: six new columns on `orders` (migration `0010`) —
+`fulfillment_status` (`not_ready` | `ready` | `in_progress` | `transmitted`
+| `failed` | `requires_review`, default `not_ready`) plus
+`fulfillment_ready_at`/`_started_at`/`_completed_at`/`_attempts`/`_last_error`
+— rather than a new queue table (the `crm_sync_queue` pattern). A paid order
+has exactly one fulfillment job, unlike CRM syncs (many per filing_session
+over its lifetime) or registered-agent acceptances (reissuable); a status
+column co-located with `payment_status` matches the existing
+`registered_agent_status` precedent (migration 0005) instead.
+
+The trigger itself is written **only** by `webhook/stripeWebhookService.ts`,
+inside the **same database transaction** that sets `payment_status = 'paid'`
+— the sole existing payment authority, unchanged. That "mark paid" step was
+previously two independent `pool.query` calls (payment_status update, then
+a `filing_events` audit insert); wrapping the whole outcome (payment,
+fulfillment decision, both audit events, and the `stripe_webhook_events`
+idempotency ledger's completion) in one transaction closes a real
+crash-recovery gap: without it, a crash between those two writes, followed
+by Stripe's routine redelivery of the same `event.id`, would hit the
+existing `already_paid_noop` guard on retry and permanently skip whatever
+came after the first write. Fulfillment readiness re-reads `filing_data`
+fresh inside that transaction, with `FOR UPDATE`, rather than trusting
+anything read earlier — a customer can take arbitrarily long between
+Checkout Session creation (gated on `current_stage = 'complete'` at that
+earlier moment) and actually paying.
+
+A schema-level `CHECK (fulfillment_status = 'not_ready' OR payment_status =
+'paid')` constraint on `orders` makes it structurally impossible — not just
+application-logic-impossible — for fulfillment to ever advance on an unpaid
+order, regardless of future application bugs, manual `UPDATE`s, or a worker
+written without reading this decision.
+
+`in_progress`/`transmitted`/`failed` are defined in the CHECK constraint for
+forward compatibility but are **not driven by any code yet** — no worker
+claims `ready` rows, and no Sunbiz client exists. That is the next task,
+requires explicit approval per this task's own instruction, and was not
+started here.
+
+**Files:** `server/migrations/0010_orders_fulfillment_status.sql` (new);
+`server/src/webhook/stripeWebhookService.ts` (paid-path rewritten as one
+transaction; new `FulfillmentStatus` type; new
+`isFilingDataFulfillmentReady` check); `server/test/webhook/stripeWebhookService.test.ts`
+(4 existing assertions updated for the new `fulfillmentStatus` return field;
+new "J. Fulfillment bridge" describe block: missing filing_data ->
+`requires_review`, incomplete filing_data -> `requires_review`, duplicate
+delivery doesn't double-write the `fulfillment_ready` audit event, and a
+direct proof of the schema-level CHECK constraint). Frontend
+(`florida-business-launchpad`) untouched — the trigger is fully
+server-side, and the customer-facing success page still reads only
+`payment_status`, unchanged.
+
+**Supersedes:** —
+
+---
+
+## 2026-09-01 — Sunbiz-fulfillment transmission layer: fax adapter (Telnyx), PDF retention, idempotent transmission ledger
+
+**Rationale:** the prior session's fulfillment bridge (immediately above) left
+`orders.fulfillment_status = 'ready'` as a terminal signal with nothing
+consuming it. This task builds the actual transmission engine: generate the
+filing package, retain the PDF, transmit it by fax, record the result — with
+the destination fully configurable (a free Phase-1 test number today, the
+real Sunbiz fax number later, same code either way) and Sunbiz never
+hardcoded anywhere in the fulfillment engine itself.
+
+**Provider:** Telnyx Fax API — chosen explicitly over Sinch/Phaxio (direct
+multipart upload, no public URL needed) because the user already has reasons
+to prefer Telnyx. The trade-off this decision accepts: Telnyx sends by
+`media_url` (a URL it fetches), so this service needed a new public,
+token-gated route (`GET /api/fax-media/:token`, routes/faxMedia.ts) for
+Telnyx to pull the generated PDF from — unauthenticated by necessity (Telnyx
+carries no credentials of ours) but access-controlled by an unguessable,
+sha256-hashed, expiring, single-document capability token, the same posture
+already established for registered-agent acceptance links (migration 0005).
+`registeredAgent/token.ts`'s existing `hashToken`/token-hash discipline is
+reused directly, not duplicated.
+
+**Schema (migration 0011):** two new tables, one new column, no existing
+row/column touched.
+- `filing_documents` — the authoritative retained PDF artifact (bytea in
+  Postgres, not an external store — GOVERNANCE.md rule 9 explicitly rules out
+  Supabase Storage, and volume is small enough that a new storage dependency
+  isn't justified). One row per fulfillment attempt, never mutated.
+- `fulfillment_transmissions` — one row per EXPLICIT transmission attempt,
+  mirroring `registered_agent_acceptances`' "single status column on the
+  parent + full append-only history table" pattern (migration 0005) rather
+  than a new queue table: a paid order has exactly one fulfillment job, so
+  there's nothing to enqueue more than once per order, unlike
+  `crm_sync_queue`. `UNIQUE(order_id, attempt_number)` is the idempotency
+  backstop at the database level. `document_id` is nullable (an attempt can
+  fail during PDF generation, before any document exists) but a CHECK
+  constraint makes it structurally impossible for a row to claim
+  `submitted`/`delivered` without one.
+- `orders.fulfillment_run_after` — backoff gate, reusing `crm_sync_queue`'s
+  exact naming convention and `sync/backoff.ts`'s exact schedule (not a new
+  schedule).
+
+**Worker design (server/src/fulfillment/fulfillmentWorker.ts):** deliberately
+modeled on `sync/worker.ts` + `sync/backoff.ts` — `SELECT ... FOR UPDATE SKIP
+LOCKED` to claim, process outside the lock, record the outcome in its own
+transaction, the identical backoff/dead-letter schedule — reused, not
+reinvented. Two additions beyond the CRM worker's shape:
+1. **The registered-agent gate is now wired in.** `acceptanceService.ts`'s
+   own comment named `isFilingSessionRegisteredAgentAccepted` as "the
+   function any future filing-submission path... should call before
+   proceeding. Not wired to a caller yet." The fulfillment claim query now
+   requires `filing_sessions.registered_agent_status = 'accepted'` — an order
+   that's paid and fulfillment-ready but whose agent hasn't accepted yet is
+   simply not selected (not a failure, not a counted attempt); it's picked
+   up automatically the moment that status flips, with no new wiring needed
+   anywhere else.
+2. **Stale in_progress reclaim.** A worker crash between claiming an order
+   and finishing its attempt would otherwise strand that order at
+   `in_progress` forever (it's no longer `'ready'`, so it would never be
+   re-claimed). The claim query also matches an `in_progress` order whose
+   `fulfillment_started_at` is older than a timeout (default 10 minutes),
+   treating it as eligible for a new, explicit attempt.
+
+**Idempotency, end to end:** the SKIP LOCKED claim means no two ticks can
+ever process the same order at once; `UNIQUE(order_id, attempt_number)` means
+a duplicate row for the same attempt is a constraint violation, not a
+possibility; and `orders.fulfillment_attempts` is bumped atomically with the
+transmission-row reservation (in the same transaction), not re-derived later
+from a possibly-stale snapshot — an earlier draft of this worker double-
+counted attempts by recomputing `attempts + 1` in two different places from
+two different snapshots of the same order; fixed by threading the
+authoritative `attemptNumber` explicitly through both call sites instead of
+letting either recompute it.
+
+**Verified with a real, non-fake PDF:** `render_pdf.py`'s dependencies were
+installed locally (a throwaway venv, discarded afterward) and the full
+pipeline was run against it with a fake fax provider standing in for Telnyx
+(no Telnyx account exists in this environment) — a genuine 89,771-byte
+WeasyPrint PDF (verified `%PDF` magic bytes) was generated from
+`composeArticlesOfOrganizationContext`, retained with its sha256, and the
+order reconciled through to `fulfillment_status = 'transmitted'`. Test rows
+were cleaned up afterward; the local PDF service and its venv were torn down.
+
+**Gap found, logged, not fixed (out of this task's scope per GOVERNANCE.md
+rule 12 — not P0):** `render_pdf.py`'s pinned `weasyprint==62.3` crashes
+(`AttributeError: 'super' object has no attribute 'transform'`) against a
+freshly-`pip install`ed `pydyf` (0.12.1) — a known class of tight coupling
+between WeasyPrint point releases and pydyf. Downgrading to `pydyf==0.11.0`
+in the local venv fixed it. **Not changed in `requirements.txt`** — this is
+the separately-managed, already-deployed Render dashboard service (per
+`render.yaml`'s own comment), untouched by this task, and its deployed
+environment's actual resolved `pydyf` version was not checked. Whoever next
+touches `render_pdf.py`'s dependencies should pin `pydyf` explicitly rather
+than leaving it to float.
+
+**Files:** `server/migrations/0011_fulfillment_transmissions.sql` (new);
+`server/src/fulfillment/faxProvider.ts` (new — `FaxProvider` interface +
+`telnyxFaxProvider`); `server/src/fulfillment/documentStore.ts` (new);
+`server/src/fulfillment/fulfillmentWorker.ts` (new); `server/src/routes/faxMedia.ts`
+(new); `server/src/index.ts` (mounts the new route, starts the fulfillment
+poller — refuses to start without `FULFILLMENT_FAX_DESTINATION_NUMBER` and
+`FULFILLMENT_MEDIA_BASE_URL` set); `server/.env.example` (new variables
+documented); `server/test/fulfillment/fulfillmentWorker.test.ts` (new, 15
+tests); `server/test/fulfillment/faxMediaRoute.test.ts` (new, 3 tests).
+Frontend (`florida-business-launchpad`) untouched — nothing about fulfillment
+is triggered from, or observable by, the client.
+
+**Not built (explicit stop point per this task's own instruction):** nothing
+was connected to a REAL Telnyx account — `TELNYX_API_KEY`/
+`TELNYX_FAX_CONNECTION_ID`/`TELNYX_FAX_FROM_NUMBER` are documented in
+`.env.example` but unset in this environment, and no real fax has been sent.
+`in_progress`→`transmitted`/`failed` reconciliation code exists and is
+tested against a fake provider, but has never observed a real Telnyx
+response.
+
+**Supersedes:** —
+
+---
+
+## 2026-09-01 — Database ambiguity resolved: one authoritative Postgres instance, proven live; production Render URL confirmed
+
+**Rationale:** a WBS audit flagged uncertainty about which Postgres instance
+is authoritative for `filing_sessions`/`orders`/`filing_documents`/
+`fulfillment_transmissions` before any further fulfillment work proceeds.
+Investigated read-only (Render MCP + Supabase MCP, both now authorized for
+this account; no application code changed). Two facts proven with live
+evidence, not inference from config files alone:
+
+**Fact 1 — Authoritative database.** Exactly one Postgres instance is in
+play: Supabase project **`llc-filing-intake`** (ref `rtivwkqsuuvbkvdudgnd`,
+`us-west-2`, status `ACTIVE_HEALTHY`, Postgres 17.6.1.155). Proof chain:
+1. Local `server/.env`'s `DATABASE_URL` username embeds project ref
+   `rtivwkqsuuvbkvdudgnd` — directly identifies this project (host
+   `aws-0-us-west-2.pooler.supabase.com`, the session pooler per
+   GOVERNANCE.md rule 9).
+2. Queried that project directly via Supabase MCP (`execute_sql`):
+   `schema_migrations` shows `0011_fulfillment_transmissions` applied at
+   `2026-09-01 07:16:48 UTC` — the exact migration this session applied via
+   that same local `DATABASE_URL` minutes earlier.
+3. The **deployed** Render service's own `/health` endpoint
+   (`routes/health.ts`'s `getLatestAppliedVersion(pool)`, queried live
+   against whatever `DATABASE_URL` Render has configured — not inferred, not
+   read from a dashboard) returns
+   `{"status":"ok","db":"connected","migrations":"0011_fulfillment_transmissions"}`
+   at the time of this check. `"0011_fulfillment_transmissions"` is a
+   filename this session invented; the only process that could ever have
+   applied it anywhere is this session's own `npm run migrate` run against
+   local `DATABASE_URL`. The deployed service reporting it as ITS OWN
+   latest-applied version is therefore not merely strong evidence but a
+   logical proof that Render's configured `DATABASE_URL` resolves to the
+   same physical database as local dev's.
+4. Attempted an additional live cross-check (insert a uniquely-tagged marker
+   order via direct SQL, read it back through the deployed service's public
+   `GET /checkout/session-status`) — this 404'd, but for an unrelated,
+   fully-explained reason: see Fact 2's deploy-lag finding below, not a
+   different-database explanation. The marker row was inserted and deleted
+   directly against the `llc-filing-intake` project only; nothing left
+   behind.
+
+**Conclusion:** local dev and the deployed Render service share ONE
+Supabase Postgres instance — there is no second, forked, or stale database
+in play for these four tables. `omnichannel-voice-intake`
+(`usdqzhkilpmylenxfhdc`, status `INACTIVE`) is a different, unrelated
+Supabase project belonging to a different Render service of the same name;
+it plays no role here and was checked only to positively rule it out.
+
+**Fact 2 — Production Render URL, and a deploy-lag finding.** The `llc-data-spine`
+web service (`srv-d9u1ihh42hec739av8og`, workspace `tea-d6iool450q8c73ba8rag`)
+is confirmed live at **`https://llc-data-spine.onrender.com`** (repo
+`DAMESBAHAHAMAS/llc-filing-intake`, branch `main`, root dir `server`).
+Its currently-live deploy (`dep-da609t8u01pc738oivc0`, status `live`) is
+built from commit `ac3930e` — the exact tip of local `git log` on `main`.
+**This means the deployed service is running code from BEFORE `checkout.ts`,
+`stripeWebhook.ts`, and every fulfillment file this and the prior session
+wrote — none of that work has been committed/pushed yet (by design; every
+session in this engagement has been explicitly instructed not to commit or
+push).** This is why `GET /checkout/session-status` 404'd on the deployed
+service during the cross-check above: the route's source file doesn't exist
+in commit `ac3930e`, not because of a database mismatch. The database is
+shared and current (migration 0011 applied); the deployed application code
+is several commits behind local. Also confirmed in the same account:
+`llc-pdf-generator` (`srv-d94edalckfvc739rg9jg`,
+`https://llc-pdf-generator.onrender.com`) is the deployed name for
+`render_pdf.py` — referred to only as "the PDF service" or by
+`PDF_SERVICE_URL` in prior session notes, its actual Render service name
+had not previously been confirmed in this repo's own docs.
+
+**No application code changed by this investigation** — read-only Render/
+Supabase MCP calls, one inserted-then-deleted marker row, this documentation
+entry. `GOVERNANCE.md`/`DEPLOY.md` should be updated to name the Supabase
+project (`llc-filing-intake`, ref `rtivwkqsuuvbkvdudgnd`) and the Render
+service ids explicitly the next time either is touched, so future sessions
+don't have to re-derive this from scratch.
+
+**Supersedes:** —
