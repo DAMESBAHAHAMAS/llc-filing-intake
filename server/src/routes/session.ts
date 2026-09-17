@@ -26,6 +26,16 @@ export const sessionRouter = Router();
  * (syncSession no longer creates Deals at all — that is now exclusively
  * the webhook-triggered order_deal path's job, per the frozen CRM
  * sequencing rule: Deal only after a verified Stripe webhook).
+ *
+ * filing_data (migration 0004) is intentionally back in this list: the
+ * canonical structured filing content (Articles I-VI, including
+ * registered_agent_path/name/florida_address) has never had anywhere
+ * else to be written from — pdf/context.ts and fulfillment/
+ * fulfillmentWorker.ts already read it, but nothing wrote it (see
+ * DECISIONS.md's schema/migration-drift entry). It is not a payment or
+ * CRM-linkage field, so it doesn't carry the P0 fix's forgery risk
+ * above — a client lying about its own filing content only affects its
+ * own filing, never another customer's payment or CRM record.
  */
 const SESSION_FIELDS = [
   "email",
@@ -41,6 +51,7 @@ const SESSION_FIELDS = [
   "utm_medium",
   "utm_campaign",
   "abandoned_at",
+  "filing_data",
 ] as const;
 
 type SessionField = (typeof SESSION_FIELDS)[number];
@@ -133,6 +144,28 @@ sessionRouter.post("/api/session/stage", async (req, res) => {
         VALUES (${insertPlaceholders.join(", ")})
       `;
       await client.query(sql, [sessionId, stage, ...setValues]);
+    }
+
+    // crm_deal_id: deliberately NOT in SESSION_FIELDS above — it carries
+    // the same class of forgery risk the P0 fix removed payment_status
+    // for (a client could otherwise point this session at an unrelated
+    // real Zoho Deal it doesn't own, and the webhook would later PUT a
+    // stage change onto that Deal — see zoho/client.ts's
+    // updateDealStage). Mitigated here with a narrower, purpose-built
+    // path: COALESCE means this can only ever be set ONCE per session —
+    // a value already on the row is never overwritten, so even a client
+    // that races this call can't hijack an id set by an earlier, honest
+    // call (e.g. from the Cloudflare Worker's real intake-time Deal
+    // creation). This does not verify the id is real or belongs to this
+    // session's Contact — that would need a Zoho round-trip this
+    // request-path doesn't make; a forged-but-plausible id still reaches
+    // updateDealStage, which fails harmlessly against Zoho if the id
+    // doesn't exist. Logged as a known residual gap, not fixed here.
+    if (typeof body.crm_deal_id === "string" && body.crm_deal_id.trim()) {
+      await client.query(
+        `UPDATE filing_sessions SET crm_deal_id = COALESCE(crm_deal_id, $2) WHERE filing_session_id = $1`,
+        [sessionId, body.crm_deal_id.trim()]
+      );
     }
 
     const stageChanged = previousStage !== stage;

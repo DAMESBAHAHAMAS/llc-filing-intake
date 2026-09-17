@@ -1,5 +1,5 @@
 import type { Pool } from "pg";
-import type { OrderSyncPayload, ZohoClient, ZohoSyncResult } from "../zoho/client.js";
+import type { DealStageUpdatePayload, OrderSyncPayload, ZohoClient, ZohoSyncResult } from "../zoho/client.js";
 import { backoffForAttempt, isDeadLetter } from "./backoff.js";
 
 export interface ClaimedJob {
@@ -66,6 +66,9 @@ export async function claimNextJob(pool: Pool, lockedBy: string): Promise<Claime
 function dispatchSync(client: ZohoClient, job: ClaimedJob): Promise<ZohoSyncResult> {
   if (job.sync_type === "order_deal" || job.sync_type === "abandoned_cart") {
     return client.syncOrderEvent(job.payload_snapshot as unknown as OrderSyncPayload);
+  }
+  if (job.sync_type === "deal_stage_update") {
+    return client.updateDealStage(job.payload_snapshot as unknown as DealStageUpdatePayload);
   }
   return client.syncSession(job.payload_snapshot);
 }

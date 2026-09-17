@@ -92,6 +92,13 @@ export interface CreateCheckoutSessionParams {
   successUrl: string;
   cancelUrl: string;
   customerEmail?: string;
+  /** Carried through to the Checkout Session's own metadata and read
+   *  back by routes/webhooksStripe.ts from the (already signature-
+   *  verified) webhook event body — no extra Stripe round-trip needed,
+   *  since this client already trusts the embedded event object for
+   *  payment_status too. Used today for crm_deal_id (see that file's
+   *  comment on the Zoho Deal lifecycle this threads into). */
+  metadata?: Record<string, string>;
 }
 
 export interface StripeCheckoutSession {
@@ -120,6 +127,7 @@ export async function createCheckoutSession(params: CreateCheckoutSessionParams)
     cancel_url: params.cancelUrl,
     customer_email: params.customerEmail,
     billing_address_collection: "required",
+    metadata: params.metadata,
   });
 }
 

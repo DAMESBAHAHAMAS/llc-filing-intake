@@ -69,8 +69,8 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
   }
 
   try {
-    const session = await pool.query<{ email: string | null }>(
-      "SELECT email FROM filing_sessions WHERE filing_session_id = $1",
+    const session = await pool.query<{ email: string | null; crm_deal_id: string | null }>(
+      "SELECT email, crm_deal_id FROM filing_sessions WHERE filing_session_id = $1",
       [filingSessionId]
     );
     if (session.rowCount === 0) {
@@ -136,6 +136,12 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         // Stripe Checkout would have landed on the 404 page.
         cancelUrl: `${frontendBaseUrl}/checkout/cancel?filing_session_id=${encodeURIComponent(filingSessionId)}&order_id=${encodeURIComponent(orderId)}`,
         customerEmail: session.rows[0].email ?? undefined,
+        // Carries the Cloudflare Worker's intake-time Deal id (when
+        // known — filing_sessions.crm_deal_id, see routes/session.ts's
+        // POST /api/session/stage) through to the webhook, so it can
+        // update that existing Deal's stage instead of creating a
+        // second one. See zoho/client.ts's updateDealStage comment.
+        metadata: session.rows[0].crm_deal_id ? { crm_deal_id: session.rows[0].crm_deal_id } : undefined,
       });
 
       await pool.query(

@@ -30,6 +30,24 @@ export interface ZohoClient {
    * touches the Lead, never a Deal (frozen CRM sequencing rule).
    */
   syncOrderEvent(payload: OrderSyncPayload): Promise<ZohoSyncResult>;
+  /**
+   * sync_type='deal_stage_update' — the OTHER Deal lifecycle this
+   * codebase now supports, alongside syncOrderEvent's "create the Deal
+   * at payment time": the Cloudflare Worker (llc-worker.js) creates the
+   * Deal at intake and hands its id back to the customer's session
+   * (filing_sessions.crm_deal_id); once payment is confirmed,
+   * routes/webhooksStripe.ts enqueues this job to update that EXISTING
+   * Deal's stage rather than create a second one. Only reachable when a
+   * crm_deal_id was already known at payment time — see that file's own
+   * comment for what happens when it isn't (falls back to the existing
+   * paid_deal creation path, unchanged).
+   */
+  updateDealStage(payload: DealStageUpdatePayload): Promise<ZohoSyncResult>;
+}
+
+export interface DealStageUpdatePayload {
+  crm_deal_id: string;
+  target_stage: string;
 }
 
 export interface OrderSyncPayload {
@@ -219,6 +237,41 @@ export const realZohoClient: ZohoClient = {
       const dealData = (await dealRes.json()) as { data?: Array<{ details?: { id?: string } }> };
       const dealId = dealData.data?.[0]?.details?.id;
       return { ok: true, dealId };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  },
+
+  /**
+   * Updates an EXISTING Deal by id (PUT, not POST) — the opposite
+   * concern from syncOrderEvent's "never create a duplicate Deal": this
+   * path only ever runs when orders.crm_deal_id is already known
+   * (routes/webhooksStripe.ts only enqueues this job when it is), so
+   * there is no Lead-upsert or Deal-create step here at all.
+   */
+  async updateDealStage(payload: DealStageUpdatePayload): Promise<ZohoSyncResult> {
+    let token: string;
+    try {
+      token = await getZohoAccessToken();
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+
+    try {
+      const res = await fetch(`https://www.zohoapis.com/crm/v2/Deals/${encodeURIComponent(payload.crm_deal_id)}`, {
+        method: "PUT",
+        headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ data: [{ Stage: payload.target_stage }] }),
+      });
+
+      if (res.status === 401) {
+        return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal stage update" };
+      }
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        return { ok: false, httpStatus: res.status, error: `Zoho Deal stage update failed (${res.status}): ${body}` };
+      }
+      return { ok: true, dealId: payload.crm_deal_id };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }

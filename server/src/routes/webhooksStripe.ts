@@ -2,21 +2,10 @@ import { Router } from "express";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { verifyStripeSignature, WebhookSignatureError } from "../stripe/webhookSignature.js";
+import { needsSunbizFiling } from "../offers/sunbizFiling.js";
+import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
 
 export const stripeWebhookRouter = Router();
-
-/**
- * offer_codes whose presence in an order's line_items means "this order
- * includes an actual Articles of Organization filing with the state" —
- * i.e. needs the Sunbiz fax-fulfillment pipeline (orders.fulfillment_status
- * -> 'ready'). EIN-only, Registered-Agent-only, or Credentials-Kit-only
- * orders never touch that pipeline at all.
- */
-const SUNBIZ_FILING_OFFER_CODES = new Set(["FASTTRACK", "PREMIUM", "DIY_STATE_FEE"]);
-
-function needsSunbizFiling(lineItems: Array<{ offer_code?: string }>): boolean {
-  return lineItems.some((li) => li.offer_code && SUNBIZ_FILING_OFFER_CODES.has(li.offer_code));
-}
 
 interface MinimalStripeEvent {
   id: string;
@@ -76,6 +65,8 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
   }
 
   const client = await pool.connect();
+  let shouldSendRegisteredAgentEmail = false;
+  let paidFilingSessionId: string | null = null;
   try {
     await client.query("BEGIN");
 
@@ -95,7 +86,7 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
     let orderId: string | null = null;
 
     if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
-      const session = event.data.object as { id: string; payment_status?: string };
+      const session = event.data.object as { id: string; payment_status?: string; metadata?: Record<string, string> | null };
       const orderRes = await client.query<{
         order_id: string;
         filing_session_id: string;
@@ -118,9 +109,29 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
 
         if (session.payment_status === "paid" && order.payment_status !== "paid") {
           const requiresFiling = needsSunbizFiling(order.line_items ?? []);
+
+          // Registered-agent gate: a "customer" (third-party) RA must
+          // accept before Sunbiz filing may proceed — typing a name at
+          // intake is not acceptance (frozen rule, pdf/context.ts).
+          // "house" never blocks (server-stamped identity, no acceptance
+          // needed). filing_data/registered_agent_status are read fresh
+          // here, inside this transaction, FOR UPDATE alongside the
+          // order row above, rather than trusted from any earlier read.
+          const sessionForGate = await client.query<{
+            filing_data: { registered_agent_path?: string } | null;
+            registered_agent_status: string | null;
+          }>(
+            `SELECT filing_data, registered_agent_status FROM filing_sessions WHERE filing_session_id = $1 FOR UPDATE`,
+            [order.filing_session_id]
+          );
+          const registeredAgentPath = sessionForGate.rows[0]?.filing_data?.registered_agent_path;
+          const registeredAgentStatus = sessionForGate.rows[0]?.registered_agent_status ?? null;
+          const blockedOnRegisteredAgent = registeredAgentPath === "customer" && registeredAgentStatus !== "accepted";
+          const fulfillmentReady = requiresFiling && !blockedOnRegisteredAgent;
+
           await client.query(
             `UPDATE orders
-             SET payment_status = 'paid', paid_at = now()${requiresFiling ? ", fulfillment_status = 'ready', fulfillment_ready_at = now()" : ""}
+             SET payment_status = 'paid', paid_at = now()${fulfillmentReady ? ", fulfillment_status = 'ready', fulfillment_ready_at = now()" : ""}
              WHERE order_id = $1`,
             [orderId]
           );
@@ -130,27 +141,59 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
             [order.filing_session_id]
           );
 
-          await client.query(
-            `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot)
-             VALUES ($1, $2, 'order_deal', $3)`,
-            [
-              order.filing_session_id,
-              orderId,
-              JSON.stringify({
-                kind: "paid_deal",
-                order: {
-                  order_id: orderId,
-                  filing_session_id: order.filing_session_id,
-                  product: order.product,
-                  crm_intent: order.product,
-                  total_cents: order.total_cents,
-                },
-                filing_session: sessionRow.rows[0] ?? {},
-              }),
-            ]
-          );
+          // Zoho Deal lifecycle: when the Cloudflare Worker already
+          // created a Deal at intake (filing_sessions.crm_deal_id, known
+          // here via Stripe metadata — routes/checkout.ts sets it,
+          // read back from this already-signature-verified event body,
+          // no extra Stripe round-trip needed), update that EXISTING
+          // Deal's stage instead of creating a second one. Only when
+          // it's unknown does this fall back to the original "create a
+          // Deal at payment time" path (order_deal/paid_deal) —
+          // unchanged, so an order never ends up with zero Deal linkage
+          // just because the Worker->session capture didn't happen yet.
+          const crmDealId = session.metadata?.crm_deal_id;
+          const targetStage = process.env.ZOHO_DEAL_STAGE_ON_PAYMENT;
+          if (crmDealId) {
+            await client.query(`UPDATE orders SET crm_deal_id = $2 WHERE order_id = $1`, [orderId, crmDealId]);
+            if (targetStage) {
+              await client.query(
+                `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot)
+                 VALUES ($1, $2, 'deal_stage_update', $3)`,
+                [order.filing_session_id, orderId, JSON.stringify({ crm_deal_id: crmDealId, target_stage: targetStage })]
+              );
+              processingResult = "deal_stage_update_enqueued";
+            } else {
+              // No confirmed "this means paid" Zoho Stage value set
+              // (ZOHO_DEAL_STAGE_ON_PAYMENT, .env.example) — deliberately
+              // not enqueued rather than guessed; a wrong guess would
+              // just dead-letter against Zoho's own INVALID_DATA error.
+              processingResult = "crm_deal_id_set_but_target_stage_unconfigured";
+            }
+          } else {
+            await client.query(
+              `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot)
+               VALUES ($1, $2, 'order_deal', $3)`,
+              [
+                order.filing_session_id,
+                orderId,
+                JSON.stringify({
+                  kind: "paid_deal",
+                  order: {
+                    order_id: orderId,
+                    filing_session_id: order.filing_session_id,
+                    product: order.product,
+                    crm_intent: order.product,
+                    total_cents: order.total_cents,
+                  },
+                  filing_session: sessionRow.rows[0] ?? {},
+                }),
+              ]
+            );
+            processingResult = "paid_deal_enqueued";
+          }
 
-          processingResult = "paid_deal_enqueued";
+          shouldSendRegisteredAgentEmail = blockedOnRegisteredAgent;
+          paidFilingSessionId = order.filing_session_id;
         } else {
           processingResult = "payment_status_not_paid_or_already_paid";
         }
@@ -225,6 +268,26 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
     ]);
 
     await client.query("COMMIT");
+
+    // Third-party ("customer") registered agent: the acceptance email
+    // fires HERE, only once payment is durably confirmed and committed —
+    // never at selection time (POST /registered-agent/select only
+    // persists the choice). Deliberately outside the transaction above:
+    // this makes a real network call, and a slow/failing email provider
+    // must never hold open or roll back the payment-confirmation
+    // transaction. A send failure is recorded by dispatchAcceptanceEmail
+    // itself (registered_agent_status -> 'email_failed', a durable row)
+    // rather than thrown, so it never turns this into a 500 — payment is
+    // already safely recorded either way, and an operator can trigger a
+    // resend via POST /api/registered-agent/request-acceptance.
+    if (shouldSendRegisteredAgentEmail && paidFilingSessionId) {
+      try {
+        await dispatchAcceptanceEmail(pool, paidFilingSessionId);
+      } catch (err) {
+        console.error(`Registered-agent acceptance email failed for filing_session_id=${paidFilingSessionId}:`, describeError(err));
+      }
+    }
+
     res.status(200).json({ received: true });
   } catch (err) {
     await client.query("ROLLBACK");
