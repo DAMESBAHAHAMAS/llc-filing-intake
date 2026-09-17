@@ -5,10 +5,18 @@ storefront that lets a customer actually start it.
 
 **Branches this deploys**
 
+Superseded, 2026-09-17: both branches below are already merged into
+`main` (`llc-filing-intake` `main` is at `c27ee58` as of this update,
+which also includes the RA-choice email workflow, the fulfillment gate,
+the Worker-Deal-then-stage-update CRM lifecycle, and Deal ownership
+verification — see DECISIONS.md's 2026-09-17 entries). `main` is what
+Render actually deploys (`autoDeploy: commit` on `srv-d9u1ihh42hec739av8og`)
+— there is no separate branch-merge step left to do here.
+
 | Repo | Branch |
 |---|---|
-| `llc-filing-intake` | `feat/gate2-backend-rebased` |
-| `florida-business-launchpad` | `feat/checkout-initiation-catalog-tiers` |
+| `llc-filing-intake` | `main` |
+| `florida-business-launchpad` | `main` |
 
 **Stripe mode: TEST.** The Offer Master is seeded with test-mode Price
 IDs (`acct_1ChHmZDo01bXdbWS`). Live-mode promotion is separate work — do
@@ -31,6 +39,10 @@ from the coding session.
 - [ ] Render dashboard access for `llc-data-spine` (`srv-d9u1ihh42hec739av8og`)
 - [ ] Lovable publish access for the frontend
 - [ ] Stripe Dashboard access to create a webhook endpoint
+- [ ] A Resend account with a verified sending domain, and its API key
+- [ ] The real Zoho Stage value that means "paid," confirmed against this
+      org's live Deals picklist (Zoho CRM → Setup → Deals → Stage field)
+      — not assumed from any name that merely sounds right
 
 **Already done — do not redo:** all 14 migrations (`0001`–`0014`) are
 applied to the production database. `offers` exists and is seeded.
@@ -53,6 +65,14 @@ Service: `llc-data-spine` → Environment.
 | `PDF_SERVICE_URL` | `https://llc-pdf-generator.onrender.com` | Fulfillment can't render; order parks at `requires_review` |
 | `PDF_SERVICE_API_KEY` | (PDF service key) | Same as above |
 | `SUNBIZ_PROXY_URL` | `https://sunbiz-proxy.onrender.com/api/sunbiz/check` | Server-side name check unavailable |
+| `RESEND_API_KEY` | (Resend dashboard → API Keys) | `registeredAgent/emailSender.ts` fails clearly, RA acceptance email not sent (CP11) |
+| `RESEND_FROM_EMAIL` | an address on a domain verified in Resend | Same as above |
+| `ZOHO_DEAL_STAGE_ON_PAYMENT` | a Stage value confirmed against this org's live Deals picklist | No `deal_stage_update` job is enqueued at all (deliberately — see zoho/client.ts's comment); `orders.crm_deal_id` still gets set, just no stage change |
+
+`RESEND_API_KEY`/`RESEND_FROM_EMAIL`/`ZOHO_DEAL_STAGE_ON_PAYMENT` are new
+as of the 2026-09-17 work above — none of the three has been set in any
+environment yet; provisioning a Resend account/domain and confirming a
+real Zoho Stage value are both human-only steps (§0).
 
 Leave `SYNC_POLLER_INTERVAL_MS` and `FULFILLMENT_POLLER_INTERVAL_MS`
 unset — both default to 30s. `EIN_EXPRESS_DAILY_CAPACITY` is not needed:
@@ -266,11 +286,28 @@ roll back; delete test rows afterwards for hygiene.
 
 State these plainly rather than discovering them mid-test:
 
-- **No email (CP11).** No transactional email provider is wired in any
-  deployed code. The customer receives no confirmation email, and the
-  registered-agent acceptance flow issues a token and URL that nothing
-  delivers. Blocked on provisioning a provider — an infrastructure
-  decision, not a coding task.
+- **No email (CP11) — code now exists, credentials do not.** As of
+  2026-09-17, `registeredAgent/emailSender.ts` (Resend SDK) and
+  `registeredAgent/acceptanceEmail.ts` are deployed and both
+  `POST /registered-agent/select` (deferred to payment) and
+  `POST /api/registered-agent/request-acceptance` (immediate) call them.
+  Until `RESEND_API_KEY`/`RESEND_FROM_EMAIL` are set (§1), every send
+  fails clearly and `registered_agent_status` records `email_failed` —
+  no confirmation email, no RA acceptance email, but also no crash and
+  no silent pretense of success. Blocked on provisioning the Resend
+  account/domain — an infrastructure decision, not a coding task.
+- **Deal-stage update not yet enqueued (new, 2026-09-17).**
+  `crm_deal_id` capture (Cloudflare Worker → `filing_sessions.crm_deal_id`
+  → Stripe metadata → `orders.crm_deal_id`) works once the frontend's
+  `deal_id` capture ships, but no `deal_stage_update` job is enqueued
+  until `ZOHO_DEAL_STAGE_ON_PAYMENT` is set to a value confirmed against
+  the live Zoho picklist (§1) — deliberately, rather than guessing and
+  guaranteeing a dead-lettered job. Even once it's enqueued,
+  `zoho/client.ts`'s ownership check (ZOHO_DEAL_STAGE_ON_PAYMENT-gated,
+  see DECISIONS.md 2026-09-17 "crm_deal_id ownership verification")
+  requires the Deal's linked Contact email to match the filing session's
+  — confirm the Cloudflare Worker sets that Contact correctly, or every
+  such job will dead-letter on a legitimate order too.
 - **No customer document retrieval (CP10 tier-4).** The PDF is generated
   and stored in `filing_documents`, but no route serves it to the
   customer. Tier 1–3 evidence is available; tier 4 is not.
