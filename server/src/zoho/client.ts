@@ -19,6 +19,18 @@ export interface ZohoSyncResult {
    *  tell "bad/expired token" apart from "Zoho unreachable." */
   httpStatus?: number;
   error?: string;
+  /**
+   * Set on a failure that will NEVER succeed on retry — e.g. Deal
+   * ownership verification failed (updateDealStage below), or the Deal
+   * id simply doesn't exist. Distinguishes "Zoho is down/rate-limited,
+   * try again later" (the default, backoff-and-retry assumption every
+   * other failure here makes) from "this job is permanently wrong, stop
+   * retrying it" — sync/worker.ts's recordOutcome sends a `permanent`
+   * failure straight to dead_letter instead of burning the normal
+   * 1m/5m/15m/1h/6h/24h backoff schedule against something that can
+   * never resolve itself.
+   */
+  permanent?: boolean;
 }
 
 export interface ZohoClient {
@@ -48,6 +60,17 @@ export interface ZohoClient {
 export interface DealStageUpdatePayload {
   crm_deal_id: string;
   target_stage: string;
+  /**
+   * filing_sessions.email at the moment payment was confirmed
+   * (routes/webhooksStripe.ts) — the ownership check updateDealStage
+   * runs before ever touching the Deal: a client-supplied crm_deal_id
+   * (see routes/session.ts's own comment on that trust boundary) is
+   * otherwise just a string nothing has verified belongs to this
+   * customer. Required, not optional — a job with no expected_email to
+   * check against is a bug in the enqueueing code, not something this
+   * client should paper over by skipping the check.
+   */
+  expected_email: string;
 }
 
 export interface OrderSyncPayload {
@@ -248,6 +271,20 @@ export const realZohoClient: ZohoClient = {
    * path only ever runs when orders.crm_deal_id is already known
    * (routes/webhooksStripe.ts only enqueues this job when it is), so
    * there is no Lead-upsert or Deal-create step here at all.
+   *
+   * Ownership verification (routes/session.ts's own comment on the
+   * crm_deal_id trust boundary: it's client-suppliable, set-once, but
+   * NEVER verified at capture time): before writing anything, this
+   * fetches the Deal, follows its Contact_Name lookup to that Contact's
+   * Email, and requires it to match payload.expected_email
+   * (case-insensitive). A client that supplied someone else's real
+   * crm_deal_id fails here — unless it also controls an email address
+   * matching that Deal's actual linked Contact, which is the same bar as
+   * actually owning the record. A mismatch, a missing Contact link, or a
+   * Deal that doesn't exist at all are all `permanent` failures (see
+   * ZohoSyncResult) — never retried, dead-lettered immediately with the
+   * reason preserved in crm_sync_queue.last_error (a durable, queryable
+   * record — GATE 2 acceptance: durable artifacts over transient logs).
    */
   async updateDealStage(payload: DealStageUpdatePayload): Promise<ZohoSyncResult> {
     let token: string;
@@ -258,18 +295,66 @@ export const realZohoClient: ZohoClient = {
     }
 
     try {
-      const res = await fetch(`https://www.zohoapis.com/crm/v2/Deals/${encodeURIComponent(payload.crm_deal_id)}`, {
+      const dealRes = await fetch(
+        `https://www.zohoapis.com/crm/v2/Deals/${encodeURIComponent(payload.crm_deal_id)}?fields=Contact_Name,Deal_Name`,
+        { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
+      );
+      if (dealRes.status === 401) {
+        return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal ownership lookup" };
+      }
+      if (dealRes.status === 404) {
+        return { ok: false, httpStatus: 404, permanent: true, error: `Deal ${payload.crm_deal_id} does not exist — ownership cannot be verified` };
+      }
+      if (!dealRes.ok) {
+        const body = await dealRes.text().catch(() => "");
+        return { ok: false, httpStatus: dealRes.status, error: `Zoho Deal ownership lookup failed (${dealRes.status}): ${body}` };
+      }
+
+      const dealData = (await dealRes.json()) as { data?: Array<{ Contact_Name?: { id?: string } | null }> };
+      const contactId = dealData.data?.[0]?.Contact_Name?.id;
+      if (!contactId) {
+        return {
+          ok: false,
+          permanent: true,
+          error: `Deal ${payload.crm_deal_id} has no linked Contact — cannot verify it belongs to this filing session`,
+        };
+      }
+
+      const contactRes = await fetch(`https://www.zohoapis.com/crm/v2/Contacts/${encodeURIComponent(contactId)}?fields=Email`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      });
+      if (contactRes.status === 401) {
+        return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Contact ownership lookup" };
+      }
+      if (!contactRes.ok) {
+        const body = await contactRes.text().catch(() => "");
+        return { ok: false, httpStatus: contactRes.status, error: `Zoho Contact ownership lookup failed (${contactRes.status}): ${body}` };
+      }
+
+      const contactData = (await contactRes.json()) as { data?: Array<{ Email?: string | null }> };
+      const contactEmail = (contactData.data?.[0]?.Email ?? "").trim().toLowerCase();
+      const expectedEmail = payload.expected_email.trim().toLowerCase();
+
+      if (!contactEmail || contactEmail !== expectedEmail) {
+        return {
+          ok: false,
+          permanent: true,
+          error: `Deal ${payload.crm_deal_id} ownership verification failed: linked Contact email does not match this filing session's email`,
+        };
+      }
+
+      const updateRes = await fetch(`https://www.zohoapis.com/crm/v2/Deals/${encodeURIComponent(payload.crm_deal_id)}`, {
         method: "PUT",
         headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ data: [{ Stage: payload.target_stage }] }),
       });
 
-      if (res.status === 401) {
+      if (updateRes.status === 401) {
         return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal stage update" };
       }
-      if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        return { ok: false, httpStatus: res.status, error: `Zoho Deal stage update failed (${res.status}): ${body}` };
+      if (!updateRes.ok) {
+        const body = await updateRes.text().catch(() => "");
+        return { ok: false, httpStatus: updateRes.status, error: `Zoho Deal stage update failed (${updateRes.status}): ${body}` };
       }
       return { ok: true, dealId: payload.crm_deal_id };
     } catch (err) {

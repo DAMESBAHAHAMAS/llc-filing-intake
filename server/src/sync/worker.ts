@@ -123,7 +123,14 @@ async function recordOutcome(pool: Pool, job: ClaimedJob, result: ZohoSyncResult
       );
     } else {
       const newAttempts = job.attempts + 1;
-      if (isDeadLetter(newAttempts, job.max_attempts)) {
+      // result.permanent (zoho/client.ts's updateDealStage: an ownership
+      // mismatch, a missing linked Contact, or a Deal that doesn't
+      // exist) skips the normal backoff schedule entirely — none of
+      // those resolve themselves by waiting and retrying, so treating
+      // them the same as a transient Zoho outage would just burn
+      // attempts/hours for a job that can never pass. Straight to
+      // dead_letter, same durable record either way.
+      if (result.permanent || isDeadLetter(newAttempts, job.max_attempts)) {
         await client.query(
           `UPDATE crm_sync_queue
            SET status = 'dead_letter', attempts = $2, locked_at = NULL, locked_by = NULL, last_error = $3

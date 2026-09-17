@@ -153,15 +153,31 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
           // just because the Worker->session capture didn't happen yet.
           const crmDealId = session.metadata?.crm_deal_id;
           const targetStage = process.env.ZOHO_DEAL_STAGE_ON_PAYMENT;
+          const expectedEmail = sessionRow.rows[0]?.email;
           if (crmDealId) {
             await client.query(`UPDATE orders SET crm_deal_id = $2 WHERE order_id = $1`, [orderId, crmDealId]);
-            if (targetStage) {
+            if (targetStage && expectedEmail) {
+              // expected_email is what zoho/client.ts's updateDealStage
+              // verifies the Deal's linked Contact against before ever
+              // writing to it — crm_deal_id itself is client-suppliable
+              // (routes/session.ts) and unverified at capture time; this
+              // is the actual ownership check, not this enqueue step.
               await client.query(
                 `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot)
                  VALUES ($1, $2, 'deal_stage_update', $3)`,
-                [order.filing_session_id, orderId, JSON.stringify({ crm_deal_id: crmDealId, target_stage: targetStage })]
+                [
+                  order.filing_session_id,
+                  orderId,
+                  JSON.stringify({ crm_deal_id: crmDealId, target_stage: targetStage, expected_email: expectedEmail }),
+                ]
               );
               processingResult = "deal_stage_update_enqueued";
+            } else if (!expectedEmail) {
+              // No email on this filing_session to verify Deal ownership
+              // against — enqueueing would only produce a job that can
+              // never pass the ownership check, so it isn't enqueued at
+              // all rather than guaranteed-dead-lettered.
+              processingResult = "crm_deal_id_set_but_no_email_to_verify_ownership";
             } else {
               // No confirmed "this means paid" Zoho Stage value set
               // (ZOHO_DEAL_STAGE_ON_PAYMENT, .env.example) — deliberately
