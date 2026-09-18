@@ -808,3 +808,17 @@ than through any queue table.
 **Files:** `routes/filingDocument.ts` (new), `index.ts` (route registration), `migrations/0015_filing_documents_pre_payment.sql` (new — not yet applied). Frontend: `src/lib/canonicalFilingData.ts` (bug fix), `src/pages/LLCFilingIntake.tsx` (`handleComplete` calls the new endpoint and triggers a browser download after RA selection succeeds, before the best-effort CRM sync step; failure here never blocks checkout, per the requirement's explicit no-gate rule).
 
 **Supersedes:** —
+
+---
+
+## 2026-09-18 — Fixed `llc-pdf-generator`'s actual rendering crash: unpinned `pydyf` resolved to an incompatible version, breaking every real (non-empty-context) PDF render
+
+**Rationale:** once migration 0015 was applied and `PDF_SERVICE_URL` configured (closing the two previous blockers), the new pre-payment endpoint was re-tested live against a real, complete filing session — the first time `render_pdf.py`'s `/generate-pdf` had ever actually been exercised with real, complete template data rather than an empty or synthetic context. It crashed with a 500. Render's own logs for `llc-pdf-generator` (`srv-d94edalckfvc739rg9jg`) gave the exact traceback: `render_pdf.py:80`'s `HTML(...).write_pdf()` → WeasyPrint's `pdf/stream.py:246` → `AttributeError: 'super' object has no attribute 'transform'`.
+
+This is a known, documented incompatibility (Kozea/WeasyPrint#2620): `pydyf` 0.11.0 removed the `Stream.transform()` method WeasyPrint 62.x's PDF-writing code calls via `super().transform(...)`. `requirements.txt` pinned `weasyprint==62.3` but never pinned `pydyf`, so `pip install -r requirements.txt` was free to resolve whatever the latest `pydyf` happened to be at build time — which, by the time this was actually exercised, was >=0.11.0. This was not caused by anything in this session's own work; it is a pre-existing, previously-undetected bug in `render_pdf.py`'s own dependency pinning that simply never surfaced before because nothing had ever driven a real PDF render through this service until the pre-payment endpoint did today.
+
+**Fix:** added `pydyf<0.11.0` to `requirements.txt`, directly above `jinja2`. Deliberately did not upgrade WeasyPrint itself (a documented alternative fix, `weasyprint>=63.0`, resolves the same bug but is a materially larger change to an already-hardened, already-tested rendering pipeline than a one-line dependency ceiling). Verified before deploying, not assumed: a clean `pip install --dry-run --report` against the updated `requirements.txt` in an isolated venv confirms this resolves to `pydyf==0.10.0` / `weasyprint==62.3`, matching the known-working combination.
+
+**Files:** `requirements.txt` (repo root — `llc-pdf-generator`'s own dependency file, a separate deployed Render service from `llc-data-spine` despite sharing this git repo).
+
+**Supersedes:** —
