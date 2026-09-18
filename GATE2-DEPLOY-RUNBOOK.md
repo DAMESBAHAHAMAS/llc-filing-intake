@@ -259,6 +259,79 @@ Stripe's testing docs. Nothing in the rate limiting or bot protection is
 geo-aware, so this should behave identically — confirm it does rather
 than assuming.
 
+### 6.4 Pre-payment PDF generation (Requirement 1, 2026-09-18 requirement handoff) — PASSED, evidenced 2026-09-18
+
+Distinct from §6's flow: this happens at intake completion, before
+checkout even starts, and is unrelated to `orders`/Stripe entirely. Not
+a payment-approval gate — a visibility/evidence control per the
+requirement.
+
+**What was run:** a full live interview at `https://damianknowles.com/file-florida-llc`
+— house registered agent, member-managed/single-member, immediate
+effective date, no other provisions — completed through Signature.
+
+**Evidence, tiers 1–4:**
+
+```sql
+-- Tier 1: filing session, canonical filing_data in the exact shape buildPdfContext requires
+select filing_session_id, filing_data, registered_agent_status, current_stage
+from filing_sessions where filing_session_id = '1833f714-5e8a-4cc2-bc67-562ba2c165f2';
+-- confirmed: principal_address/mailing_address combined correctly, registered_agent_path='house',
+-- authorized_persons=[{name,address,article_iv_title}], effective_date_option='Immediate'
+
+-- Tier 3/4: the generated document (order_id IS NULL = pre-payment)
+select id, filing_session_id, order_id, byte_size, sha256, created_at
+from filing_documents where filing_session_id = '1833f714-5e8a-4cc2-bc67-562ba2c165f2';
+-- id=50, order_id=NULL, byte_size=86755, sha256=90871569a7db3d6dfad1a100a353dda5c15ca060c3cea4537854732ad20c4582
+```
+
+- Downloaded PDF bytes' independently-recomputed SHA-256 matched the
+  DB-recorded value exactly (byte-for-byte, not just row existence).
+- PDF content read back and checked field-by-field against a PDF-parsing
+  tool (not just "a file exists"): Article I name, Article II
+  principal/mailing address, Article III registered agent identity,
+  Article IV authorized person, Article V effective date, and Article VI
+  all matched what was entered in the live form exactly.
+- `{{zs_agent_signature}}` / `{{zs_authorized_signature}}` /
+  `{{zs_date_signed}}` render as literal text in the PDF — confirmed via
+  `templates/articles_of_organization.html.j2` (`{{ '{{zs_agent_signature}}' }}`,
+  deliberately escaped so Jinja2 emits it as text, `class="zs-anchor"`)
+  to be intentional Zoho Sign text-tag anchors for the not-yet-built
+  signing envelope (`API.md`'s "Zoho Sign — NOT BUILT", decision
+  boundary #4) — not an unpopulated template variable.
+
+**Two real, previously-undetected bugs were found and fixed to get here, not just configuration:**
+1. `florida-business-launchpad/src/lib/canonicalFilingData.ts` never
+   actually produced `FilingSessionRecord`'s shape (sent
+   `principal_street/city/state/zip` etc. instead of a combined
+   `principal_address`, and separate `members`/`managers` arrays instead
+   of one flat `authorized_persons`) — meaning `buildPdfContext` would
+   have reported every filing as incomplete regardless of what a
+   customer entered, **pre- or post-payment**, silently, since intake
+   was first wired to write `filing_data` at all. This was not specific
+   to the pre-payment path — it would have blocked §6.1 tier-3's
+   `filing_documents` row for every real paid order too, had one ever
+   reached fulfillment.
+2. `llc-pdf-generator`'s `requirements.txt` never pinned `pydyf`, which
+   resolved to an incompatible 0.11.0+ at build time (`AttributeError:
+   'super' object has no attribute 'transform'`, a known WeasyPrint
+   issue, Kozea/WeasyPrint#2620) — every real (non-empty-context) render
+   crashed, on this path or the fulfillment worker's. Fixed by pinning
+   `pydyf<0.11.0`. See `DECISIONS.md`, 2026-09-18 entries, for both.
+
+**Pass conditions:** filing session's `filing_data` complete and
+correctly shaped; exactly one `filing_documents` row with `order_id IS
+NULL`; recorded `sha256` matches independently-recomputed hash of the
+delivered bytes; PDF content matches submitted form data field-by-field.
+All met.
+
+**Still open, not resolved by this evidence:** WorkDrive delivery
+(SA4-T464, R-0100) — this section covers generation and browser
+download only, not the frozen-record archival destination. Internal
+reviewer delivery (the requirement's own "designated internal reviewer"
+copy) is also not yet built — the PDF is retrievable by the customer's
+own browser today, nothing yet pushes a copy anywhere internal.
+
 ---
 
 ## 7. Rollback
@@ -308,9 +381,15 @@ State these plainly rather than discovering them mid-test:
   requires the Deal's linked Contact email to match the filing session's
   — confirm the Cloudflare Worker sets that Contact correctly, or every
   such job will dead-letter on a legitimate order too.
-- **No customer document retrieval (CP10 tier-4).** The PDF is generated
-  and stored in `filing_documents`, but no route serves it to the
-  customer. Tier 1–3 evidence is available; tier 4 is not.
+- **No customer document retrieval (CP10 tier-4) — post-payment path only.**
+  The *post-payment fulfillment* PDF (`order_id NOT NULL` rows,
+  generated by `fulfillmentWorker.ts` after Stripe confirms payment) is
+  generated and stored in `filing_documents`, but no route serves it to
+  the customer. Tier 1–3 evidence is available; tier 4 is not. This is
+  now resolved for the separate *pre-payment* PDF (`order_id IS NULL`,
+  §6.4) — that one is customer-retrievable via browser download at
+  intake completion. The two are different rows generated by different
+  code paths; fixing one did not fix the other.
 - **Fulfillment stops at `requires_review`.** The worker generates and
   persists the PDF, then deliberately parks the order rather than
   reporting a fax transmission that didn't happen. This is intentional
