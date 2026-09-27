@@ -28,7 +28,7 @@
 -- before this file is applied. Refuse to run with the placeholder.
 DO $$
 BEGIN
-  IF '__DIY_SERVICE_FEE_V2_PRICE_ID__' LIKE '\_\_%' THEN
+  IF 'price_1UK7xmDo01bXdbWSy2gwongH' LIKE '\_\_%' THEN
     RAISE EXCEPTION '0016: DIY_SERVICE_FEE v2 Stripe price id placeholder not replaced';
   END IF;
 END $$;
@@ -41,7 +41,7 @@ INSERT INTO offers
   (offer_code, offer_version, display_name, crm_intent, stripe_product_id, stripe_price_id, unit_amount_cents, internal_cost_cents, inclusions, exclusions, sla_clock_start, status, notes)
 VALUES
   ('DIY_SERVICE_FEE', 'v2', 'DIY Processing / Service Fee', 'LLC_FORMATION_DIY',
-   'prod_V9b4rBVgiREeGZ', '__DIY_SERVICE_FEE_V2_PRICE_ID__', 900, NULL,
+   'prod_V9b4rBVgiREeGZ', 'price_1UK7xmDo01bXdbWSy2gwongH', 900, NULL,
    '[]'::jsonb, '[]'::jsonb, NULL, 'active',
    'Flat $9. DIY total = 125 (DIY_STATE_FEE) + 9 + 5 (DIY_CERT_OF_STATUS) = $139, per the 2026-09-17 pricing decision.'),
 
