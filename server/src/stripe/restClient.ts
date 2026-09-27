@@ -134,3 +134,16 @@ export async function createCheckoutSession(params: CreateCheckoutSessionParams)
 export async function retrieveCheckoutSession(sessionId: string): Promise<StripeCheckoutSession> {
   return stripeRequest<StripeCheckoutSession>("GET", `/checkout/sessions/${encodeURIComponent(sessionId)}`);
 }
+
+export interface StripePrice {
+  id: string;
+  active: boolean;
+  unit_amount: number | null;
+  currency: string;
+  product: string;
+}
+
+/** Read-only; used by scripts/verifyPriceParity.ts. */
+export async function retrievePrice(priceId: string): Promise<StripePrice> {
+  return stripeRequest<StripePrice>("GET", `/prices/${encodeURIComponent(priceId)}`);
+}

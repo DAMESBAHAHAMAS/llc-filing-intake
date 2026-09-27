@@ -822,3 +822,117 @@ This is a known, documented incompatibility (Kozea/WeasyPrint#2620): `pydyf` 0.1
 **Files:** `requirements.txt` (repo root — `llc-pdf-generator`'s own dependency file, a separate deployed Render service from `llc-data-spine` despite sharing this git repo).
 
 **Supersedes:** —
+
+---
+
+## 2026-09-17 — Package pricing: DIY $139 ($9 service + $130 state), FastTrack $499, Premium $999, Registered Agent $98, EIN $299, Credentials Kit $89 (recorded retroactively 2026-09-27)
+
+**Rationale:** decided 2026-09-17 and implemented on the storefront in
+`florida-business-launchpad` `e4abff8` ("Unify pricing catalog…",
+`src/data/offer-catalog.ts`); the Registered Agent Stripe price was changed
+to $98 the same evening (Stripe reports `price_1U8bhU…` at 9800). The
+decision was never recorded here, and was never propagated to the `offers`
+table or to a $9 DIY service-fee Stripe price, so checkout would have charged
+DIY $134 and displayed RA at $100. Found by the 2026-09-26 reconciliation
+audit (`florida-business-launchpad/RECONCILIATION-AUDIT-2026-09-26.md`) and
+**confirmed by Damian 2026-09-26** as an established decision.
+The DIY state-fee component is $130 = $125 filing (includes the $25 RA
+designation) + $5 Certificate of Status; in Stripe terms DIY =
+DIY_STATE_FEE 12500 + DIY_SERVICE_FEE 900 + DIY_CERT_OF_STATUS 500.
+Implemented in the Offer Master by `migrations/0016_offer_master_pricing_2026_09_17.sql`.
+Enforced by `npm run verify:prices` (displayed = catalog = Stripe) and the
+storefront's price-parity test.
+
+**Supersedes:** the $134 DIY composition and the $4 DIY_SERVICE_FEE in
+"2026-09-09 — Stripe catalog drift", and `PRICING.md`'s $129 (2026-09-02).
+
+---
+
+## 2026-09-10 — EIN Filing Express confirmed at $299 (recorded retroactively 2026-09-27)
+
+**Rationale:** Stripe product `prod_VDlv9FbHrhq4S8` carries
+`pricing_status: CONFIRMED_2026-09-10` on its active price
+`price_1UE0RY…` ($299); the $449 price that 0012 seeded as `draft` is
+inactive in Stripe. 0016 retires v1 and makes v2 ($299) active.
+
+**Supersedes:** the EIN_FILING_EXPRESS `draft` note in "2026-09-09 — Stripe
+catalog drift" and 0012's seed row.
+
+---
+
+## 2026-09-12 — Operating Agreement, BOI and Banking are not sold as à-la-carte add-ons (recorded retroactively 2026-09-27)
+
+**Rationale:** GATE2-DEPLOY-RUNBOOK.md §8: removed from the storefront
+because no approved offer exists — "a deliberate commercial decision, not an
+omission." The Operating Agreement remains an inclusion of Premium only.
+Any copy that says an Operating Agreement can be "added during checkout"
+(e.g. the build prompt's Article VI wording) contradicts this and must not
+ship until an offer exists.
+
+**Supersedes:** —
+
+---
+
+## 2026-09-15 — Signer age attestation removed from the interview (recorded retroactively 2026-09-27; implementation stranded)
+
+**Rationale:** `74114e2` on `claude/funnel-audit-fixes` removed
+`signerOver18` citing F.S. §605.0401 and §605.04072(2) (no minimum age for
+an LLC member or manager). That commit was never merged, so `main` still
+collects the attestation. Recovery pending; this entry records that the
+decision exists so it is not re-asked.
+
+**Supersedes:** —
+
+---
+
+## 2026-09-26 — MASTER_ISSUES_REGISTER.md is the single funnel issue register
+
+**Rationale:** Damian's instruction (2026-09-25): one authoritative register
+in `florida-business-launchpad/MASTER_ISSUES_REGISTER.md`, with stable
+`MIR-###` IDs; GAPS.md rows 1–36 frozen as history and carried over by
+number.
+
+**Supersedes:** the GAPS.md half of GOVERNANCE.md rule 11 / "Living-register
+discipline" (GAPS.md is no longer appended to).
+
+---
+
+## 2026-09-27 — Correction: the 2026-09-17 runbook update said both repos' Gate 2 branches were merged; the frontend's was not
+
+**Rationale:** `9388600` states "both branches below are already merged into
+`main`" and lists `florida-business-launchpad` `main`. True for this repo;
+false for the frontend, where `feat/checkout-initiation-catalog-tiers`
+(`b956661`) was never merged (§5's `--ff-only` merge cannot succeed once
+Lovable has pushed to `main`). Consequence: production has had no path from
+Package Selection to Stripe (0 orders). Recovery: frontend
+`claude/trusting-carson-hmcqc3`.
+
+**Supersedes:** the "Superseded, 2026-09-17" paragraph at the top of
+GATE2-DEPLOY-RUNBOOK.md, as far as the frontend is concerned.
+
+---
+
+## 2026-09-27 — Open condition, not a decision: the frontend writes to a Lovable-managed Supabase project
+
+**Rationale:** Damian's `9bd644b` (2026-08-11) removed the frontend Supabase
+client ("frontend must never touch Supabase"); Lovable's `e2ac66d`
+(2026-08-24) re-added it. The frontend now uses project
+`cedwebrzbpjwusbshdiu` (`hero_formation_leads`, `lean_plan_submissions`,
+`sunbiz-name-search`, `send-lean-plan`), which is not in the
+`llc-filing-intake` Supabase account. Recorded so it is not rediscovered;
+whether to sanction it or route it through the data spine is open.
+
+**Supersedes:** —
+
+---
+
+## 2026-09-27 — Controls adopted to stop rebuilding existing work (GOVERNANCE.md rules 13–17)
+
+**Rationale:** the reconciliation audit found finished work stranded on
+unmerged branches and settled decisions re-asked, because each session
+built from the code it could see. Rules 13–17 make "search the decision
+record, full history, stranded branches and current implementation before
+asking Damian or building" mandatory, and add mechanical checks (merge
+check, price parity, publish-ID confirmation). Details in GOVERNANCE.md.
+
+**Supersedes:** —
