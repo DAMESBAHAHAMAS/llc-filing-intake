@@ -5,6 +5,12 @@ storefront that lets a customer actually start it.
 
 **Branches this deploys**
 
+> **Correction, 2026-09-27:** the paragraph below is wrong for the frontend.
+> `feat/checkout-initiation-catalog-tiers` was never merged into
+> `florida-business-launchpad` `main`; see DECISIONS.md 2026-09-27. Prices
+> in §6 step 4 are now **DIY $139 / FastTrack $499 / Premium $999**
+> (DECISIONS.md 2026-09-17).
+
 Superseded, 2026-09-17: both branches below are already merged into
 `main` (`llc-filing-intake` `main` is at `c27ee58` as of this update,
 which also includes the RA-choice email workflow, the fulfillment gate,

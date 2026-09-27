@@ -1,6 +1,6 @@
 # GOVERNANCE — Standing Rules for This Engagement
 
-Twelve standing rules, consolidated here because they'd accumulated across
+Seventeen standing rules, consolidated here because they'd accumulated across
 multiple sessions and were at risk of only living in scrollback. These apply
 across both repos (`llc-filing-intake` and `florida-business-launchpad`)
 unless a rule says otherwise. Adding a new standing rule is itself a decision
@@ -48,6 +48,31 @@ unless a rule says otherwise. Adding a new standing rule is itself a decision
     severity, and continue with the task at hand — unless it's a P0
     security or data-loss issue, in which case stop and report before
     proceeding.
+
+13. **Search before you ask or build.** Before asking Damian a question or
+    building a feature, check, in order: `DECISIONS.md`, the full git
+    history of both repos (`git fetch --unshallow`; never reason from a
+    shallow clone), stranded branches (`git branch -r --no-merged
+    origin/main`, then `git cherry -v origin/main <branch>`), and the
+    current implementation. Only ask if all four are silent.
+14. **A branch is not done until it is merged.** Every session closes by
+    running `scripts/merge-check.sh` (frontend repo) and reporting each of
+    its branches as MERGED or STRANDED. "Done" means `git merge-base
+    --is-ancestor <branch> origin/main` succeeds, not "pushed".
+15. **Every business decision is recorded here**, in `DECISIONS.md`, with the
+    commit or Stripe/Zoho object that implements it, including decisions
+    first made in a frontend commit, a console, or chat.
+16. **Price parity is a release gate.** After any change to `offers`,
+    Stripe prices, or `src/data/offer-catalog.ts`: `npm run verify:prices`
+    (server) and the storefront price-parity test must both pass.
+17. **Nothing is "live" until the publish is confirmed.** Backend: the
+    Render deploy for the commit shows `live`. Frontend: Lovable Publish
+    was clicked and `x-deployment-id` on `https://damianknowles.com/`
+    changed (GATE2-DEPLOY-RUNBOOK.md §5).
+
+**Rule 11 update (2026-09-26):** the funnel issue register is now
+`florida-business-launchpad/MASTER_ISSUES_REGISTER.md`; GAPS.md is frozen
+history. See DECISIONS.md 2026-09-26.
 
 ## Living-register discipline
 
