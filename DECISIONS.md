@@ -936,3 +936,20 @@ asking Damian or building" mandatory, and add mechanical checks (merge
 check, price parity, publish-ID confirmation). Details in GOVERNANCE.md.
 
 **Supersedes:** —
+
+---
+
+## 2026-09-27 — Registered Agent is described as "$98 one time for 3 years"
+
+**Rationale:** Damian, 2026-09-27: the Registered Agent is $98 once for the
+full three-year term, not per year. The "two years at $49/year, third year
+free" framing (copied on 2026-09-27 from a Stripe product created
+2026-09-17) could be read as an annual charge, so all customer-facing copy
+now says "$98 one time for 3 years": Stripe product `prod_V8tUh6KAuva6qr`
+description and features, the `offers` v2 inclusions (migration 0017,
+applied to the live database 2026-09-27), and PRICING.md. Price unchanged:
+one Stripe price, `price_1U8bhU…`, unit_amount 9800, quantity 1, no
+recurring charge.
+
+**Supersedes:** the Registered Agent wording (not the price) in
+"2026-09-17 — Package pricing".
