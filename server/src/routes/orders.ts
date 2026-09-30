@@ -10,6 +10,7 @@ import {
   StripeApiError,
 } from "../stripe/restClient.js";
 import { holdNoLongerCapturable } from "../payments/holdState.js";
+import { sendOpsAlert } from "../ops/alerts.js";
 
 export const ordersRouter = Router();
 
@@ -156,4 +157,5 @@ async function recordCaptureError(orderId: string, err: unknown): Promise<void> 
     console.error(`[payments] could not record capture error for ${orderId}:`, describeError(e));
   }
   console.error(`[payments] collection problem on order ${orderId}:`, describeError(err));
+  await sendOpsAlert("Payment could not be collected", `Order ${orderId}: ${describeError(err)}. Proof of filing is recorded; the card was not charged.`);
 }

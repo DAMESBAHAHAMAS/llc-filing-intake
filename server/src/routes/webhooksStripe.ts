@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
+import { notifyOrderEvent } from "../ops/alerts.js";
 import { verifyStripeSignature, WebhookSignatureError } from "../stripe/webhookSignature.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
@@ -335,6 +336,10 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
     // rather than thrown, so it never turns this into a 500 — payment is
     // already safely recorded either way, and an operator can trigger a
     // resend via POST /api/registered-agent/request-acceptance.
+    // New orders and money events reach a person (Cliq, email, or logs).
+    // After COMMIT and never awaited into the response path's failure.
+    await notifyOrderEvent(pool, processingResult, orderId);
+
     if (shouldSendRegisteredAgentEmail && paidFilingSessionId) {
       try {
         await dispatchAcceptanceEmail(pool, paidFilingSessionId);

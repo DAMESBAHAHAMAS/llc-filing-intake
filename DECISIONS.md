@@ -996,3 +996,21 @@ verified: a hold placed through a real Checkout page in a browser, and
 migration 0018 against the live database.
 
 **Supersedes:** charge-at-checkout for filing orders (the Gate 2 flow).
+
+---
+
+## 2026-09-30 — Order and failure alerts go to Cliq, else email, else logs
+
+**Rationale:** the data spine had no new-order alert at all (the only Cliq
+call lived in the legacy Cloudflare worker, for urgent name reviews, and
+is a silent no-op without `CLIQ_WEBHOOK_URL`). Launch needs a person to
+hear about every new order and every money or sync failure within
+minutes. `src/ops/alerts.ts` sends: new order (card held or paid),
+payment collected, hold released, refund, collection failure, hold
+expiring within 48 hours, and CRM sync giving up. Delivery: Cliq incoming
+webhook if `CLIQ_WEBHOOK_URL` is set, otherwise email through the
+existing Resend sender to `OPS_ALERT_EMAIL`, otherwise Render logs. Test
+orders are marked [TEST]. Alerts never throw and never roll back the event
+that raised them.
+
+**Supersedes:** —

@@ -2,6 +2,7 @@ import type { Pool } from "pg";
 import { describeError } from "../db/describeError.js";
 import { holdDetails, retrievePaymentIntent, type StripePaymentIntent } from "../stripe/restClient.js";
 import { ordersNeedingExpiryFlag, type HeldOrderRow } from "../payments/holdState.js";
+import { sendOpsAlert } from "../ops/alerts.js";
 
 export interface HoldSweepDeps {
   retrievePaymentIntent: (id: string) => Promise<StripePaymentIntent>;
@@ -13,8 +14,7 @@ const defaultDeps: HoldSweepDeps = {
   retrievePaymentIntent,
   now: () => new Date(),
   alert: async (message) => {
-    // Visible in Render logs; the daily check-in reads flagged orders from the table.
-    console.error(`[HOLD EXPIRY ALERT] ${message}`);
+    await sendOpsAlert("Card hold expires within 48 hours", message);
   },
 };
 
