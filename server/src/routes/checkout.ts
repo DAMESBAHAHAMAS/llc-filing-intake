@@ -4,6 +4,7 @@ import { describeError } from "../db/describeError.js";
 import { resolveActiveOffers } from "../offers/catalog.js";
 import { createCheckoutSession, StripeApiError } from "../stripe/restClient.js";
 import { getEinExpressAvailability } from "../ein/capacity.js";
+import { holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 
 export const checkoutRouter = Router();
 
@@ -125,6 +126,10 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
     );
     const orderId = orderInsert.rows[0].order_id;
 
+    // Pay-after-filing: filing orders place a card hold that is collected
+    // only when proof of filing is recorded (routes/orders.ts).
+    const captureMode = holdsEnabled() && requiresPayAfterFiling(lineItemSnapshots) ? "hold" : "immediate";
+
     try {
       const stripeSession = await createCheckoutSession({
         filingSessionId,
@@ -142,6 +147,8 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         // update that existing Deal's stage instead of creating a
         // second one. See zoho/client.ts's updateDealStage comment.
         metadata: session.rows[0].crm_deal_id ? { crm_deal_id: session.rows[0].crm_deal_id } : undefined,
+        captureMode,
+        paymentIntentMetadata: { order_id: orderId, filing_session_id: filingSessionId },
       });
 
       await pool.query(
@@ -154,6 +161,7 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         checkout_url: stripeSession.url,
         stripe_checkout_session_id: stripeSession.id,
         total_cents: totalCents,
+        capture_mode: captureMode,
       });
     } catch (stripeErr) {
       const reason = stripeErr instanceof StripeApiError ? stripeErr.message : describeError(stripeErr);
@@ -179,7 +187,7 @@ checkoutRouter.get("/api/checkout/order/:orderId", async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT order_id, filing_session_id, checkout_status, payment_status, failure_reason,
-              fulfillment_status, total_cents, currency
+              fulfillment_status, total_cents, currency, proof_of_filing_at, captured_at
        FROM orders WHERE order_id = $1`,
       [req.params.orderId]
     );

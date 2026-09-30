@@ -25,6 +25,7 @@ export async function claimNextReadyOrder(pool: Pool, lockedBy: string): Promise
     const picked = await client.query<{ order_id: string }>(
       `SELECT order_id FROM orders
        WHERE fulfillment_status = 'ready'
+         AND payment_status IN ('authorized', 'paid')
          AND (fulfillment_run_after IS NULL OR fulfillment_run_after <= now())
        ORDER BY fulfillment_ready_at ASC
        LIMIT 1

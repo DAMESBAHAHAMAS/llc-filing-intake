@@ -4,6 +4,11 @@ import { describeError } from "../db/describeError.js";
 import { verifyStripeSignature, WebhookSignatureError } from "../stripe/webhookSignature.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
+import {
+  classifyCheckoutCompletion,
+  fulfillmentAfterPaymentEnds,
+  shouldMarkPaidOnPaymentIntentSucceeded,
+} from "../payments/holdState.js";
 
 export const stripeWebhookRouter = Router();
 
@@ -86,7 +91,12 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
     let orderId: string | null = null;
 
     if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
-      const session = event.data.object as { id: string; payment_status?: string; metadata?: Record<string, string> | null };
+      const session = event.data.object as {
+        id: string;
+        payment_status?: string;
+        payment_intent?: string | null;
+        metadata?: Record<string, string> | null;
+      };
       const orderRes = await client.query<{
         order_id: string;
         filing_session_id: string;
@@ -107,7 +117,12 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
         const order = orderRes.rows[0];
         orderId = order.order_id;
 
-        if (session.payment_status === "paid" && order.payment_status !== "paid") {
+        // "paid": collected at checkout. "authorized": a card hold under the
+        // pay-after-filing rule (checkout.ts) — filing starts now, money is
+        // collected when proof of filing is recorded (routes/orders.ts).
+        const completion = classifyCheckoutCompletion(session.payment_status, session.payment_intent, order.payment_status);
+        const held = completion === "authorized";
+        if (completion !== "ignore") {
           const requiresFiling = needsSunbizFiling(order.line_items ?? []);
 
           // Registered-agent gate: a "customer" (third-party) RA must
@@ -130,14 +145,19 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
           const fulfillmentReady = requiresFiling && !blockedOnRegisteredAgent;
 
           await client.query(
-            `UPDATE orders
-             SET payment_status = 'paid', paid_at = now()${fulfillmentReady ? ", fulfillment_status = 'ready', fulfillment_ready_at = now()" : ""}
-             WHERE order_id = $1`,
-            [orderId]
+            held
+              ? `UPDATE orders
+                 SET payment_status = 'authorized', authorized_at = now(), stripe_payment_intent_id = $2${fulfillmentReady ? ", fulfillment_status = 'ready', fulfillment_ready_at = now()" : ""}
+                 WHERE order_id = $1`
+              : `UPDATE orders
+                 SET payment_status = 'paid', paid_at = now(), stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, $2)${fulfillmentReady ? ", fulfillment_status = 'ready', fulfillment_ready_at = now()" : ""}
+                 WHERE order_id = $1`,
+            [orderId, session.payment_intent ?? null]
           );
 
           const sessionRow = await client.query(
-            `SELECT email, full_name, phone, entity_name_primary, crm_lead_id FROM filing_sessions WHERE filing_session_id = $1`,
+            `SELECT email, full_name, phone, entity_name_primary, crm_lead_id, utm_source, utm_medium, utm_campaign
+             FROM filing_sessions WHERE filing_session_id = $1`,
             [order.filing_session_id]
           );
 
@@ -152,7 +172,9 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
           // unchanged, so an order never ends up with zero Deal linkage
           // just because the Worker->session capture didn't happen yet.
           const crmDealId = session.metadata?.crm_deal_id;
-          const targetStage = process.env.ZOHO_DEAL_STAGE_ON_PAYMENT;
+          const targetStage = held
+            ? process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED"
+            : process.env.ZOHO_DEAL_STAGE_ON_PAYMENT;
           const expectedEmail = sessionRow.rows[0]?.email;
           if (crmDealId) {
             await client.query(`UPDATE orders SET crm_deal_id = $2 WHERE order_id = $1`, [orderId, crmDealId]);
@@ -168,7 +190,15 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
                 [
                   order.filing_session_id,
                   orderId,
-                  JSON.stringify({ crm_deal_id: crmDealId, target_stage: targetStage, expected_email: expectedEmail }),
+                  JSON.stringify({
+                    crm_deal_id: crmDealId,
+                    target_stage: targetStage,
+                    expected_email: expectedEmail,
+                    extra_fields: {
+                      Payment_Status: held ? "Hold Placed" : "Payment Collected",
+                      ...(session.payment_intent ? { Stripe_Payment_Intent: session.payment_intent } : {}),
+                    },
+                  }),
                 ]
               );
               processingResult = "deal_stage_update_enqueued";
@@ -193,19 +223,20 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
                 order.filing_session_id,
                 orderId,
                 JSON.stringify({
-                  kind: "paid_deal",
+                  kind: held ? "held_deal" : "paid_deal",
                   order: {
                     order_id: orderId,
                     filing_session_id: order.filing_session_id,
                     product: order.product,
                     crm_intent: order.product,
                     total_cents: order.total_cents,
+                    stripe_payment_intent_id: session.payment_intent ?? null,
                   },
                   filing_session: sessionRow.rows[0] ?? {},
                 }),
               ]
             );
-            processingResult = "paid_deal_enqueued";
+            processingResult = held ? "held_deal_enqueued" : "paid_deal_enqueued";
           }
 
           shouldSendRegisteredAgentEmail = blockedOnRegisteredAgent;
@@ -214,6 +245,14 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
           processingResult = "payment_status_not_paid_or_already_paid";
         }
       }
+    } else if (
+      event.type === "payment_intent.succeeded" ||
+      event.type === "payment_intent.canceled" ||
+      event.type === "charge.refunded"
+    ) {
+      const result = await handlePaymentLifecycleEvent(client, event);
+      processingResult = result.processingResult;
+      orderId = result.orderId;
     } else if (event.type === "checkout.session.async_payment_failed" || event.type === "checkout.session.expired") {
       const session = event.data.object as { id: string };
       const orderRes = await client.query<{
@@ -235,7 +274,7 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
         orderId = order.order_id;
         const failureReason = event.type === "checkout.session.expired" ? "checkout_session_expired" : "async_payment_failed";
 
-        if (order.payment_status !== "paid") {
+        if (order.payment_status === "pending") {
           // Never delete the session/order — record the failure in place.
           await client.query(`UPDATE orders SET payment_status = 'failed', failure_reason = $2 WHERE order_id = $1`, [
             orderId,
@@ -270,9 +309,9 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
 
           processingResult = "abandoned_cart_enqueued";
         } else {
-          // Already paid (e.g. a late/duplicate expired event racing a
-          // completed one) — never overwrite a paid order as failed.
-          processingResult = "ignored_already_paid";
+          // Already paid or held (e.g. a late/duplicate expired event racing
+          // a completed one) — never overwrite a secured order as failed.
+          processingResult = "ignored_already_secured";
         }
       }
     }
@@ -312,3 +351,136 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
     client.release();
   }
 });
+
+type TxClient = { query: (text: string, params?: unknown[]) => Promise<{ rows: any[]; rowCount: number | null }> };
+
+/**
+ * PaymentIntent / Charge lifecycle for card holds:
+ *  - payment_intent.succeeded: the hold was collected (or the saved-card
+ *    fallback charged) → order paid; Deal moves to Closed Won.
+ *  - payment_intent.canceled: the hold was released or expired before
+ *    collection → order released; filing that has not started is stopped.
+ *  - charge.refunded (full refund) → order refunded.
+ * The order is found by metadata.order_id (set at checkout and on the
+ * fallback charge) or by the stored PaymentIntent id.
+ */
+export async function handlePaymentLifecycleEvent(
+  client: TxClient,
+  event: MinimalStripeEvent
+): Promise<{ processingResult: string; orderId: string | null }> {
+  const obj = event.data.object as {
+    id: string;
+    payment_intent?: string | null;
+    refunded?: boolean;
+    metadata?: Record<string, string> | null;
+    cancellation_reason?: string | null;
+  };
+  const paymentIntentId = event.type === "charge.refunded" ? obj.payment_intent ?? null : obj.id;
+  const metadataOrderId = obj.metadata?.order_id;
+  const uuidLike = /^[0-9a-f-]{36}$/i;
+
+  const found = await client.query(
+    `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at
+     FROM orders
+     WHERE ($1::uuid IS NOT NULL AND order_id = $1::uuid) OR ($2::text IS NOT NULL AND stripe_payment_intent_id = $2::text)
+     ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
+    [metadataOrderId && uuidLike.test(metadataOrderId) ? metadataOrderId : null, paymentIntentId]
+  );
+  if (!found.rowCount) return { processingResult: "order_not_found", orderId: null };
+  const order = found.rows[0] as {
+    order_id: string;
+    filing_session_id: string;
+    payment_status: string;
+    fulfillment_status: string;
+    crm_deal_id: string | null;
+    proof_of_filing_at: Date | null;
+  };
+
+  if (event.type === "payment_intent.succeeded") {
+    if (!shouldMarkPaidOnPaymentIntentSucceeded(order.payment_status)) {
+      return { processingResult: "ignored_not_awaiting_collection", orderId: order.order_id };
+    }
+    await client.query(
+      `UPDATE orders SET payment_status = 'paid', paid_at = COALESCE(paid_at, now()), captured_at = COALESCE(captured_at, now()), capture_error = NULL
+       WHERE order_id = $1`,
+      [order.order_id]
+    );
+    const enqueued = await enqueueDealUpdate(client, order, {
+      target_stage: process.env.ZOHO_DEAL_STAGE_ON_CAPTURE || process.env.ZOHO_DEAL_STAGE_ON_PAYMENT || "Closed Won",
+      extra_fields: {
+        Payment_Status: "Payment Collected",
+        ...(order.proof_of_filing_at ? { Proof_of_Filing_Date: new Date(order.proof_of_filing_at).toISOString().slice(0, 10) } : {}),
+      },
+    });
+    return { processingResult: enqueued ? "collected_deal_update_enqueued" : "collected", orderId: order.order_id };
+  }
+
+  if (event.type === "payment_intent.canceled") {
+    if (order.payment_status !== "authorized") {
+      return { processingResult: "ignored_not_held", orderId: order.order_id };
+    }
+    await client.query(
+      `UPDATE orders SET payment_status = 'released', released_at = now(), fulfillment_status = $2
+       WHERE order_id = $1`,
+      [order.order_id, fulfillmentAfterPaymentEnds(order.fulfillment_status)]
+    );
+    await enqueueDealUpdate(client, order, {
+      target_stage: process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED",
+      extra_fields: { Payment_Status: "Hold Released" },
+    });
+    console.error(
+      `[payments] hold released for order ${order.order_id} (reason: ${obj.cancellation_reason ?? "unknown"}; fulfillment was ${order.fulfillment_status})`
+    );
+    return { processingResult: "hold_released", orderId: order.order_id };
+  }
+
+  // charge.refunded
+  if (!obj.refunded) return { processingResult: "partial_refund_recorded_in_stripe_only", orderId: order.order_id };
+  if (order.payment_status !== "paid") return { processingResult: "ignored_not_paid", orderId: order.order_id };
+  await client.query(`UPDATE orders SET payment_status = 'refunded', fulfillment_status = $2 WHERE order_id = $1`, [
+    order.order_id,
+    fulfillmentAfterPaymentEnds(order.fulfillment_status),
+  ]);
+  await enqueueDealUpdate(client, order, {
+    target_stage: process.env.ZOHO_DEAL_STAGE_ON_REFUND || "Closed Lost",
+    extra_fields: { Payment_Status: "Refunded" },
+  });
+  return { processingResult: "refunded", orderId: order.order_id };
+}
+
+/**
+ * Queues a Deal update for an order's Deal, if one is known. A Deal this
+ * data spine created itself (a synced order_deal job for the order) is
+ * updated directly; a Deal id that came from intake metadata keeps the
+ * email-ownership check in zoho/client.ts.
+ */
+async function enqueueDealUpdate(
+  client: TxClient,
+  order: { order_id: string; filing_session_id: string; crm_deal_id: string | null },
+  update: { target_stage: string; extra_fields: Record<string, unknown> }
+): Promise<boolean> {
+  if (!order.crm_deal_id) return false;
+  const own = await client.query(
+    `SELECT 1 FROM crm_sync_queue WHERE order_id = $1 AND sync_type = 'order_deal' AND status = 'synced' LIMIT 1`,
+    [order.order_id]
+  );
+  const email = await client.query(`SELECT email FROM filing_sessions WHERE filing_session_id = $1`, [order.filing_session_id]);
+  const expectedEmail = email.rows[0]?.email as string | undefined;
+  if (!own.rowCount && !expectedEmail) return false;
+  await client.query(
+    `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot)
+     VALUES ($1, $2, 'deal_stage_update', $3)`,
+    [
+      order.filing_session_id,
+      order.order_id,
+      JSON.stringify({
+        crm_deal_id: order.crm_deal_id,
+        target_stage: update.target_stage,
+        expected_email: expectedEmail ?? "",
+        extra_fields: update.extra_fields,
+        server_created: Boolean(own.rowCount),
+      }),
+    ]
+  );
+  return true;
+}

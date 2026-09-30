@@ -13,7 +13,8 @@
     "start": "node dist/index.js",
     "migrate": "tsx src/db/migrate.ts",
     "test": "vitest run",
-    "verify:prices": "tsx src/scripts/verifyPriceParity.ts"
+    "verify:prices": "tsx src/scripts/verifyPriceParity.ts",
+    "check:card-hold": "tsx src/scripts/cardHoldRoundTrip.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
