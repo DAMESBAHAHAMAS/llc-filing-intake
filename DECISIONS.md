@@ -953,3 +953,46 @@ recurring charge.
 
 **Supersedes:** the Registered Agent wording (not the price) in
 "2026-09-17 — Package pricing".
+
+---
+
+## 2026-09-30 — Filing orders are paid after filing: card held at checkout, collected on proof of filing
+
+**Rule (Damian, 29 Sep 2026):** funds are collected only after proof of
+filing is delivered. Applies to orders containing a Sunbiz formation
+package (FASTTRACK, PREMIUM, DIY_STATE_FEE) or an EIN filing. Orders with
+no filing in them still charge at checkout.
+
+**How:** Checkout uses manual capture and saves the card to a Customer
+(`setup_future_usage=off_session`). The order becomes `authorized`; the
+CRM Deal opens at SERVICE REQUESTED with Payment_Status "Hold Placed".
+Filing may start on a held order. Proof of filing (the Sunbiz document
+number of the filed Articles; the EIN for an EIN-only order) is recorded
+through `POST /api/orders/:orderId/proof-of-filing` (operator key), which
+captures the hold. If the hold has lapsed, the saved card is charged
+off-session for the same amount. The order is marked `paid` only by
+Stripe's `payment_intent.succeeded` webhook; the Deal then moves to Closed
+Won. A watch records each hold's expiry and flags holds within 48 hours of
+expiry that have no proof yet. `PAYMENT_CAPTURE_MODE=immediate` turns the
+whole rule off.
+
+**Verified in Stripe test mode, 30 Sep 2026 (acct_1ChHmZDo01bXdbWS):**
+- Checkout Session with these hold parameters: accepted.
+- Extended holds (`request_extended_authorization`): refused — "This
+  account is not eligible for the requested card features." They need
+  IC+ pricing or Stripe approval. Left opt-in (`STRIPE_EXTENDED_AUTHORIZATION`).
+- Card hold on this account: 7.00 days (capture_before reported on the charge).
+- Collect: succeeded; repeat collect with the same idempotency key
+  returned the same result, no second charge.
+- Release then saved-card charge: succeeded.
+- Run script: `npm run check:card-hold` (refuses a live key).
+
+**Known limits:** a filing that takes longer than 7 days relies on the
+saved-card charge, which a bank can decline or send back for customer
+authentication (more likely on non-US cards). The Checkout Session also
+offers non-card methods enabled in the Dashboard (Klarna, Cash App Pay,
+Amazon Pay on test mode); their hold behaviour was not tested. Not yet
+verified: a hold placed through a real Checkout page in a browser, and
+migration 0018 against the live database.
+
+**Supersedes:** charge-at-checkout for filing orders (the Gate 2 flow).
