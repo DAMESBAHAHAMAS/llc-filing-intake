@@ -953,3 +953,38 @@ recurring charge.
 
 **Supersedes:** the Registered Agent wording (not the price) in
 "2026-09-17 — Package pricing".
+
+---
+
+## 2026-10-01 — Operating Agreement generator built; wording held as draft
+
+**What exists now:** two templates, `operating_agreement_single_member`
+and `operating_agreement_multi_member`, rendered by the existing PDF
+service (`render_pdf.py`, unchanged apart from per-template download
+filenames). `buildOperatingAgreementContext()` in
+`server/src/pdf/operatingAgreementContext.ts` follows the Articles rule:
+any missing value is returned as a named gap, never filled in. The
+agreement cites the filing date and document number, so it can only be
+generated after proof of filing.
+
+**Rationale:** Premium includes a custom Operating Agreement (2026-09-17
+package pricing; Stripe Premium product), and no generator or template
+existed. The wording comes from the "Operating Agreement Templates for
+Review" doc (rev 6). Sections the doc described by reference ("same as
+the single-member version") are written out in full in the multi-member
+template, and are listed in that doc for review.
+
+**Hold:** `OPERATING_AGREEMENT_WORDING_APPROVED = false`. Until Damian
+approves the wording, every rendered PDF carries a "Draft wording, not
+yet approved. Not for customer delivery" banner. Changing that constant
+needs a new entry here that cites his approval. No delivery step is
+wired. Rendering has only been run on fictional sample data
+(`src/scripts/renderOperatingAgreementSamples.ts`).
+
+**Not yet collected by the interview:** initial contribution and
+successor (optional, so they render as blank lines to write in); and,
+for multi-member filings, each member's percentage, the borrowing limit,
+the buy-out payment period and the tax representative. Multi-member
+agreements cannot be generated until the interview collects those four.
+
+**Supersedes:** —

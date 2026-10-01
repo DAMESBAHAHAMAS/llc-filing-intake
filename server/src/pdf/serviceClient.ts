@@ -23,6 +23,21 @@ export type PdfGenerationResult = PdfGenerationSuccess | PdfGenerationFailure;
  * discover missing fields.
  */
 export async function generateArticlesOfOrganizationPdf(context: Record<string, unknown>): Promise<PdfGenerationResult> {
+  return generatePdf("articles_of_organization", context);
+}
+
+/**
+ * Operating Agreement (Premium). template and context come from
+ * buildOperatingAgreementContext() in pdf/operatingAgreementContext.ts.
+ */
+export async function generateOperatingAgreementPdf(
+  template: "operating_agreement_single_member" | "operating_agreement_multi_member",
+  context: Record<string, unknown>
+): Promise<PdfGenerationResult> {
+  return generatePdf(template, context);
+}
+
+async function generatePdf(template: string, context: Record<string, unknown>): Promise<PdfGenerationResult> {
   const baseUrl = process.env.PDF_SERVICE_URL;
   const apiKey = process.env.PDF_SERVICE_API_KEY;
   if (!baseUrl) {
@@ -36,7 +51,7 @@ export async function generateArticlesOfOrganizationPdf(context: Record<string, 
         "Content-Type": "application/json",
         ...(apiKey ? { "X-PDF-Service-Key": apiKey } : {}),
       },
-      body: JSON.stringify({ template: "articles_of_organization", context }),
+      body: JSON.stringify({ template, context }),
     });
 
     if (!res.ok) {

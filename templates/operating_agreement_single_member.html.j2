@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Operating Agreement — {{ llc_name }}</title>
+{% include "partials/operating_agreement_styles.html.j2" %}
+</head>
+<body>
+{#
+  Wording source: "Operating Agreement Templates for Review" doc, rev 6
+  (single-member section). Fixed wording is kept as drafted; only the
+  [[FIELD]] slots are filled. Do not edit the wording here without the
+  same change being approved in that doc.
+#}
+
+{% if draft %}
+<div class="draft-banner">Draft wording, not yet approved. Not for customer delivery.</div>
+{% endif %}
+
+<header class="doc-header">
+  <img class="seal" src="./assets/florida_seal.png" alt="">
+  <h1>Operating Agreement of {{ llc_name }}</h1>
+  <p class="subheading">A Florida Limited Liability Company — Single Member</p>
+</header>
+
+<div class="filing-facts">
+  <div><p class="label">Document number</p><p class="value">{{ document_number }}</p></div>
+  <div><p class="label">Filed</p><p class="value">{{ filing_date }}</p></div>
+  <div><p class="label">Effective</p><p class="value">{{ effective_date }}</p></div>
+</div>
+
+<p class="section">This Operating Agreement (the "Agreement") is made effective {{ effective_date }} by {{ member.name }} (the "Member"), the sole member of {{ llc_name }} (the "Company").</p>
+
+<p class="section"><b>1. Formation.</b> The Company was formed as a Florida limited liability company by filing Articles of Organization with the Florida Department of State, Division of Corporations, on {{ filing_date }}, Document Number {{ document_number }}. This Agreement and the Florida Revised Limited Liability Company Act, Chapter 605, Florida Statutes (the "Act"), govern the Company. Where this Agreement is silent, the Act applies.</p>
+
+<p class="section"><b>2. Name and Addresses.</b> The Company's name is {{ llc_name }}. Its principal office is {{ principal_address }}, and its mailing address is {{ mailing_address }}. The Member may change either address and will update the Company's state records when doing so.</p>
+
+<p class="section"><b>3. Registered Agent.</b> The Company's registered agent is {{ registered_agent_name }}, at {{ registered_agent_florida_address }}, as stated in the Articles of Organization.</p>
+
+<p class="section"><b>4. Purpose.</b> The Company may carry on any lawful business permitted under the Act.</p>
+
+<p class="section"><b>5. Term.</b> The Company continues until it is dissolved under Section 17.</p>
+
+<p class="section"><b>6. Sole Member.</b> The Member owns 100% of the membership interest in the Company. The Member's name, address and contribution are listed in Schedule A.</p>
+
+<p class="section"><b>7. Capital Contributions.</b> The Member's initial contribution is listed in Schedule A. The Member is not required to contribute more. Any later contribution is recorded in the Company's records.</p>
+
+{% if management == "manager" %}
+<p class="section"><b>8. Management.</b> The Company is managed by {{ manager_names }} (the "Manager"), who has full authority to act for the Company, including to open and operate bank accounts, sign contracts, and engage and pay others. The Member may remove and replace the Manager at any time by written notice.</p>
+{% else %}
+<p class="section"><b>8. Management.</b> The Company is managed by the Member. The Member has full authority to act for the Company, including to open and operate bank accounts, sign contracts, and engage and pay others.</p>
+{% endif %}
+
+<p class="section"><b>9. Keeping the Company Separate.</b> The Member will keep the Company's money, accounts and records separate from the Member's personal affairs; sign Company documents in the Company's name; and hold Company property in the Company's name.</p>
+
+<p class="section"><b>10. Limited Liability.</b> The Member is not personally liable for the Company's debts, obligations or liabilities solely because of being a member or acting as its manager, except as the Act provides.</p>
+
+<p class="section"><b>11. Distributions.</b> The Member may have the Company distribute available cash to the Member at any time. No distribution may be made if, afterward, the Company could not pay its debts as they come due, or its total assets would be less than its total liabilities.</p>
+
+<p class="section"><b>12. Taxes and Fiscal Year.</b> For federal income tax purposes, the Company is treated under the default rules for a single-member limited liability company unless the Member makes a different election. The Member should decide any election with a tax professional. The fiscal year is the calendar year.</p>
+
+<p class="section"><b>13. Records and Annual Report.</b> The Company keeps, at its principal office or electronically: its Articles of Organization, this Agreement and any amendments, tax returns, financial statements, and a record of contributions and distributions. The Member will make sure the Company files its annual report with the Division of Corporations each year between January 1 and May 1.</p>
+
+<p class="section"><b>14. Indemnification.</b> To the fullest extent the Act allows, the Company will indemnify and hold harmless the Member, and any Manager, against losses, claims and expenses arising from acting in good faith on the Company's behalf. This does not cover conduct the Act does not permit a company to indemnify.</p>
+
+<p class="section"><b>15. Transfers and New Members.</b> The Member may transfer all or part of the membership interest. A new member may be admitted only with the Member's written consent and by signing this Agreement, as amended, or a new operating agreement. Admitting a second member should be done with a multi-member operating agreement.</p>
+
+<p class="section"><b>16. Death or Incapacity.</b> If the Member dies or becomes legally incapacitated, the Member's legal representative or successor{% if successor_name %} ({{ successor_name }}){% else %} (named successor, if any: <span class="blank">&nbsp;</span>){% endif %} may exercise the Member's rights so the Company can continue or be wound up.</p>
+
+<p class="section"><b>17. Dissolution.</b> The Company dissolves when the Member decides in writing, or when the Act requires. On dissolution the Company pays or provides for its debts, distributes any remaining assets to the Member, and files articles of dissolution with the Division of Corporations.</p>
+
+<p class="section"><b>18. Amendments.</b> This Agreement may be changed only in a writing signed by the Member.</p>
+
+<p class="section"><b>19. General.</b> This Agreement is the entire agreement about the Company's affairs and replaces any earlier understanding. Florida law governs it. If any part is found unenforceable, the rest remains in effect.</p>
+
+<h2 class="block-heading">Signature</h2>
+
+<table class="sig">
+  <tr>
+    <td class="sig-name"><div class="rule"></div><p class="signature-caption">MEMBER: {{ member.name }}</p></td>
+    <td class="sig-date"><div class="rule"></div><p class="signature-caption">Date</p></td>
+  </tr>
+  <tr>
+    <td class="sig-name"><div class="rule"></div><p class="signature-caption">{{ llc_name }}, by: {{ member.name }}, Member</p></td>
+    <td class="sig-date"><div class="rule"></div><p class="signature-caption">Date</p></td>
+  </tr>
+</table>
+
+<h2 class="block-heading">Schedule A — Member</h2>
+<table class="schedule">
+  <thead>
+    <tr><th>Member</th><th>Address</th><th>Initial contribution</th><th>Ownership</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>{{ member.name }}</td>
+      <td>{{ member.address }}</td>
+      <td>{% if member.contribution %}{{ member.contribution }}{% else %}<span class="blank">&nbsp;</span>{% endif %}</td>
+      <td>100%</td>
+    </tr>
+  </tbody>
+</table>
+
+<p class="footnote">Prepared from the information you provided at filing. This document is not legal or tax advice.</p>
+
+</body>
+</html>

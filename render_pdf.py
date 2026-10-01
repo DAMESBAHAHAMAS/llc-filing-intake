@@ -43,6 +43,15 @@ def _is_authorized(req) -> bool:
     return hmac.compare_digest(supplied, _PDF_SERVICE_API_KEY)
 
 
+# Download filename suffix per template. Before the Operating Agreement
+# templates existed, every PDF was named "..._Articles_of_Organization.pdf".
+_DOCUMENT_LABELS = {
+    "articles_of_organization": "Articles_of_Organization",
+    "operating_agreement_single_member": "Operating_Agreement",
+    "operating_agreement_multi_member": "Operating_Agreement",
+}
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
@@ -79,8 +88,9 @@ def generate_pdf():
     # In-memory only — write_pdf() with no target returns bytes, nothing touches disk.
     pdf_bytes = HTML(string=html_string, base_url=BASE_DIR).write_pdf()
 
-    llc_name = context.get("llc_name") or "Articles_of_Organization"
-    filename = secure_filename(f"{llc_name}_Articles_of_Organization.pdf")
+    document_label = _DOCUMENT_LABELS.get(template_name, template_name)
+    llc_name = context.get("llc_name") or document_label
+    filename = secure_filename(f"{llc_name}_{document_label}.pdf")
 
     return Response(
         pdf_bytes,
