@@ -1,0 +1,121 @@
+<style>
+  /* Same palette and type as articles_of_organization.html.j2. The font
+     files referenced there are not in assets/, so the fallbacks below are
+     what actually renders until they are added. */
+  @font-face { font-family: "Oswald"; src: url("./assets/fonts/Oswald-SemiBold.ttf") format("truetype"); font-weight: 600; }
+  @font-face { font-family: "Roboto"; src: url("./assets/fonts/Roboto-Regular.ttf") format("truetype"); font-weight: 400; }
+  @font-face { font-family: "Roboto"; src: url("./assets/fonts/Roboto-Bold.ttf") format("truetype"); font-weight: 700; }
+  @font-face { font-family: "DM Mono"; src: url("./assets/fonts/DMMono-Regular.ttf") format("truetype"); font-weight: 400; }
+
+  @page {
+    size: Letter;
+    margin: 22mm 20mm 20mm 20mm;
+    @bottom-center {
+      /* The company name stays out of CSS: an "&" or quote in it would be
+         escaped or break the rule. */
+      content: "Operating Agreement · Page " counter(page) " of " counter(pages);
+      font-family: "DM Mono", "DejaVu Sans Mono", monospace;
+      font-size: 7.5pt;
+      color: #6b8496;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    font-family: "Roboto", "Helvetica", "Arial", "DejaVu Sans", sans-serif;
+    font-size: 10.5pt;
+    color: #113A57;
+    margin: 0;
+  }
+
+  p { orphans: 3; widows: 3; line-height: 1.45; margin: 0 0 8px 0; }
+
+  .draft-banner {
+    border: 1.5px solid #B42318;
+    color: #B42318;
+    font-family: "DM Mono", "DejaVu Sans Mono", monospace;
+    font-size: 8.5pt;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    text-align: center;
+    padding: 6px 8px;
+    margin-bottom: 14px;
+  }
+
+  .doc-header { text-align: center; margin-bottom: 16px; }
+  .doc-header .seal { width: 54px; height: 54px; margin-bottom: 6px; }
+  .doc-header h1 {
+    font-family: "Oswald", "Helvetica", "Arial", "DejaVu Sans", sans-serif;
+    font-size: 15pt;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin: 0 0 4px 0;
+  }
+  .doc-header .subheading { font-size: 10pt; font-style: italic; color: #0087D4; margin: 0; }
+
+  .filing-facts {
+    display: flex;
+    justify-content: space-between;
+    border-top: 1.5px solid #0087D4;
+    border-bottom: 1px solid rgba(17, 58, 87, 0.2);
+    padding: 6px 0;
+    margin-bottom: 14px;
+  }
+  .filing-facts div { width: 32%; }
+  .label {
+    font-family: "DM Mono", "DejaVu Sans Mono", monospace;
+    font-size: 7.5pt;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: #0087D4;
+    margin: 0 0 2px 0;
+  }
+  .value { font-size: 9.5pt; margin: 0; }
+
+  .section { margin: 0 0 9px 0; break-inside: avoid-page; }
+  .section b { font-weight: 700; }
+
+  .blank { display: inline-block; min-width: 150px; border-bottom: 1px solid #113A57; }
+
+  h2.block-heading {
+    font-family: "Oswald", "Helvetica", "Arial", "DejaVu Sans", sans-serif;
+    font-size: 12pt;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1.5px solid #0087D4;
+    padding-bottom: 3px;
+    margin: 18px 0 10px 0;
+    break-after: avoid;
+  }
+
+  table.sig { width: 100%; border-collapse: collapse; break-inside: avoid; }
+  table.sig td { padding: 26px 0 0 0; vertical-align: bottom; }
+  table.sig td.sig-name { width: 62%; padding-right: 24px; }
+  table.sig td.sig-date { width: 38%; }
+  table.sig .rule { border-bottom: 1px solid #113A57; height: 1px; }
+  .signature-caption { font-size: 9pt; margin: 3px 0 0 0; }
+
+  table.schedule { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  table.schedule th {
+    font-family: "DM Mono", "DejaVu Sans Mono", monospace;
+    font-size: 7.5pt;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    background: #113A57;
+    color: #FFFFFF;
+    padding: 6px 8px;
+    text-align: left;
+  }
+  table.schedule td {
+    font-size: 9.5pt;
+    border-bottom: 1px solid rgba(17, 58, 87, 0.15);
+    padding: 7px 8px;
+    vertical-align: top;
+  }
+  table.schedule td .blank { min-width: 90px; }
+
+  .footnote { font-size: 8.5pt; font-style: italic; color: rgba(17, 58, 87, 0.7); margin-top: 12px; }
+</style>

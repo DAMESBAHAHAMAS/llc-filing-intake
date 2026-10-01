@@ -26,6 +26,22 @@ export async function generateArticlesOfOrganizationPdf(context: Record<string, 
   return renderTemplatePdf("articles_of_organization", context);
 }
 
+/**
+ * Operating Agreement (Premium). template and context come from
+ * buildOperatingAgreementContext() in pdf/operatingAgreementContext.ts.
+ */
+export async function generateOperatingAgreementPdf(
+  template: "operating_agreement_single_member" | "operating_agreement_multi_member",
+  context: Record<string, unknown>
+): Promise<PdfGenerationResult> {
+  return generatePdf(template, context);
+}
+
+/** Same as renderTemplatePdf; the name the document generators use. */
+function generatePdf(template: string, context: Record<string, unknown>): Promise<PdfGenerationResult> {
+  return renderTemplatePdf(template, context);
+}
+
 /** Any template in templates/ through POST /generate-pdf (T144 D12: the RA acceptance statement). */
 export async function renderTemplatePdf(template: string, context: Record<string, unknown>): Promise<PdfGenerationResult> {
   const baseUrl = process.env.PDF_SERVICE_URL;
