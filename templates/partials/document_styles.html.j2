@@ -13,7 +13,11 @@
     @bottom-center {
       /* The company name stays out of CSS: an "&" or quote in it would be
          escaped or break the rule. */
-      content: "Operating Agreement · Page " counter(page) " of " counter(pages);
+      {% if hide_page_numbers | default(false) -%}
+      content: "{{ footer_label | default("Operating Agreement") }}";
+      {%- else -%}
+      content: "{{ footer_label | default("Operating Agreement") }} · Page " counter(page) " of " counter(pages);
+      {%- endif %}
       font-family: "DM Mono", "DejaVu Sans Mono", monospace;
       font-size: 7.5pt;
       color: #6b8496;
@@ -118,4 +122,55 @@
   table.schedule td .blank { min-width: 90px; }
 
   .footnote { font-size: 8.5pt; font-style: italic; color: rgba(17, 58, 87, 0.7); margin-top: 12px; }
+</style>
+<style>
+  /* Formation package pages (cover letter, next steps, placeholder). */
+  .letterhead {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    border-bottom: 1.5px solid #0087D4;
+    padding-bottom: 6px;
+    margin-bottom: 18px;
+  }
+  .letterhead .brand {
+    font-family: "Oswald", "Helvetica", "Arial", "DejaVu Sans", sans-serif;
+    font-size: 12pt;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .letterhead .contact { font-size: 8.5pt; color: #6b8496; }
+  h1.letter-subject {
+    font-family: "Oswald", "Helvetica", "Arial", "DejaVu Sans", sans-serif;
+    font-size: 15pt;
+    font-weight: 600;
+    margin: 0 0 14px 0;
+  }
+  h3.minor { font-size: 10.5pt; font-weight: 700; margin: 14px 0 6px 0; }
+  ul.tight, ol.steps { margin: 0 0 8px 0; padding-left: 20px; }
+  ul.tight li { margin-bottom: 3px; line-height: 1.4; }
+  ol.steps li { margin-bottom: 9px; line-height: 1.45; break-inside: avoid; }
+  table.facts { width: 100%; border-collapse: collapse; margin: 4px 0 12px 0; }
+  table.facts th {
+    width: 34%;
+    text-align: left;
+    font-family: "DM Mono", "DejaVu Sans Mono", monospace;
+    font-size: 7.5pt;
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: #0087D4;
+    padding: 5px 8px 5px 0;
+    border-bottom: 1px solid rgba(17, 58, 87, 0.12);
+  }
+  table.facts td { font-size: 9.5pt; padding: 5px 0; border-bottom: 1px solid rgba(17, 58, 87, 0.12); }
+  .signoff { margin-top: 18px; }
+  .placeholder-box {
+    border: 1.5px dashed #6b8496;
+    color: #6b8496;
+    text-align: center;
+    padding: 120px 30px;
+    margin-top: 40px;
+  }
 </style>

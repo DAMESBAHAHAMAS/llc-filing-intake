@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Your Florida LLC is filed — {{ llc_name }}</title>
+{% set footer_label = "Formation Package" %}
+{% set hide_page_numbers = true %}
+{% include "partials/document_styles.html.j2" %}
+</head>
+<body>
+{#
+  Wording source: "Operating Agreement Templates for Review" doc, rev 10,
+  section "Formation Package: Cover Letter (Draft)". Do not edit the
+  wording here without the same change being approved there.
+#}
+
+{% if draft %}
+<div class="draft-banner">Draft wording, not yet approved. Not for customer delivery.</div>
+{% endif %}
+
+<div class="letterhead">
+  <span class="brand">Damian Knowles Business Development</span>
+  <span class="contact">hello@damianknowles.com · damianknowles.com</span>
+</div>
+
+<h1 class="letter-subject">Your Florida LLC is filed: {{ llc_name }}</h1>
+
+<p>Hi {{ customer_first_name }},</p>
+
+<p>{{ llc_name }} is now a Florida limited liability company. The Florida Division of Corporations filed your Articles of Organization on {{ filing_date }}, Document Number {{ document_number }}.
+{%- if effective_on_filing %} Your company exists as of that date.{% else %} Its existence is effective {{ effective_date }}, the date you chose.{% endif %}</p>
+
+<p>I review every filing myself before it goes to the state. This package is the record of what we filed for you, so keep it with your company records.</p>
+
+<h3 class="minor">In this package</h3>
+<ul class="tight">
+  <li>Your Articles of Organization, as filed</li>
+  <li>The state's filing confirmation</li>
+  {% if includes_operating_agreement %}<li>Your Operating Agreement, ready to sign</li>{% endif %}
+  <li>Your next steps: a one-page checklist of what most new Florida LLCs do after filing</li>
+</ul>
+
+<h3 class="minor">Your company at a glance</h3>
+<table class="facts">
+  <tr><th>Company name</th><td>{{ llc_name }}</td></tr>
+  <tr><th>Document number</th><td>{{ document_number }}</td></tr>
+  <tr><th>Filed</th><td>{{ filing_date }}</td></tr>
+  <tr><th>Effective</th><td>{{ effective_date }}</td></tr>
+  <tr><th>Registered agent</th><td>{{ registered_agent_name }}</td></tr>
+  <tr><th>Principal address</th><td>{{ principal_address }}</td></tr>
+</table>
+
+<p><b>Your payment.</b> As promised, nothing was charged until your LLC was filed. Your card is charged {{ order_total }} today, and a receipt follows separately.</p>
+
+<p>If anything here doesn't match what you expected, reply to this email or book a free 15-minute Formation Review: {{ booking_link }}.</p>
+
+<p class="signoff">Damian Knowles</p>
+
+</body>
+</html>

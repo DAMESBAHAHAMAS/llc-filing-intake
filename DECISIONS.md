@@ -988,3 +988,34 @@ the buy-out payment period and the tax representative. Multi-member
 agreements cannot be generated until the interview collects those four.
 
 **Supersedes:** —
+
+---
+
+## 2026-10-01 — Formation package assembled as one PDF; wording held as draft
+
+**What exists now:** `server/src/pdf/formationPackage.ts` builds the cover
+letter and next-steps contexts and puts the parts in package order:
+cover letter, Articles, the state's filing confirmation, Operating
+Agreement (Premium only), next steps. `render_pdf.py` gains `/merge-pdf`
+(pypdf, already in requirements.txt; same shared-secret auth, at most 10
+parts and 25 MB) and three templates: `formation_cover_letter`,
+`formation_next_steps`, and `formation_placeholder_page` (samples only).
+The style partial is renamed `partials/document_styles.html.j2`.
+
+**Rationale:** Damian's rule is that every LLC filer gets the branded
+delivery package, and delivering it is the proof-of-filing step that
+collects the card hold. Wording comes from the "Operating Agreement
+Templates for Review" doc (rev 10).
+
+**Hold:** `FORMATION_PACKAGE_WORDING_APPROVED = false`, so every rendered
+page carries the "not for customer delivery" banner. A package can't be
+assembled without the state's filing confirmation, and a Premium package
+can't be assembled without the Operating Agreement. No delivery step is
+wired; only fictional sample data has been rendered
+(`src/scripts/renderFormationPackageSamples.ts`).
+
+**Known gap:** the Articles template is A4, the new documents are US
+Letter, so a package mixes page sizes until the Articles template is
+changed (a filed-document change, so not made here).
+
+**Supersedes:** —

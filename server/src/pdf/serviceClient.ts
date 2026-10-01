@@ -71,3 +71,42 @@ async function generatePdf(template: string, context: Record<string, unknown>): 
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
+
+/** Formation package pages: cover letter, next steps, and the sample-only placeholder. */
+export async function generateFormationPagePdf(
+  template: "formation_cover_letter" | "formation_next_steps" | "formation_placeholder_page",
+  context: Record<string, unknown>
+): Promise<PdfGenerationResult> {
+  return generatePdf(template, context);
+}
+
+/**
+ * Joins already-rendered PDFs into one file, in the order given, through
+ * the PDF service's /merge-pdf (pypdf). Used for the formation package.
+ */
+export async function mergePdfs(parts: Buffer[], filename: string): Promise<PdfGenerationResult> {
+  const baseUrl = process.env.PDF_SERVICE_URL;
+  const apiKey = process.env.PDF_SERVICE_API_KEY;
+  if (!baseUrl) {
+    return { ok: false, error: "server misconfigured: PDF_SERVICE_URL not set" };
+  }
+  try {
+    const res = await fetch(`${baseUrl}/merge-pdf`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey ? { "X-PDF-Service-Key": apiKey } : {}),
+      },
+      body: JSON.stringify({ pdfs: parts.map((p) => p.toString("base64")), filename }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      return { ok: false, httpStatus: res.status, error: `PDF merge returned ${res.status}: ${text.slice(0, 500)}` };
+    }
+    const pdfBytes = Buffer.from(await res.arrayBuffer());
+    const sha256 = createHash("sha256").update(pdfBytes).digest("hex");
+    return { ok: true, pdfBytes, sha256 };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}

@@ -1,8 +1,12 @@
+import base64
+import binascii
 import hmac
+import io
 import os
 
 from flask import Flask, Response, jsonify, request
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, TemplateNotFound, UndefinedError
+from pypdf import PdfReader, PdfWriter
 from weasyprint import HTML
 from werkzeug.utils import secure_filename
 
@@ -49,6 +53,9 @@ _DOCUMENT_LABELS = {
     "articles_of_organization": "Articles_of_Organization",
     "operating_agreement_single_member": "Operating_Agreement",
     "operating_agreement_multi_member": "Operating_Agreement",
+    "formation_cover_letter": "Cover_Letter",
+    "formation_next_steps": "Next_Steps",
+    "formation_placeholder_page": "Placeholder",
 }
 
 
@@ -94,6 +101,52 @@ def generate_pdf():
 
     return Response(
         pdf_bytes,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# Formation package assembly: joins PDFs that were already rendered (or,
+# for the state's filing confirmation, received) into one file, in the
+# order given. Nothing is written to disk.
+_MAX_MERGE_PARTS = 10
+_MAX_MERGE_BYTES = 25 * 1024 * 1024
+
+
+@app.route("/merge-pdf", methods=["POST"])
+def merge_pdf():
+    if not _is_authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    parts = body.get("pdfs")
+    if not isinstance(parts, list) or not parts:
+        return jsonify({"error": "'pdfs' must be a non-empty list of base64 strings"}), 400
+    if len(parts) > _MAX_MERGE_PARTS:
+        return jsonify({"error": f"at most {_MAX_MERGE_PARTS} parts"}), 400
+
+    writer = PdfWriter()
+    total = 0
+    for i, encoded in enumerate(parts):
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, TypeError, ValueError):
+            return jsonify({"error": f"part {i} is not valid base64"}), 400
+        total += len(raw)
+        if total > _MAX_MERGE_BYTES:
+            return jsonify({"error": "parts exceed the size limit"}), 413
+        if not raw.startswith(b"%PDF"):
+            return jsonify({"error": f"part {i} is not a PDF"}), 400
+        try:
+            writer.append(PdfReader(io.BytesIO(raw)))
+        except Exception as err:  # malformed PDF
+            return jsonify({"error": f"part {i} could not be read: {err}"}), 422
+
+    out = io.BytesIO()
+    writer.write(out)
+    filename = secure_filename(f"{body.get('filename') or 'Formation_Package'}.pdf")
+    return Response(
+        out.getvalue(),
         mimetype="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
