@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Your next steps after filing</title>
+{% set footer_label = "Formation Package" %}
+{% set hide_page_numbers = true %}
+{% include "partials/document_styles.html.j2" %}
+</head>
+<body>
+{#
+  Wording source: "Operating Agreement Templates for Review" doc, rev 10,
+  section "Your Next Steps After Filing (Draft)". Fees in item 7 were
+  checked on the Division of Corporations annual report page on
+  2026-10-01; re-check each January. BOI is deliberately left out
+  (Damian's rule).
+#}
+
+{% if draft %}
+<div class="draft-banner">Draft wording, not yet approved. Not for customer delivery.</div>
+{% endif %}
+
+<div class="letterhead">
+  <span class="brand">Damian Knowles Business Development</span>
+  <span class="contact">hello@damianknowles.com · damianknowles.com</span>
+</div>
+
+<h1 class="letter-subject">Your next steps after filing</h1>
+
+<ol class="steps">
+  {% if includes_operating_agreement %}
+  <li><b>Sign your Operating Agreement.</b> Sign and date it, then keep it with your records. Florida doesn't require you to file it with the state, but banks often ask to see it.</li>
+  {% endif %}
+  <li><b>Get an EIN.</b> It's your company's federal tax number, and you need it to open a bank account, hire and file taxes. Applying through the IRS website is free.{% if ein_ordered %} We're handling this for you and will send your IRS confirmation letter.{% endif %}</li>
+  <li><b>Open a business bank account.</b> Take your Articles{% if includes_operating_agreement %}, your EIN letter and your Operating Agreement{% else %} and your EIN letter{% endif %}. Keep company money separate from personal money: that separation is part of what protects your limited liability.</li>
+  <li><b>Check your local business tax receipt.</b> Most Florida counties, and many cities, require one before you do business there. Ask the tax collector for your county and your city.</li>
+  <li><b>Register for state taxes, if they apply.</b> If you sell taxable goods or services, or hire employees, register with the Florida Department of Revenue.</li>
+  <li><b>Trading under a different name?</b> If you'll use a name that isn't your exact LLC name, register it as a fictitious name with the Division of Corporations first.</li>
+  <li><b>File your annual report every year.</b> It's due between January 1 and May 1, starting the year after your LLC is formed. The state fee is $138.75, and a $400 late fee applies after May 1. If no report is filed, the state can dissolve the company. File at sunbiz.org.</li>
+  <li><b>Keep your state record current.</b> If your addresses, registered agent or managers change, update them with the Division of Corporations.</li>
+  <li><b>Talk to a tax professional</b> about how your LLC is taxed and whether any election makes sense. If you're not a U.S. person and you are the LLC's only owner, ask specifically about IRS Form 5472: it has its own yearly filing and penalties.</li>
+</ol>
+
+<p class="footnote">This is general information, not legal or tax advice.</p>
+
+</body>
+</html>
