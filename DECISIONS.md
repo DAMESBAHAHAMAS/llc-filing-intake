@@ -1013,4 +1013,37 @@ existing Resend sender to `OPS_ALERT_EMAIL`, otherwise Render logs. Test
 orders are marked [TEST]. Alerts never throw and never roll back the event
 that raised them.
 
+## 2026-10-01 — Rate limits on the public funnel endpoints; Turnstile check built but off
+
+**Correction first:** the 72-hour launch map (30 Sep) said a
+"bot-protection branch" existed unmerged. It didn't. No branch in either
+repository, and nothing on `main`, limited requests. The Zoho task
+"Turn on bot protection and rate limits for the filing funnel" (due Fri
+2 Oct) was unbuilt.
+
+**What exists now (branch `claude/rate-limits-bot-protection`):**
+`middleware/rateLimit.ts` (fixed-window per-IP counter, in memory, 429
+with `Retry-After`) and `middleware/turnstile.ts`, wired by
+`middleware/funnelProtection.ts` after CORS and `express.json()`.
+Limits: interview autosave 120/min, name check 30/min, checkout 10 per
+10 min, registered-agent acceptance email 5/hour, other agent calls 30 per
+10 min, filing PDF 10 per 10 min, reads 120/min. Health and the Stripe
+webhook are not limited. Every limit has a `RATE_LIMIT_*` override.
+
+**Rationale:** the name check calls Sunbiz, checkout creates Stripe
+sessions, the acceptance request emails a third party, and the PDF
+render is CPU-heavy; all were open to unlimited calls. In memory is
+enough because the service is one Render instance (starter plan); if it
+scales out, the counter must move to Postgres or Redis.
+
+**Client IP:** Render puts several proxies in front of the app, and Render
+staff point to the `True-Client-IP` header for the visitor's address, so
+the limiter keys on that header and falls back to `req.ip`. Verify after
+the first deploy that the keys are visitor addresses.
+
+**Turnstile:** off until `TURNSTILE_SECRET_KEY` is set. It guards checkout
+and the agent acceptance email only. Turning it on needs a Turnstile
+widget created in Damian's Cloudflare account and the frontend sending
+its token, released together; the secret alone would block every customer.
+
 **Supersedes:** —

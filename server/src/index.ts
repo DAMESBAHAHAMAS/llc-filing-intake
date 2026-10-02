@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { corsMiddleware } from "./middleware/cors.js";
+import { applyFunnelProtection } from "./middleware/funnelProtection.js";
 import { healthRouter } from "./routes/health.js";
 import { sessionRouter } from "./routes/session.js";
 import { checkoutRouter } from "./routes/checkout.js";
@@ -41,6 +42,11 @@ app.use("/api/webhooks/stripe", express.raw({ type: "application/json" }));
 app.use(stripeWebhookRouter);
 
 app.use(express.json());
+
+// Per-IP limits (429) and the Turnstile bot check on the public funnel
+// endpoints; see middleware/funnelProtection.ts.
+applyFunnelProtection(app);
+
 app.use(healthRouter);
 app.use(sessionRouter);
 app.use(checkoutRouter);
