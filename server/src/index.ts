@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { corsMiddleware } from "./middleware/cors.js";
+import { applyFunnelProtection } from "./middleware/funnelProtection.js";
 import { healthRouter } from "./routes/health.js";
 import { sessionRouter } from "./routes/session.js";
 import { checkoutRouter } from "./routes/checkout.js";
@@ -10,6 +11,8 @@ import { nameCheckRouter } from "./routes/nameCheck.js";
 import { einExpressRouter } from "./routes/einExpress.js";
 import { offersRouter } from "./routes/offers.js";
 import { filingDocumentRouter } from "./routes/filingDocument.js";
+import { ordersRouter } from "./routes/orders.js";
+import { runHoldSweepOnce } from "./fulfillment/holdSweep.js";
 import { pool } from "./db/pool.js";
 import { realZohoClient } from "./zoho/client.js";
 import { runOnce } from "./sync/worker.js";
@@ -39,6 +42,11 @@ app.use("/api/webhooks/stripe", express.raw({ type: "application/json" }));
 app.use(stripeWebhookRouter);
 
 app.use(express.json());
+
+// Per-IP limits (429) and the Turnstile bot check on the public funnel
+// endpoints; see middleware/funnelProtection.ts.
+applyFunnelProtection(app);
+
 app.use(healthRouter);
 app.use(sessionRouter);
 app.use(checkoutRouter);
@@ -47,6 +55,7 @@ app.use(nameCheckRouter);
 app.use(einExpressRouter);
 app.use(offersRouter);
 app.use(filingDocumentRouter);
+app.use(ordersRouter);
 
 const port = Number(process.env.PORT ?? 3000);
 app.listen(port, () => {
@@ -88,4 +97,19 @@ if (fulfillmentPollerIntervalMs > 0) {
     });
   }, fulfillmentPollerIntervalMs);
   console.log(`Fulfillment poller running every ${fulfillmentPollerIntervalMs}ms`);
+}
+
+/**
+ * Card-hold watch (pay-after-filing): records hold expiry times and flags
+ * held orders nearing expiry without proof of filing. Every 15 minutes by
+ * default; HOLD_SWEEP_INTERVAL_MS=0 disables it.
+ */
+const holdSweepIntervalMs = Number(process.env.HOLD_SWEEP_INTERVAL_MS ?? 15 * 60_000);
+if (holdSweepIntervalMs > 0) {
+  setInterval(() => {
+    runHoldSweepOnce(pool).catch((err) => {
+      console.error("[hold sweep] tick failed", err);
+    });
+  }, holdSweepIntervalMs);
+  console.log(`Card-hold watch running every ${holdSweepIntervalMs}ms`);
 }

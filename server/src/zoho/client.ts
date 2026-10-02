@@ -71,10 +71,23 @@ export interface DealStageUpdatePayload {
    * client should paper over by skipping the check.
    */
   expected_email: string;
+  /** Extra Deal fields written in the same update (e.g. Payment_Status,
+   *  Proof_of_Filing_Date). */
+  extra_fields?: Record<string, unknown>;
+  /**
+   * true only when crm_deal_id is a Deal this data spine created itself
+   * (a synced order_deal job for the same order — checked by the webhook
+   * before setting this). The ownership lookup exists to stop a
+   * client-supplied Deal id from being edited; it is not needed, and would
+   * wrongly fail, for our own Deals, which have no linked Contact.
+   */
+  server_created?: boolean;
 }
 
 export interface OrderSyncPayload {
-  kind: "paid_deal" | "abandoned_cart";
+  /** paid_deal: money collected at checkout. held_deal: card hold placed,
+   *  money collected later on proof of filing. */
+  kind: "paid_deal" | "held_deal" | "abandoned_cart";
   order: {
     order_id: string;
     filing_session_id: string;
@@ -82,6 +95,7 @@ export interface OrderSyncPayload {
     crm_intent: string;
     total_cents: number;
     failure_reason?: string | null;
+    stripe_payment_intent_id?: string | null;
   };
   filing_session: {
     email?: string | null;
@@ -89,7 +103,58 @@ export interface OrderSyncPayload {
     phone?: string | null;
     entity_name_primary?: string | null;
     crm_lead_id?: string | null;
+    utm_source?: string | null;
+    utm_medium?: string | null;
+    utm_campaign?: string | null;
   };
+}
+
+/** CRM Package picklist value for an Offer Master offer_code. */
+export function packageLabel(offerCode: string): string | undefined {
+  if (offerCode === "FASTTRACK") return "FastTrack";
+  if (offerCode === "PREMIUM") return "Premium";
+  if (offerCode.startsWith("DIY")) return "DIY";
+  if (offerCode === "EIN_FILING_EXPRESS") return "EIN Express";
+  if (offerCode === "EIN_FILING") return "EIN Filing";
+  if (offerCode.startsWith("REGISTERED_AGENT")) return "Registered Agent 3-Year";
+  if (offerCode.startsWith("CREDENTIALS_KIT") || offerCode.startsWith("CCK")) return "Credentials Kit";
+  return undefined;
+}
+
+/** Test orders are recognised by the address they were placed with. */
+export function isTestEmail(email: string | null | undefined): boolean {
+  const e = (email ?? "").toLowerCase();
+  return e.includes("+test") || e.includes("test@") || e.includes("launch-test") || e.endsWith(".invalid");
+}
+
+/**
+ * The Deal record written when an order's payment is secured. Stage values
+ * are ones present in the live Deal Stage picklist (checked 30 Sep 2026):
+ * a hold opens the Deal at "SERVICE REQUESTED"; money collected at
+ * checkout opens it at "Closed Won". Both are overridable by env.
+ */
+export function buildDealRecord(payload: OrderSyncPayload): Record<string, unknown> {
+  const email = payload.filing_session.email ?? "";
+  const held = payload.kind === "held_deal";
+  const stage = held
+    ? process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED"
+    : process.env.ZOHO_DEAL_STAGE_ON_PAYMENT || "Closed Won";
+  const record: Record<string, unknown> = {
+    Deal_Name: `${payload.filing_session.entity_name_primary || email} — ${payload.order.product}`,
+    Stage: stage,
+    Amount: payload.order.total_cents / 100,
+    Lead_Source: "LLC Filing Intake",
+    filing_session_id: payload.order.filing_session_id,
+    Payment_Status: held ? "Hold Placed" : "Payment Collected",
+    Package: packageLabel(payload.order.product),
+    Stripe_Payment_Intent: payload.order.stripe_payment_intent_id ?? undefined,
+    UTM_Source: payload.filing_session.utm_source ?? undefined,
+    UTM_Medium: payload.filing_session.utm_medium ?? undefined,
+    UTM_Campaign: payload.filing_session.utm_campaign ?? undefined,
+    Test_Record: isTestEmail(email),
+  };
+  for (const k of Object.keys(record)) if (record[k] === undefined) delete record[k];
+  return record;
 }
 
 async function getZohoAccessToken(): Promise<string> {
@@ -168,8 +233,13 @@ export const realZohoClient: ZohoClient = {
               Email: email,
               Phone: snapshot.phone ?? undefined,
               Company: snapshot.entity_name_primary ?? undefined,
-              Lead_Source: "Data Spine — session_sync",
+              // A real value in the live Lead Source picklist (checked 30 Sep 2026).
+              Lead_Source: "LLC Filing Intake",
               filing_session_id: (snapshot.filing_session_id as string | undefined) ?? undefined,
+              UTM_Source: (snapshot.utm_source as string | undefined) ?? undefined,
+              UTM_Medium: (snapshot.utm_medium as string | undefined) ?? undefined,
+              UTM_Campaign: (snapshot.utm_campaign as string | undefined) ?? undefined,
+              Test_Record: isTestEmail(email),
             },
           ],
           duplicate_check_fields: ["Email"],
@@ -239,21 +309,11 @@ export const realZohoClient: ZohoClient = {
         return { ok: true, leadId: leadData.data?.[0]?.details?.id };
       }
 
-      // kind === "paid_deal"
+      // kind === "paid_deal" | "held_deal"
       const dealRes = await fetch("https://www.zohoapis.com/crm/v2/Deals", {
         method: "POST",
         headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          data: [
-            {
-              Deal_Name: `${payload.filing_session.entity_name_primary || email} — ${payload.order.product}`,
-              Stage: "Payment Received",
-              Amount: payload.order.total_cents / 100,
-              Lead_Source: "Data Spine — order_deal",
-              filing_session_id: payload.order.filing_session_id,
-            },
-          ],
-        }),
+        body: JSON.stringify({ data: [buildDealRecord(payload)] }),
       });
       if (dealRes.status === 401) return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal creation" };
       if (!dealRes.ok) return { ok: false, httpStatus: dealRes.status, error: `Zoho Deal create failed: ${dealRes.status}` };
@@ -295,6 +355,9 @@ export const realZohoClient: ZohoClient = {
     }
 
     try {
+      if (payload.server_created) {
+        return await putDealUpdate(token, payload);
+      }
       const dealRes = await fetch(
         `https://www.zohoapis.com/crm/v2/Deals/${encodeURIComponent(payload.crm_deal_id)}?fields=Contact_Name,Deal_Name`,
         { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
@@ -343,22 +406,26 @@ export const realZohoClient: ZohoClient = {
         };
       }
 
-      const updateRes = await fetch(`https://www.zohoapis.com/crm/v2/Deals/${encodeURIComponent(payload.crm_deal_id)}`, {
-        method: "PUT",
-        headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ data: [{ Stage: payload.target_stage }] }),
-      });
-
-      if (updateRes.status === 401) {
-        return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal stage update" };
-      }
-      if (!updateRes.ok) {
-        const body = await updateRes.text().catch(() => "");
-        return { ok: false, httpStatus: updateRes.status, error: `Zoho Deal stage update failed (${updateRes.status}): ${body}` };
-      }
-      return { ok: true, dealId: payload.crm_deal_id };
+      return await putDealUpdate(token, payload);
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
   },
 };
+
+async function putDealUpdate(token: string, payload: DealStageUpdatePayload): Promise<ZohoSyncResult> {
+  const updateRes = await fetch(`https://www.zohoapis.com/crm/v2/Deals/${encodeURIComponent(payload.crm_deal_id)}`, {
+    method: "PUT",
+    headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ data: [{ Stage: payload.target_stage, ...(payload.extra_fields ?? {}) }] }),
+  });
+
+  if (updateRes.status === 401) {
+    return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal stage update" };
+  }
+  if (!updateRes.ok) {
+    const body = await updateRes.text().catch(() => "");
+    return { ok: false, httpStatus: updateRes.status, error: `Zoho Deal stage update failed (${updateRes.status}): ${body}` };
+  }
+  return { ok: true, dealId: payload.crm_deal_id };
+}

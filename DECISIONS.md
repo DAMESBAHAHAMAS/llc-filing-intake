@@ -953,3 +953,108 @@ recurring charge.
 
 **Supersedes:** the Registered Agent wording (not the price) in
 "2026-09-17 — Package pricing".
+
+---
+
+## 2026-09-30 — Filing orders are paid after filing: card held at checkout, collected on proof of filing
+
+**Rule (Damian, 29 Sep 2026):** funds are collected only after proof of
+filing is delivered. Applies to orders containing a Sunbiz formation
+package (FASTTRACK, PREMIUM, DIY_STATE_FEE) or an EIN filing. Orders with
+no filing in them still charge at checkout.
+
+**How:** Checkout uses manual capture and saves the card to a Customer
+(`setup_future_usage=off_session`). The order becomes `authorized`; the
+CRM Deal opens at SERVICE REQUESTED with Payment_Status "Hold Placed".
+Filing may start on a held order. Proof of filing (the Sunbiz document
+number of the filed Articles; the EIN for an EIN-only order) is recorded
+through `POST /api/orders/:orderId/proof-of-filing` (operator key), which
+captures the hold. If the hold has lapsed, the saved card is charged
+off-session for the same amount. The order is marked `paid` only by
+Stripe's `payment_intent.succeeded` webhook; the Deal then moves to Closed
+Won. A watch records each hold's expiry and flags holds within 48 hours of
+expiry that have no proof yet. `PAYMENT_CAPTURE_MODE=immediate` turns the
+whole rule off.
+
+**Verified in Stripe test mode, 30 Sep 2026 (acct_1ChHmZDo01bXdbWS):**
+- Checkout Session with these hold parameters: accepted.
+- Extended holds (`request_extended_authorization`): refused — "This
+  account is not eligible for the requested card features." They need
+  IC+ pricing or Stripe approval. Left opt-in (`STRIPE_EXTENDED_AUTHORIZATION`).
+- Card hold on this account: 7.00 days (capture_before reported on the charge).
+- Collect: succeeded; repeat collect with the same idempotency key
+  returned the same result, no second charge.
+- Release then saved-card charge: succeeded.
+- Run script: `npm run check:card-hold` (refuses a live key).
+
+**Known limits:** a filing that takes longer than 7 days relies on the
+saved-card charge, which a bank can decline or send back for customer
+authentication (more likely on non-US cards). The Checkout Session also
+offers non-card methods enabled in the Dashboard (Klarna, Cash App Pay,
+Amazon Pay on test mode); their hold behaviour was not tested. Not yet
+verified: a hold placed through a real Checkout page in a browser, and
+migration 0018 against the live database.
+
+**Migration 0018 status, 2 Oct 2026 09:15 ET:** applies cleanly after
+0001–0017 on a fresh Postgres 16, and the full suite (90 tests, including
+the two database test files) passes against that database. The live
+database is still at 0017 (`schema_migrations`), its `orders` table has
+none of the 0018 columns, and it holds no orders. Render's build and
+start commands do not run migrations, so **0018 must be applied to the
+live database before this branch deploys**; otherwise the first checkout
+writes `payment_status = 'authorized'` and the constraint rejects it.
+0018 only adds nullable columns and widens two checks, so applying it
+first is safe under the code currently on `main`.
+
+**Supersedes:** charge-at-checkout for filing orders (the Gate 2 flow).
+
+---
+
+## 2026-09-30 — Order and failure alerts go to Cliq, else email, else logs
+
+**Rationale:** the data spine had no new-order alert at all (the only Cliq
+call lived in the legacy Cloudflare worker, for urgent name reviews, and
+is a silent no-op without `CLIQ_WEBHOOK_URL`). Launch needs a person to
+hear about every new order and every money or sync failure within
+minutes. `src/ops/alerts.ts` sends: new order (card held or paid),
+payment collected, hold released, refund, collection failure, hold
+expiring within 48 hours, and CRM sync giving up. Delivery: Cliq incoming
+webhook if `CLIQ_WEBHOOK_URL` is set, otherwise email through the
+existing Resend sender to `OPS_ALERT_EMAIL`, otherwise Render logs. Test
+orders are marked [TEST]. Alerts never throw and never roll back the event
+that raised them.
+
+## 2026-10-01 — Rate limits on the public funnel endpoints; Turnstile check built but off
+
+**Correction first:** the 72-hour launch map (30 Sep) said a
+"bot-protection branch" existed unmerged. It didn't. No branch in either
+repository, and nothing on `main`, limited requests. The Zoho task
+"Turn on bot protection and rate limits for the filing funnel" (due Fri
+2 Oct) was unbuilt.
+
+**What exists now (branch `claude/rate-limits-bot-protection`):**
+`middleware/rateLimit.ts` (fixed-window per-IP counter, in memory, 429
+with `Retry-After`) and `middleware/turnstile.ts`, wired by
+`middleware/funnelProtection.ts` after CORS and `express.json()`.
+Limits: interview autosave 120/min, name check 30/min, checkout 10 per
+10 min, registered-agent acceptance email 5/hour, other agent calls 30 per
+10 min, filing PDF 10 per 10 min, reads 120/min. Health and the Stripe
+webhook are not limited. Every limit has a `RATE_LIMIT_*` override.
+
+**Rationale:** the name check calls Sunbiz, checkout creates Stripe
+sessions, the acceptance request emails a third party, and the PDF
+render is CPU-heavy; all were open to unlimited calls. In memory is
+enough because the service is one Render instance (starter plan); if it
+scales out, the counter must move to Postgres or Redis.
+
+**Client IP:** Render puts several proxies in front of the app, and Render
+staff point to the `True-Client-IP` header for the visitor's address, so
+the limiter keys on that header and falls back to `req.ip`. Verify after
+the first deploy that the keys are visitor addresses.
+
+**Turnstile:** off until `TURNSTILE_SECRET_KEY` is set. It guards checkout
+and the agent acceptance email only. Turning it on needs a Turnstile
+widget created in Damian's Cloudflare account and the frontend sending
+its token, released together; the secret alone would block every customer.
+
+**Supersedes:** —

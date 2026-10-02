@@ -1,6 +1,7 @@
 import type { Pool } from "pg";
 import type { DealStageUpdatePayload, OrderSyncPayload, ZohoClient, ZohoSyncResult } from "../zoho/client.js";
 import { backoffForAttempt, isDeadLetter } from "./backoff.js";
+import { sendOpsAlert } from "../ops/alerts.js";
 
 export interface ClaimedJob {
   id: number;
@@ -93,6 +94,7 @@ async function syncWithOneFreeAuthRetry(client: ZohoClient, job: ClaimedJob): Pr
  */
 async function recordOutcome(pool: Pool, job: ClaimedJob, result: ZohoSyncResult): Promise<void> {
   const client = await pool.connect();
+  let deadLettered = false;
   try {
     await client.query("BEGIN");
 
@@ -131,6 +133,7 @@ async function recordOutcome(pool: Pool, job: ClaimedJob, result: ZohoSyncResult
       // attempts/hours for a job that can never pass. Straight to
       // dead_letter, same durable record either way.
       if (result.permanent || isDeadLetter(newAttempts, job.max_attempts)) {
+        deadLettered = true;
         await client.query(
           `UPDATE crm_sync_queue
            SET status = 'dead_letter', attempts = $2, locked_at = NULL, locked_by = NULL, last_error = $3
@@ -163,6 +166,12 @@ async function recordOutcome(pool: Pool, job: ClaimedJob, result: ZohoSyncResult
     throw err;
   } finally {
     client.release();
+  }
+  if (deadLettered) {
+    await sendOpsAlert(
+      "CRM sync gave up",
+      `${job.sync_type} for ${job.order_id ? `order ${job.order_id}` : `session ${job.filing_session_id}`} stopped retrying: ${result.error ?? "unknown error"}`
+    );
   }
 }
 
