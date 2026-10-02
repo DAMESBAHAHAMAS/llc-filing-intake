@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { closedCodesIn } from "../offers/closedOffers.js";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { resolveActiveOffers } from "../offers/catalog.js";
@@ -60,6 +61,14 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
   const requestedItems = parseLineItems(body);
   if (!requestedItems) {
     res.status(400).json({ error: "line_items must be a non-empty array of { offer_code, quantity? }" });
+    return;
+  }
+
+  // Offers closed at launch (offers/closedOffers.ts): refused before any
+  // database or Stripe work.
+  const closedRequested = closedCodesIn(requestedItems.map((i) => i.offer_code));
+  if (closedRequested.length > 0) {
+    res.status(422).json({ error: "offer not currently available", closed_offer_codes: closedRequested });
     return;
   }
 
