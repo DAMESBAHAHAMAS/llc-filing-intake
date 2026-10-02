@@ -953,3 +953,87 @@ recurring charge.
 
 **Supersedes:** the Registered Agent wording (not the price) in
 "2026-09-17 — Package pricing".
+
+---
+
+## 2026-10-01 — Plan only: filing transmission by fax (Prepaid Sunbiz E-File account + Telnyx). Nothing built.
+
+**Status:** plan, no code. The fax-sending code stays frozen under the
+earlier ruling recorded on the Zoho task "Confirm the prepaid Sunbiz
+filing account is active, or open one" (fax code frozen until its
+prerequisite passes). Building starts only when Damian lifts the freeze
+and the accounts below exist. Extends "2026-09-09 — Fulfillment worker
+stops at `requires_review`".
+
+**Facts, checked 2026-10-01**
+- Sunbiz (dos.fl.gov, efile.sunbiz.org): fax filing needs a Prepaid Sunbiz
+  E-File account, minimum deposit $300, fees deducted on receipt. An
+  Electronic Filing Cover Sheet is generated for each document after
+  logging in to that account; the document and cover sheet are faxed to
+  the number printed on the sheet. The file date is the date of receipt,
+  and evidence of filing or rejection is returned by fax within 24 hours.
+  Sunbiz advises a dedicated fax line.
+- Telnyx (developers.telnyx.com): `POST /v2/faxes` with `connection_id`
+  (the Fax Application), `media_url` (a PDF), `to`, `from` (E.164).
+  Outbound events: `fax.queued`, `fax.media.processed`,
+  `fax.sending.started`, `fax.delivered`, `fax.failed` (with
+  `failure_reason`). Inbound: `fax.received` with `media_url` (a signed
+  link valid for 10 minutes), `from`, `to`, `page_count`. One Fax
+  Application holds the number and the webhook URL for both directions.
+  Webhook signature header names and algorithm: to confirm in Telnyx's
+  docs at build time (not confirmed here).
+
+**Flow**
+1. *Approval before each send (gate rule).* Fulfillment already stops at
+   `requires_review` with the Articles PDF stored in `filing_documents`.
+   New: an approval record (who, when, and the sha256 of the exact PDF
+   approved). The send step refuses if the PDF to send doesn't match the
+   approved hash.
+2. *Cover sheet.* Open decision for Damian:
+   (a) automated: the backend logs in to efile.sunbiz.org with the prepaid
+       account credentials stored as Render secrets (pasted by Damian) and
+       saves the cover sheet per filing, but only after confirming the
+       site's terms allow it; or
+   (b) a named person (not Damian) generates it and attaches it to the
+       order through an operator endpoint.
+3. *Media.* Cover sheet + Articles merged into one PDF (the PDF service's
+   `/merge-pdf`, on the Operating Agreement branch), stored in
+   `filing_documents`, served to Telnyx at a single-use URL that expires
+   after 15 minutes (`fulfillment_transmissions.media_access_token_id`
+   and `media_access_expires_at` already exist).
+4. *Send.* Insert a `fulfillment_transmissions` row (`pending`, next
+   `attempt_number`), call `POST /v2/faxes`, store
+   `provider_transmission_id`, status `submitted`.
+5. *Status webhook* (`/api/webhooks/telnyx`): verify the signature,
+   ignore duplicate events, set `delivered` or `failed`. Delivered is not
+   filed (the task's Definition of Done). Failed retries with backoff, at
+   most 3 attempts, then an ops alert.
+6. *Return fax.* `fax.received` on the same number: download the PDF
+   within the 10-minute window, store it in `filing_documents` as the
+   state's return, and match it to the order: automatically when exactly
+   one transmission is awaiting a return and its company name is found
+   in the text; otherwise it goes to a review queue for a named person.
+7. *Proof of filing.* A matched filed return calls the existing
+   proof-of-filing step (card-hold branch:
+   `POST /api/orders/:orderId/proof-of-filing` with the document number),
+   which collects the card hold and triggers the formation package.
+8. *Rejection.* The order is marked rejected with an ops alert; the card
+   hold stays uncollected (Terms decision 2, pending Damian).
+
+**Configuration (names only):** `TELNYX_API_KEY`,
+`TELNYX_FAX_CONNECTION_ID`, `TELNYX_FAX_FROM_NUMBER`, the webhook
+verification key, `SUNBIZ_FAX_TO_NUMBER` (checked against the number
+printed on each cover sheet), `FAX_MEDIA_BASE_URL`; for option 2(a), the
+prepaid account number and password.
+
+**Test before any real filing:** send from the Telnyx number to a second
+test fax number on the same Fax Application, proving send, status and
+receive end to end without touching the state. Then one real filing,
+with Damian's recorded approval.
+
+**Needed from Damian before building:** lift the freeze; confirm or open
+the prepaid Sunbiz account ($300 minimum deposit); open the Telnyx
+account, buy the fax number(s), paste the API key into Render; choose 2(a)
+or 2(b).
+
+**Supersedes:** —
