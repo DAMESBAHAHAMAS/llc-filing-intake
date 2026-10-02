@@ -995,6 +995,17 @@ Amazon Pay on test mode); their hold behaviour was not tested. Not yet
 verified: a hold placed through a real Checkout page in a browser, and
 migration 0018 against the live database.
 
+**Migration 0018 status, 2 Oct 2026 09:30 ET:** applies cleanly after
+0001–0017 on a fresh Postgres 16, and the full suite (90 tests, including
+the two database test files) passes against that database. The live
+database is still at 0017 (`schema_migrations`), its `orders` table has
+none of the 0018 columns, and it holds no orders. Render's build and
+start commands do not run migrations, so **0018 must be applied to the
+live database before this branch deploys**; otherwise the first checkout
+writes `payment_status = 'authorized'` and the constraint rejects it.
+0018 only adds nullable columns and widens two checks, so applying it
+first is safe under the code currently on `main`.
+
 **Supersedes:** charge-at-checkout for filing orders (the Gate 2 flow).
 
 ---

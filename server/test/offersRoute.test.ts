@@ -64,13 +64,20 @@ describe("GET /api/offers", () => {
     expect(JSON.stringify(body)).not.toMatch(/prod_[A-Za-z0-9]/);
   });
 
-  it("excludes draft offers — a draft offer must be neither renderable nor sellable", async () => {
+  it("excludes draft and retired offers — only the active version of each offer is renderable or sellable", async () => {
     const res = await fetch(`${baseUrl}/api/offers`);
-    const body = (await res.json()) as { offers: { offer_code: string }[] };
+    const body = (await res.json()) as { offers: { offer_code: string; unit_amount_cents: number }[] };
     const codes = body.offers.map((o) => o.offer_code);
 
-    // EIN_FILING_EXPRESS is seeded status='draft' (price unconfirmed).
-    expect(codes).not.toContain("EIN_FILING_EXPRESS");
+    // One row per offer code: the v1 rows that 0016 retired never appear
+    // alongside their active v2 replacements.
+    expect(new Set(codes).size).toBe(codes.length);
+    // EIN_FILING_EXPRESS v1 was the $449 draft placeholder (0012); 0016
+    // retired it and made v2 at $299 active. (This test previously asserted
+    // the offer was absent, which stopped being true when 0016 shipped.)
+    const einExpress = body.offers.find((o) => o.offer_code === "EIN_FILING_EXPRESS");
+    expect(einExpress?.unit_amount_cents).toBe(29900);
+    expect(body.offers.some((o) => o.unit_amount_cents === 44900)).toBe(false);
     // Sanity: the tiers the storefront depends on ARE present.
     expect(codes).toContain("FASTTRACK");
     expect(codes).toContain("PREMIUM");
