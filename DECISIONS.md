@@ -995,7 +995,7 @@ Amazon Pay on test mode); their hold behaviour was not tested. Not yet
 verified: a hold placed through a real Checkout page in a browser, and
 migration 0018 against the live database.
 
-**Migration 0018 status, 2 Oct 2026 09:30 ET:** applies cleanly after
+**Migration 0018 status, 2 Oct 2026 09:15 ET:** applies cleanly after
 0001–0017 on a fresh Postgres 16, and the full suite (90 tests, including
 the two database test files) passes against that database. The live
 database is still at 0017 (`schema_migrations`), its `orders` table has
