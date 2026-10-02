@@ -143,6 +143,60 @@ describe("POST /api/orders/:orderId/proof-of-filing", () => {
   });
 });
 
+describe("services charged when complete (EIN with a formation order)", () => {
+  it("collects only the formation part at proof of filing; the rest of the hold is released", async () => {
+    db.order = { ...db.order, total_cents: 79800, deferred_cents: 29900 };
+    stripe.capture.mockResolvedValue({ id: "pi_hold", status: "succeeded" });
+    const r = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
+    expect(r.status).toBe(200);
+    expect(stripe.capture).toHaveBeenCalledWith("pi_hold", "capture-ord-1", 49900);
+    expect(r.json.collected_cents).toBe(49900);
+    expect(r.json.deferred_cents).toBe(29900);
+  });
+
+  it("charges the saved card only the formation part when the hold has expired", async () => {
+    db.order = { ...db.order, total_cents: 79800, deferred_cents: 29900 };
+    stripe.capture.mockRejectedValue(new StripeApiError("expired", 400, { code: "charge_expired_for_capture" }));
+    stripe.retrieve.mockResolvedValue({ id: "pi_hold", customer: "cus_1", payment_method: "pm_1" });
+    stripe.charge.mockResolvedValue({ id: "pi_fallback", status: "succeeded" });
+    await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
+    expect(stripe.charge).toHaveBeenCalledWith(expect.objectContaining({ amountCents: 49900 }));
+  });
+
+  it("charges the deferred part to the saved card once the service is complete", async () => {
+    db.order = { ...db.order, payment_status: "paid", deferred_cents: 29900, deferred_payment_intent_id: null };
+    stripe.retrieve.mockResolvedValue({ id: "pi_hold", customer: "cus_1", payment_method: "pm_1" });
+    stripe.charge.mockResolvedValue({ id: "pi_ein", status: "succeeded" });
+    const r = await post("/api/orders/ord-1/service-complete", { service_ref: "12-3456789" });
+    expect(r.status).toBe(200);
+    expect(r.json.status).toBe("deferred_service_charged");
+    expect(stripe.charge).toHaveBeenCalledWith(
+      expect.objectContaining({
+        amountCents: 29900,
+        idempotencyKey: "deferred-ord-1",
+        metadata: expect.objectContaining({ kind: "deferred_service", order_id: "ord-1" }),
+      })
+    );
+    expect(db.queries.some((q) => /deferred_payment_intent_id = \$3/.test(q))).toBe(true);
+  });
+
+  it("refuses before the formation part is collected, never charging early", async () => {
+    db.order = { ...db.order, payment_status: "authorized", deferred_cents: 29900, deferred_payment_intent_id: null };
+    const r = await post("/api/orders/ord-1/service-complete", { service_ref: "12-3456789" });
+    expect(r.status).toBe(409);
+    expect(stripe.charge).not.toHaveBeenCalled();
+  });
+
+  it("does not charge twice, and refuses orders with nothing deferred or no operator key", async () => {
+    db.order = { ...db.order, payment_status: "paid", deferred_cents: 29900, deferred_payment_intent_id: "pi_ein" };
+    expect((await post("/api/orders/ord-1/service-complete", { service_ref: "12-3456789" })).json.status).toBe("already_requested");
+    db.order = { ...db.order, deferred_cents: 0, deferred_payment_intent_id: null };
+    expect((await post("/api/orders/ord-1/service-complete", { service_ref: "12-3456789" })).status).toBe(409);
+    expect((await post("/api/orders/ord-1/service-complete", { service_ref: "12-3456789" }, null)).status).toBe(401);
+    expect(stripe.charge).not.toHaveBeenCalled();
+  });
+});
+
 describe("POST /api/orders/:orderId/release-hold", () => {
   it("cancels a hold", async () => {
     stripe.cancel.mockResolvedValue({ id: "pi_hold", status: "canceled" });

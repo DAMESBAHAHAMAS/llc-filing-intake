@@ -5,7 +5,8 @@ import { describeError } from "../db/describeError.js";
 import { resolveActiveOffers } from "../offers/catalog.js";
 import { createCheckoutSession, StripeApiError } from "../stripe/restClient.js";
 import { getEinExpressAvailability } from "../ein/capacity.js";
-import { holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
+import { deferredServiceCents, holdsEnabled, HOLD_CHECKOUT_MESSAGE, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
+import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 
 export const checkoutRouter = Router();
 
@@ -127,17 +128,20 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
     const totalCents = lineItemSnapshots.reduce((sum, li) => sum + li.unit_amount_cents * li.quantity, 0);
     const primaryOffer = resolvedByCode.get(requestedItems[0].offer_code)!;
 
-    const orderInsert = await pool.query<{ order_id: string }>(
-      `INSERT INTO orders (filing_session_id, crm_intent, product, line_items, total_cents, currency, checkout_status)
-       VALUES ($1, $2, $3, $4, $5, 'usd', 'pending')
-       RETURNING order_id`,
-      [filingSessionId, primaryOffer.crm_intent, primaryOffer.offer_code, JSON.stringify(lineItemSnapshots), totalCents]
-    );
-    const orderId = orderInsert.rows[0].order_id;
-
     // Pay-after-filing: filing orders place a card hold that is collected
     // only when proof of filing is recorded (routes/orders.ts).
     const captureMode = holdsEnabled() && requiresPayAfterFiling(lineItemSnapshots) ? "hold" : "immediate";
+    // Services delivered after the filing (EIN) are charged when complete,
+    // not at proof of filing. Only meaningful on a held order.
+    const deferredCents = captureMode === "hold" ? deferredServiceCents(lineItemSnapshots) : 0;
+
+    const orderInsert = await pool.query<{ order_id: string }>(
+      `INSERT INTO orders (filing_session_id, crm_intent, product, line_items, total_cents, currency, checkout_status, deferred_cents)
+       VALUES ($1, $2, $3, $4, $5, 'usd', 'pending', $6)
+       RETURNING order_id`,
+      [filingSessionId, primaryOffer.crm_intent, primaryOffer.offer_code, JSON.stringify(lineItemSnapshots), totalCents, deferredCents]
+    );
+    const orderId = orderInsert.rows[0].order_id;
 
     try {
       const stripeSession = await createCheckoutSession({
@@ -158,6 +162,7 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         metadata: session.rows[0].crm_deal_id ? { crm_deal_id: session.rows[0].crm_deal_id } : undefined,
         captureMode,
         paymentIntentMetadata: { order_id: orderId, filing_session_id: filingSessionId },
+        submitMessage: captureMode === "hold" && needsSunbizFiling(lineItemSnapshots) ? HOLD_CHECKOUT_MESSAGE : undefined,
       });
 
       await pool.query(

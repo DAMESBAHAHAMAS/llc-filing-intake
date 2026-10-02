@@ -385,7 +385,7 @@ export async function handlePaymentLifecycleEvent(
   const uuidLike = /^[0-9a-f-]{36}$/i;
 
   const found = await client.query(
-    `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at
+    `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at, deferred_payment_intent_id
      FROM orders
      WHERE ($1::uuid IS NOT NULL AND order_id = $1::uuid) OR ($2::text IS NOT NULL AND stripe_payment_intent_id = $2::text)
      ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
@@ -399,7 +399,26 @@ export async function handlePaymentLifecycleEvent(
     fulfillment_status: string;
     crm_deal_id: string | null;
     proof_of_filing_at: Date | null;
+    deferred_payment_intent_id?: string | null;
   };
+
+  // The separate charge for a service completed after the filing (EIN).
+  // It never changes the order's own payment state.
+  const isDeferredServicePayment =
+    obj.metadata?.kind === "deferred_service" ||
+    (!!paymentIntentId && !!order.deferred_payment_intent_id && paymentIntentId === order.deferred_payment_intent_id);
+  if (isDeferredServicePayment) {
+    if (event.type === "payment_intent.succeeded") {
+      await client.query(
+        `UPDATE orders SET deferred_charged_at = COALESCE(deferred_charged_at, now()), deferred_charge_error = NULL,
+                deferred_payment_intent_id = COALESCE(deferred_payment_intent_id, $2)
+         WHERE order_id = $1`,
+        [order.order_id, obj.id]
+      );
+      return { processingResult: "deferred_service_collected", orderId: order.order_id };
+    }
+    return { processingResult: `deferred_service_${event.type.replace(/\./g, "_")}_stripe_only`, orderId: order.order_id };
+  }
 
   if (event.type === "payment_intent.succeeded") {
     if (!shouldMarkPaidOnPaymentIntentSucceeded(order.payment_status)) {
