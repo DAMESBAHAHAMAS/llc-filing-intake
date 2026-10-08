@@ -38,7 +38,7 @@ scorecardRouter.post("/api/scorecard/signup", async (req, res) => {
         content: clip(b.utm_content, 120),
       },
     });
-    res.json({ success: true, created: r.created });
+    res.json({ success: true, outcome: r.outcome });
   } catch (err) {
     console.error("[scorecard signup] failed", describeError(err));
     res.status(500).json({ success: false, error: "could not record sign-up" });

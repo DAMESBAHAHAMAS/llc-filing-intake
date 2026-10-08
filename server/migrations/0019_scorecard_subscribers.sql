@@ -19,6 +19,7 @@ CREATE TABLE scorecard_subscribers (
   crm_lead_id        text,
   crm_synced_at      timestamptz,
   crm_attempts       integer NOT NULL DEFAULT 0,
+  crm_next_at        timestamptz NOT NULL DEFAULT now(),
   crm_last_error     text,
   preview_sent_at    timestamptz,
   signed_up_at       timestamptz NOT NULL DEFAULT now()
@@ -30,14 +31,17 @@ CREATE TABLE scorecard_emails (
   id                   bigserial PRIMARY KEY,
   subscriber_id        bigint NOT NULL REFERENCES scorecard_subscribers (id),
   step                 integer NOT NULL CHECK (step BETWEEN 1 AND 5),
+  -- 0 for the scheduled email; 1, 2, 3 for a Scorecard re-send after a repeat sign-up.
+  seq                  integer NOT NULL DEFAULT 0,
   send_at              timestamptz NOT NULL,
   status               text NOT NULL DEFAULT 'pending'
-                         CHECK (status IN ('pending', 'sent', 'failed', 'skipped')),
+                         CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'skipped')),
   attempts             integer NOT NULL DEFAULT 0,
+  claimed_at           timestamptz,
   sent_at              timestamptz,
   provider_message_id  text,
   last_error           text,
-  UNIQUE (subscriber_id, step)
+  UNIQUE (subscriber_id, step, seq)
 );
 
 CREATE INDEX scorecard_emails_due_idx ON scorecard_emails (send_at) WHERE status = 'pending';
