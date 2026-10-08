@@ -12,7 +12,10 @@ beforeEach(async () => {
   const db = newDb();
   const { Pool: MemPool } = db.adapters.createPg();
   pool = new MemPool() as unknown as Pool;
-  await pool.query(readFileSync(new URL("../migrations/0019_scorecard_subscribers.sql", import.meta.url), "utf8"));
+  // pg-mem has no row-level security; drop only those statements, run the rest as written.
+  const sql = readFileSync(new URL("../migrations/0019_scorecard_subscribers.sql", import.meta.url), "utf8")
+    .replace(/ALTER TABLE \w+ ENABLE ROW LEVEL SECURITY;/g, "");
+  await pool.query(sql);
 });
 
 const T0 = new Date("2026-10-08T12:00:00Z");
