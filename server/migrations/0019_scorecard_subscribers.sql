@@ -45,3 +45,8 @@ CREATE TABLE scorecard_emails (
 );
 
 CREATE INDEX scorecard_emails_due_idx ON scorecard_emails (send_at) WHERE status = 'pending';
+
+-- Same convention as every other table here: RLS on, no policies. The service
+-- connects directly as the table owner; nothing is readable through the public API.
+ALTER TABLE scorecard_subscribers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE scorecard_emails ENABLE ROW LEVEL SECURITY;
