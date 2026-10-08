@@ -157,7 +157,7 @@ export function buildDealRecord(payload: OrderSyncPayload): Record<string, unkno
   return record;
 }
 
-async function getZohoAccessToken(): Promise<string> {
+export async function getZohoAccessToken(): Promise<string> {
   const clientId = process.env.ZOHO_CLIENT_ID;
   const clientSecret = process.env.ZOHO_CLIENT_SECRET;
   const refreshToken = process.env.ZOHO_REFRESH_TOKEN;
