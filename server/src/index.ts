@@ -12,6 +12,9 @@ import { einExpressRouter } from "./routes/einExpress.js";
 import { offersRouter } from "./routes/offers.js";
 import { filingDocumentRouter } from "./routes/filingDocument.js";
 import { ordersRouter } from "./routes/orders.js";
+import { scorecardRouter } from "./routes/scorecard.js";
+import { runScorecardTick } from "./scorecard/service.js";
+import { realScorecardSender } from "./scorecard/sender.js";
 import { runHoldSweepOnce } from "./fulfillment/holdSweep.js";
 import { pool } from "./db/pool.js";
 import { realZohoClient } from "./zoho/client.js";
@@ -56,6 +59,7 @@ app.use(einExpressRouter);
 app.use(offersRouter);
 app.use(filingDocumentRouter);
 app.use(ordersRouter);
+app.use(scorecardRouter);
 
 const port = Number(process.env.PORT ?? 3000);
 app.listen(port, () => {
@@ -112,4 +116,18 @@ if (holdSweepIntervalMs > 0) {
     });
   }, holdSweepIntervalMs);
   console.log(`Card-hold watch running every ${holdSweepIntervalMs}ms`);
+}
+
+/**
+ * Scorecard lead funnel (SA4-T38): retries unsynced CRM Leads and sends due
+ * emails. Every 30 seconds by default; SCORECARD_POLLER_INTERVAL_MS=0 disables.
+ */
+const scorecardPollerIntervalMs = Number(process.env.SCORECARD_POLLER_INTERVAL_MS ?? 30_000);
+if (scorecardPollerIntervalMs > 0) {
+  setInterval(() => {
+    runScorecardTick(pool, { sender: realScorecardSender }).catch((err) => {
+      console.error("[scorecard poller] tick failed", err);
+    });
+  }, scorecardPollerIntervalMs);
+  console.log(`Scorecard poller running every ${scorecardPollerIntervalMs}ms`);
 }

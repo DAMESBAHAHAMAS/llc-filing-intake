@@ -28,6 +28,8 @@ export function applyFunnelProtection(
   app.use(["/api/registered-agent", "/registered-agent"], limits.raOther);
   app.use("/api/filing-session/:filingSessionId/pdf", limits.filingPdf);
   app.use(["/api/offers", "/api/ein-express"], limits.reads);
+  // Scorecard sign-up sends email: capped like the other email-sending endpoint.
+  app.use("/api/scorecard/signup", limits.scorecardSignup);
 
   return limits;
 }
