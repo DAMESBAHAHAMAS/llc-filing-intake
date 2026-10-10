@@ -50,6 +50,9 @@ export const realScorecardCrm: ScorecardCrm = {
       UTM_Campaign: input.utmCampaign || undefined,
       UTM_Content: input.utmContent || undefined,
       Test_Record: isTestEmail(input.email),
+      // Sent with the Lead itself. The separate add_tags call returned 401 with the
+      // current token, so the tag never landed (found in the 10 Oct live test).
+      Tag: [{ name: SCORECARD_TAG }],
     };
     for (const k of Object.keys(record)) if (record[k] === undefined) delete record[k];
 
@@ -65,11 +68,6 @@ export const realScorecardCrm: ScorecardCrm = {
       const leadId = row?.details?.id;
       if (row?.status !== "success" || !leadId) return { ok: false, error: `Zoho rejected the Lead: ${row?.code ?? "unknown"}` };
 
-      const tagRes = await fetch(
-        `https://www.zohoapis.com/crm/v2/Leads/${leadId}/actions/add_tags?tag_names=${SCORECARD_TAG}&over_write=false`,
-        { method: "POST", headers }
-      );
-      if (!tagRes.ok) return { ok: false, leadId, error: `Zoho add_tags failed: ${tagRes.status}` };
       return { ok: true, leadId };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
