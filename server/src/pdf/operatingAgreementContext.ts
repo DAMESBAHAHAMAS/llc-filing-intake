@@ -8,11 +8,13 @@ import { HOUSE_REGISTERED_AGENT, type FilingSessionRecord } from "./types.js";
  * render_pdf.py's StrictUndefined is the second line of defence.
  *
  * The wording lives in templates/operating_agreement_*.html.j2 and comes
- * from the "Operating Agreement Templates for Review" doc. Until Damian
- * approves that wording, OPERATING_AGREEMENT_WORDING_APPROVED stays false
- * and every rendered PDF carries a "not for customer delivery" banner.
- * Flipping it is a one-line change that needs a DECISIONS.md entry citing
- * his approval.
+ * from the "Templates With Citations" tab of the "Operating Agreement
+ * Templates for Review" doc, which Damian approved on 2026-10-10. The
+ * printed layout is still awaiting his approval, so
+ * OPERATING_AGREEMENT_WORDING_APPROVED stays false and every rendered PDF
+ * carries a "Review copy. Not for customer delivery." banner. Flipping it
+ * is a one-line change that needs a DECISIONS.md entry citing his
+ * approval of the PDF output.
  */
 export const OPERATING_AGREEMENT_WORDING_APPROVED = false;
 
@@ -152,6 +154,10 @@ export function buildOperatingAgreementContext(
   if (management === "manager" && managerNames.length !== managers.length) {
     missing.push("authorized_persons: every manager needs a name");
   }
+  // Schedule A lists each manager with an address (records list, s. 605.0410(1)(a)).
+  if (management === "manager" && !managers.every((p) => isNonEmptyString(p.address))) {
+    missing.push("authorized_persons: every manager needs an address");
+  }
 
   // Members: explicit input wins; otherwise the Article IV authorized members.
   let members: OperatingAgreementMemberInput[];
@@ -214,6 +220,7 @@ export function buildOperatingAgreementContext(
     effective_date: effectiveDate,
     management,
     manager_names: joinNames(managerNames),
+    managers: managers.map((p) => ({ name: p.name, address: p.address })),
   };
 
   if (!multi) {

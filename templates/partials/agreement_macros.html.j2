@@ -1,0 +1,13 @@
+{#- Statute citation printed right after the provision it supports.
+    Each reference stays on one line; the brackets stay attached. -#}
+{% macro cite() -%}
+<span class="cite">{% for ref in varargs %}<span class="part">{% if loop.first %}[{% endif %}{{ ref | replace("§ ", "§ ") }}{% if loop.last %}]{% else %};{% endif %}</span>{% if not loop.last %} {% endif %}{% endfor %}</span>
+{%- endmacro %}
+
+{#- One numbered provision: hanging number, Title Case heading, body. -#}
+{% macro clause(num, title) -%}
+<section class="clause">
+  <h2><span class="num">{{ num }}.</span>{{ title }}</h2>
+  <p>{{ caller() }}</p>
+</section>
+{%- endmacro %}

@@ -101,7 +101,25 @@ describe("buildOperatingAgreementContext", () => {
     if (!r.ok) return;
     expect(r.context.management).toBe("manager");
     expect(r.context.manager_names).toBe("Alex Kim");
+    expect(r.context.managers).toEqual([{ name: "Alex Kim", address: "1 Ocean Dr, Miami, FL 33139" }]);
     expect((r.context.member as { name: string }).name).toBe("Jane Doe");
+  });
+
+  it("needs each manager's address, because Schedule A lists managers", () => {
+    const noAddress = {
+      ...singleMember,
+      authorized_persons: [{ article_iv_title: "MGR", name: "Alex Kim", address: "" }],
+    } as Partial<FilingSessionRecord>;
+    const r = buildOperatingAgreementContext(noAddress, filed, {
+      members: [{ name: "Jane Doe", address: "123 Main St, Miami, FL 33101" }],
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.missingFields).toContain("authorized_persons: every manager needs an address");
+  });
+
+  it("passes no managers for a member-managed company", () => {
+    const r = buildOperatingAgreementContext(singleMember, filed);
+    expect(r.ok && r.context.managers).toEqual([]);
   });
 
   it("switches to the multi-member template and requires its four extra inputs", () => {

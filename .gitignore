@@ -19,8 +19,11 @@ venv/
 .mypy_cache/
 .pytest_cache/
 
-# Fonts (licensing not yet confirmed for redistribution — fetch at build/deploy time instead)
-assets/fonts/
+# Fonts (licensing not yet confirmed for redistribution — fetch at build/deploy time instead).
+# Exception: assets/fonts/brand holds Oswald and Roboto, both SIL Open Font
+# License 1.1 (license files alongside), which allows bundling. DECISIONS.md 2026-10-10.
+assets/fonts/*
+!assets/fonts/brand/
 
 # OS
 .DS_Store

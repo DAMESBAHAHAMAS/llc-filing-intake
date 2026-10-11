@@ -1019,3 +1019,45 @@ Letter, so a package mixes page sizes until the Articles template is
 changed (a filed-document change, so not made here).
 
 **Supersedes:** —
+
+---
+
+## 2026-10-10 — Operating Agreement: approved cited wording in the generator; new layout; no state seal
+
+**Approval:** Damian approved the wording in the "Templates With
+Citations" tab (rev 6) in chat on 2026-10-10 at 20:08 ET ("it's
+definitely approved"), including the 12 cross-check fixes and the
+"Electronic signatures are valid" line. He did not approve the
+typesetting, so the layout was redone and is awaiting his review.
+
+**What changed:** both Operating Agreement templates now carry that
+wording with each Florida statute citation printed right after the
+provision it supports. The tab's "[Use when ...]" instructions are
+template conditions and never print. The context adds `managers`
+(name and address) for the Schedule A manager row; a manager without an
+address is now a named gap. s. 605.04074 was confirmed in the 2026
+edition before release (last section that had only been checked in 2023).
+
+**Layout:** new `partials/agreement_styles.html.j2` and
+`partials/agreement_macros.html.j2`: Oswald Bold Title Case headings
+kept with the following text, Roboto body, hanging section numbers,
+citations in small muted italic kept on one line each, running header
+from page 2, signature block kept together, Schedule A on its own page.
+Fonts are embedded from `assets/fonts/brand/` (Oswald and Roboto, SIL Open
+Font License 1.1, license files alongside); `.gitignore` now allows that
+folder only. The formation cover letter, next steps and the Articles are
+unchanged.
+
+**State seal removed from the agreement:** s. 15.03(3), Fla. Stat.,
+reserves affixing the Great Seal to the Department of State and requires
+its approval for any reproduction (second-degree misdemeanor otherwise).
+The live Articles of Organization template still prints it; removing it
+there is a production change awaiting Damian's decision.
+
+**Hold:** `OPERATING_AGREEMENT_WORDING_APPROVED` stays false until Damian
+approves the PDF output; until then every PDF carries "Review copy. Not
+for customer delivery." A Florida attorney read is still recommended
+before customer delivery.
+
+**Supersedes:** the wording source and banner text in the 2026-10-01
+Operating Agreement entry.
