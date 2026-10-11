@@ -5,8 +5,8 @@
  *
  *   PDF_SERVICE_URL=http://localhost:5055 npx tsx src/scripts/renderOperatingAgreementSamples.ts ./oa-samples
  *
- * Output PDFs carry the "not for customer delivery" banner until the
- * wording is approved (OPERATING_AGREEMENT_WORDING_APPROVED).
+ * Output PDFs carry the "Review copy. Not for customer delivery." banner
+ * until the PDF output is approved (OPERATING_AGREEMENT_WORDING_APPROVED).
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -68,6 +68,29 @@ const samples: Array<{ file: string; filing: Partial<FilingSessionRecord>; input
       borrowing_limit: "$25,000",
       payment_period_months: 24,
       partnership_representative: "Avery Demo",
+    },
+  },
+  {
+    file: "sample-multi-member-manager-managed.pdf",
+    filing: {
+      llc_name: "Sample Grove Properties LLC",
+      principal_address: "500 Placeholder Road, Gainesville, FL 32601",
+      mailing_address: "500 Placeholder Road, Gainesville, FL 32601",
+      registered_agent_path: "house",
+      authorized_persons: [
+        { article_iv_title: "MGR", name: "Taylor Placeholder", address: "500 Placeholder Road, Gainesville, FL 32601" },
+      ],
+      effective_date_option: "Immediate",
+    },
+    inputs: {
+      members: [
+        { name: "Jamie Placeholder", address: "500 Placeholder Road, Gainesville, FL 32601", contribution: "$5,000 cash", percentage: 50 },
+        { name: "Robin Placeholder", address: "77 Fictional Court, Ocala, FL 34470", contribution: "$3,000 cash", percentage: 30 },
+        { name: "Drew Placeholder", address: "9 Sample Circle, Jacksonville, FL 32202", percentage: 20 },
+      ],
+      borrowing_limit: "$50,000",
+      payment_period_months: 36,
+      partnership_representative: "Jamie Placeholder",
     },
   },
 ];

@@ -3,105 +3,173 @@
 <head>
 <meta charset="UTF-8">
 <title>Operating Agreement — {{ llc_name }}</title>
-{% include "partials/document_styles.html.j2" %}
+{% include "partials/agreement_styles.html.j2" %}
 </head>
 <body>
+{% import "partials/agreement_macros.html.j2" as oa %}
 {#
-  Wording source: "Operating Agreement Templates for Review" doc, rev 6
-  (single-member section). Fixed wording is kept as drafted; only the
-  [[FIELD]] slots are filled. Do not edit the wording here without the
-  same change being approved in that doc.
+  Wording source: "Operating Agreement Templates for Review" doc, tab
+  "Templates With Citations" rev 6 (single-member), approved by Damian
+  2026-10-10. Fixed wording and citations are kept exactly as approved;
+  only the [[FIELD]] slots are filled, and the "[Use when ...]"
+  instructions in that tab are the conditions below. Do not edit the
+  wording here without the same change being approved in that tab.
 #}
 
 {% if draft %}
-<div class="draft-banner">Draft wording, not yet approved. Not for customer delivery.</div>
+<div class="draft-banner">Review copy. Not for customer delivery.</div>
 {% endif %}
 
-<header class="doc-header">
-  <img class="seal" src="./assets/florida_seal.png" alt="">
-  <h1>Operating Agreement of {{ llc_name }}</h1>
-  <p class="subheading">A Florida Limited Liability Company — Single Member</p>
+<header class="title-block">
+  <p class="kicker">A Florida Limited Liability Company — Single Member</p>
+  <h1>Operating Agreement of</h1>
+  <span class="company">{{ llc_name }}</span>
 </header>
 
-<div class="filing-facts">
-  <div><p class="label">Document number</p><p class="value">{{ document_number }}</p></div>
-  <div><p class="label">Filed</p><p class="value">{{ filing_date }}</p></div>
-  <div><p class="label">Effective</p><p class="value">{{ effective_date }}</p></div>
-</div>
+<table class="facts">
+  <tr>
+    <td><span class="label">Document Number</span><span class="value">{{ document_number }}</span></td>
+    <td><span class="label">Filed</span><span class="value">{{ filing_date }}</span></td>
+    <td><span class="label">Effective</span><span class="value">{{ effective_date }}</span></td>
+  </tr>
+</table>
 
-<p class="section">This Operating Agreement (the "Agreement") is made effective {{ effective_date }} by {{ member.name }} (the "Member"), the sole member of {{ llc_name }} (the "Company").</p>
+<p class="cite-note">Statute references in brackets are to the Florida Revised Limited Liability Company Act, Chapter 605, Florida Statutes (2026), unless another source is named.</p>
 
-<p class="section"><b>1. Formation.</b> The Company was formed as a Florida limited liability company by filing Articles of Organization with the Florida Department of State, Division of Corporations, on {{ filing_date }}, Document Number {{ document_number }}. This Agreement and the Florida Revised Limited Liability Company Act, Chapter 605, Florida Statutes (the "Act"), govern the Company. Where this Agreement is silent, the Act applies.</p>
+<p class="preamble">This Operating Agreement (the “Agreement”) is made effective {{ effective_date }} by {{ member.name }} (the “Member”), the sole member of {{ llc_name }} (the “Company”). {{ oa.cite("§ 605.0102(45)", "§ 605.0106(5)") }}</p>
 
-<p class="section"><b>2. Name and Addresses.</b> The Company's name is {{ llc_name }}. Its principal office is {{ principal_address }}, and its mailing address is {{ mailing_address }}. The Member may change either address and will update the Company's state records when doing so.</p>
+{% call oa.clause("1", "Formation") %}
+The Company was formed as a Florida limited liability company by filing Articles of Organization with the Florida Department of State, Division of Corporations, on {{ filing_date }}, Document Number {{ document_number }}. This Agreement and the Florida Revised Limited Liability Company Act, Chapter 605, Florida Statutes (the “Act”), govern the Company. Where this Agreement is silent, the Act applies. {{ oa.cite("§ 605.0105(1)–(2)", "§ 605.0104(1)") }}
+{% endcall %}
 
-<p class="section"><b>3. Registered Agent.</b> The Company's registered agent is {{ registered_agent_name }}, at {{ registered_agent_florida_address }}, as stated in the Articles of Organization.</p>
+{% call oa.clause("2", "Name and Addresses") %}
+The Company’s name is {{ llc_name }}. {{ oa.cite("§ 605.0112(1)") }} Its principal office is {{ principal_address }}, and its mailing address is {{ mailing_address }}. The Member may change either address and will update the Company’s state records when doing so. {{ oa.cite("§ 605.0212") }}
+{% endcall %}
 
-<p class="section"><b>4. Purpose.</b> The Company may carry on any lawful business permitted under the Act.</p>
+{% call oa.clause("3", "Registered Agent") %}
+The Company’s registered agent is {{ registered_agent_name }}, at {{ registered_agent_florida_address }}, as stated in the Articles of Organization. {{ oa.cite("§ 605.0113(1)") }}
+{% endcall %}
 
-<p class="section"><b>5. Term.</b> The Company continues until it is dissolved under Section 17.</p>
+{% call oa.clause("4", "Purpose") %}
+The Company may carry on any lawful business permitted under the Act. {{ oa.cite("§ 605.0108") }}
+{% endcall %}
 
-<p class="section"><b>6. Sole Member.</b> The Member owns 100% of the membership interest in the Company. The Member's name, address and contribution are listed in Schedule A.</p>
+{% call oa.clause("5", "Term") %}
+The Company continues until it is dissolved under Section 17. {{ oa.cite("§ 605.0108", "§ 605.0701") }}
+{% endcall %}
 
-<p class="section"><b>7. Capital Contributions.</b> The Member's initial contribution is listed in Schedule A. The Member is not required to contribute more. Any later contribution is recorded in the Company's records.</p>
+{% call oa.clause("6", "Sole Member") %}
+The Member owns 100% of the membership interest in the Company. The Member’s name, address and contribution are listed in Schedule A. {{ oa.cite("§ 605.0401(1)") }}
+{% endcall %}
 
+{% call oa.clause("7", "Capital Contributions") %}
+The Member’s initial contribution is listed in Schedule A. The Member is not required to contribute more. {{ oa.cite("§ 605.0403(1)") }} Any later contribution is recorded in the Company’s records. {{ oa.cite("§ 605.0410(1)(f)") }}
+{% endcall %}
+
+{% call oa.clause("8", "Management") %}
 {% if management == "manager" %}
-<p class="section"><b>8. Management.</b> The Company is managed by {{ manager_names }} (the "Manager"), who has full authority to act for the Company, including to open and operate bank accounts, sign contracts, and engage and pay others. The Member may remove and replace the Manager at any time by written notice.</p>
+The Company is managed by {{ manager_names }} (the “Manager”), who has full authority to act for the Company, including to open and operate bank accounts, sign contracts, and engage and pay others. {{ oa.cite("§ 605.0407", "§ 605.04074(2)(b)") }} The Member may remove and replace the Manager at any time by written notice. {{ oa.cite("§ 605.0105(1)") }}
 {% else %}
-<p class="section"><b>8. Management.</b> The Company is managed by the Member. The Member has full authority to act for the Company, including to open and operate bank accounts, sign contracts, and engage and pay others.</p>
+The Company is managed by the Member. {{ oa.cite("§ 605.0407") }} The Member has full authority to act for the Company, including to open and operate bank accounts, sign contracts, and engage and pay others. {{ oa.cite("§ 605.04074(1)(a)") }}
 {% endif %}
+{% endcall %}
 
-<p class="section"><b>9. Keeping the Company Separate.</b> The Member will keep the Company's money, accounts and records separate from the Member's personal affairs; sign Company documents in the Company's name; and hold Company property in the Company's name.</p>
+{% call oa.clause("9", "Keeping the Company Separate") %}
+The Member will keep the Company’s money, accounts and records separate from the Member’s personal affairs; sign Company documents in the Company’s name; and hold Company property in the Company’s name. {{ oa.cite("§ 605.0108", "§ 605.0105(1)") }}
+{% endcall %}
 
-<p class="section"><b>10. Limited Liability.</b> The Member is not personally liable for the Company's debts, obligations or liabilities solely because of being a member or acting as its manager, except as the Act provides.</p>
+{% call oa.clause("10", "Limited Liability") %}
+The Member is not personally liable for the Company’s debts, obligations or liabilities solely because of being a member or acting as its manager, except as the Act provides. {{ oa.cite("§ 605.0304") }}
+{% endcall %}
 
-<p class="section"><b>11. Distributions.</b> The Member may have the Company distribute available cash to the Member at any time. No distribution may be made if, afterward, the Company could not pay its debts as they come due, or its total assets would be less than its total liabilities.</p>
+{% call oa.clause("11", "Distributions") %}
+The Member may have the Company distribute available cash to the Member at any time. {{ oa.cite("§ 605.0404") }} No distribution may be made if, afterward, the Company could not pay its debts as they come due, or its total assets would be less than its total liabilities. {{ oa.cite("§ 605.0405(1)", "§ 605.0105(4)(a)2") }}
+{% endcall %}
 
-<p class="section"><b>12. Taxes and Fiscal Year.</b> For federal income tax purposes, the Company is treated under the default rules for a single-member limited liability company unless the Member makes a different election. The Member should decide any election with a tax professional. The fiscal year is the calendar year.</p>
+{% call oa.clause("12", "Taxes and Fiscal Year") %}
+For federal income tax purposes, the Company is treated under the default rules for a single-member limited liability company unless the Member makes a different election. {{ oa.cite("26 C.F.R. § 301.7701-3(b)(1)(ii)") }} The Member should decide any election with a tax professional. The fiscal year is the calendar year.
+{% endcall %}
 
-<p class="section"><b>13. Records and Annual Report.</b> The Company keeps, at its principal office or electronically: its Articles of Organization, this Agreement and any amendments, tax returns, financial statements, and a record of contributions and distributions. The Member will make sure the Company files its annual report with the Division of Corporations each year between January 1 and May 1.</p>
+{% call oa.clause("13", "Records and Annual Report") %}
+The Company keeps, at its principal office or electronically, the records the Act requires: a current list of the full name and last known address of each member and any manager; this Agreement and all amendments; the Articles of Organization and every other document filed with the Division of Corporations, with any powers of attorney used to sign them; its federal, state and local income tax returns and reports for the 3 most recent years; its financial statements for the 3 most recent years; and, unless Schedule A states them, a record of each member’s contributions and any agreed future contributions. The Company also keeps a record of distributions. {{ oa.cite("§ 605.0410(1)") }} The Member will make sure the Company files its annual report with the Division of Corporations each year between January 1 and May 1. {{ oa.cite("§ 605.0212") }}
+{% endcall %}
 
-<p class="section"><b>14. Indemnification.</b> To the fullest extent the Act allows, the Company will indemnify and hold harmless the Member, and any Manager, against losses, claims and expenses arising from acting in good faith on the Company's behalf. This does not cover conduct the Act does not permit a company to indemnify.</p>
+{% call oa.clause("14", "Indemnification") %}
+To the fullest extent the Act allows, the Company will indemnify and hold harmless the Member, and any Manager, against losses, claims and expenses arising from acting in good faith on the Company’s behalf. {{ oa.cite("§ 605.0408(2)") }} The Company will not indemnify anyone for conduct involving bad faith, willful or intentional misconduct or a knowing violation of law; a transaction from which that person received an improper personal benefit; an improper distribution; or a breach of the duties of loyalty, care or good faith under the Act. {{ oa.cite("§ 605.0105(3)(p)") }}
+{% endcall %}
 
-<p class="section"><b>15. Transfers and New Members.</b> The Member may transfer all or part of the membership interest. A new member may be admitted only with the Member's written consent and by signing this Agreement, as amended, or a new operating agreement. Admitting a second member should be done with a multi-member operating agreement.</p>
+{% call oa.clause("15", "Transfers and New Members") %}
+The Member may transfer all or part of the membership interest. {{ oa.cite("§ 605.0502") }} A new member may be admitted only with the Member’s written consent and by signing this Agreement, as amended, or a new operating agreement. {{ oa.cite("§ 605.0401(3)", "§ 605.0106(8)") }} If the Member transfers the Member’s entire interest, the transferee becomes the sole member when the transferee signs this Agreement or a new operating agreement, and the transferring Member then ceases to be a member. {{ oa.cite("§ 605.0401(3)(a)") }} Admitting a second member should be done with a multi-member operating agreement.
+{% endcall %}
 
-<p class="section"><b>16. Death or Incapacity.</b> If the Member dies or becomes legally incapacitated, the Member's legal representative or successor{% if successor_name %} ({{ successor_name }}){% else %} (named successor, if any: <span class="blank">&nbsp;</span>){% endif %} may exercise the Member's rights so the Company can continue or be wound up.</p>
+{% call oa.clause("16", "Death or Incapacity") %}
+{% if successor_name %}If the Member dies, {{ successor_name }} becomes the sole member on signing this Agreement or a new operating agreement. {{ oa.cite("§ 605.0401(3)(a)", "§ 605.0602(7)(a)") }} {% endif %}If no successor is named, or the successor does not sign within 60 days, the Member’s legal representative may exercise all of the Member’s rights to settle the estate, including admitting a new member, so that the Company does not dissolve for having no member. {{ oa.cite("§ 605.0504", "§ 605.0701(3)") }} If a guardian is appointed for the Member or a court finds the Member incapacitated, the Member’s legal representative may exercise the Member’s rights, including admitting a new member within 60 days. {{ oa.cite("§ 605.0504", "§ 605.0602(7)(b)") }}
+{% endcall %}
 
-<p class="section"><b>17. Dissolution.</b> The Company dissolves when the Member decides in writing, or when the Act requires. On dissolution the Company pays or provides for its debts, distributes any remaining assets to the Member, and files articles of dissolution with the Division of Corporations.</p>
+{% call oa.clause("17", "Dissolution") %}
+The Company dissolves when the Member decides in writing, or when the Act requires. {{ oa.cite("§ 605.0701") }} On dissolution the Company pays or provides for its debts, distributes any remaining assets to the Member, {{ oa.cite("§ 605.0710") }} and files articles of dissolution with the Division of Corporations. {{ oa.cite("§ 605.0707") }}
+{% endcall %}
 
-<p class="section"><b>18. Amendments.</b> This Agreement may be changed only in a writing signed by the Member.</p>
+{% call oa.clause("18", "Amendments") %}
+This Agreement may be changed only in a writing signed by the Member. {{ oa.cite("§ 605.0105(1)") }}
+{% endcall %}
 
-<p class="section"><b>19. General.</b> This Agreement is the entire agreement about the Company's affairs and replaces any earlier understanding. Florida law governs it. If any part is found unenforceable, the rest remains in effect.</p>
+{% call oa.clause("19", "General") %}
+This Agreement is the entire agreement about the Company’s affairs and replaces any earlier understanding. Florida law governs it. {{ oa.cite("§ 605.0104") }} If any part is found unenforceable, the rest remains in effect.
+{% endcall %}
 
-<h2 class="block-heading">Signature</h2>
-
-<table class="sig">
-  <tr>
-    <td class="sig-name"><div class="rule"></div><p class="signature-caption">MEMBER: {{ member.name }}</p></td>
-    <td class="sig-date"><div class="rule"></div><p class="signature-caption">Date</p></td>
-  </tr>
-  <tr>
-    <td class="sig-name"><div class="rule"></div><p class="signature-caption">{{ llc_name }}, by: {{ member.name }}, Member</p></td>
-    <td class="sig-date"><div class="rule"></div><p class="signature-caption">Date</p></td>
-  </tr>
-</table>
-
-<h2 class="block-heading">Schedule A — Member</h2>
-<table class="schedule">
-  <thead>
-    <tr><th>Member</th><th>Address</th><th>Initial contribution</th><th>Ownership</th></tr>
-  </thead>
-  <tbody>
+<section class="sign-block">
+  <h2 class="part-heading">Signature</h2>
+  <table class="sig">
+    <tr><td class="who role" colspan="2">Member</td></tr>
     <tr>
-      <td>{{ member.name }}</td>
-      <td>{{ member.address }}</td>
-      <td>{% if member.contribution %}{{ member.contribution }}{% else %}<span class="blank">&nbsp;</span>{% endif %}</td>
-      <td>100%</td>
+      <td class="who"><div class="line"></div></td>
+      <td class="when"><div class="line"></div></td>
     </tr>
-  </tbody>
-</table>
+    <tr>
+      <td class="who caption"><span class="name">{{ member.name }}</span></td>
+      <td class="when caption">Date</td>
+    </tr>
+    <tr><td class="who role" colspan="2">Company</td></tr>
+    <tr><td class="who entity" colspan="2">{{ llc_name }}</td></tr>
+    <tr>
+      <td class="who"><div class="line with-by"><span class="by">By:</span></div></td>
+      <td class="when"></td>
+    </tr>
+    <tr>
+      <td class="who caption" colspan="2"><span class="name">{{ member.name }}</span>, Member {{ oa.cite("§ 605.0106(1)") }}</td>
+    </tr>
+  </table>
+  <p class="e-sign">Electronic signatures are valid. {{ oa.cite("§ 668.50(7), Fla. Stat.") }}</p>
+</section>
 
-<p class="footnote">Prepared from the information you provided at filing. This document is not legal or tax advice.</p>
+<section class="schedule-page">
+  <h2 class="part-heading">Schedule A — Member {{ oa.cite("§ 605.0410(1)(a), (f)") }}</h2>
+  <table class="schedule">
+    <thead>
+      <tr><th>Member</th><th>Address</th><th>Initial Contribution</th><th>Ownership</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>{{ member.name }}</td>
+        <td>{{ member.address }}</td>
+        <td>{% if member.contribution %}{{ member.contribution }}{% else %}<span class="blank">&nbsp;</span>{% endif %}</td>
+        <td class="num">100%</td>
+      </tr>
+      {% if management == "manager" %}
+      {% for mgr in managers %}
+      <tr class="manager">
+        <td>Manager: {{ mgr.name }}</td>
+        <td>{{ mgr.address }}</td>
+        <td>—</td>
+        <td class="num">—</td>
+      </tr>
+      {% endfor %}
+      {% endif %}
+    </tbody>
+  </table>
+  <p class="disclaimer">Prepared from the information you provided at filing. This document is not legal or tax advice.</p>
+</section>
 
 </body>
 </html>

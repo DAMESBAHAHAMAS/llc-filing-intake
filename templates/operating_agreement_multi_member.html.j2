@@ -3,115 +3,180 @@
 <head>
 <meta charset="UTF-8">
 <title>Operating Agreement — {{ llc_name }}</title>
-{% include "partials/document_styles.html.j2" %}
+{% include "partials/agreement_styles.html.j2" %}
 </head>
 <body>
+{% import "partials/agreement_macros.html.j2" as oa %}
 {#
-  Wording source: "Operating Agreement Templates for Review" doc, rev 6
-  (multi-member section). Sections 1-4, 9, 10 and 19 are the
-  single-member wording with "the Members" in place of "the Member", as
-  that doc instructs. Sections 13 and 14 are written out in full here
-  because the doc refers back to the single-member version, which a
-  customer will not have. Those written-out sections are listed in the
-  doc for review. Do not edit wording here without the same change
-  being approved there.
+  Wording source: "Operating Agreement Templates for Review" doc, tab
+  "Templates With Citations" rev 6 (multi-member), approved by Damian
+  2026-10-10. Fixed wording and citations are kept exactly as approved;
+  only the [[FIELD]] slots are filled, and the "[Use when ...]"
+  instructions in that tab are the conditions below. Do not edit the
+  wording here without the same change being approved in that tab.
 #}
 
 {% if draft %}
-<div class="draft-banner">Draft wording, not yet approved. Not for customer delivery.</div>
+<div class="draft-banner">Review copy. Not for customer delivery.</div>
 {% endif %}
 
-<header class="doc-header">
-  <img class="seal" src="./assets/florida_seal.png" alt="">
-  <h1>Operating Agreement of {{ llc_name }}</h1>
-  <p class="subheading">A Florida Limited Liability Company — Multiple Members</p>
+<header class="title-block">
+  <p class="kicker">A Florida Limited Liability Company — Multiple Members</p>
+  <h1>Operating Agreement of</h1>
+  <span class="company">{{ llc_name }}</span>
 </header>
 
-<div class="filing-facts">
-  <div><p class="label">Document number</p><p class="value">{{ document_number }}</p></div>
-  <div><p class="label">Filed</p><p class="value">{{ filing_date }}</p></div>
-  <div><p class="label">Effective</p><p class="value">{{ effective_date }}</p></div>
-</div>
-
-<p class="section">This Operating Agreement (the "Agreement") is made effective {{ effective_date }} by the persons listed in Schedule A (each a "Member" and together the "Members").</p>
-
-<p class="section"><b>1. Formation.</b> The Company was formed as a Florida limited liability company by filing Articles of Organization with the Florida Department of State, Division of Corporations, on {{ filing_date }}, Document Number {{ document_number }}. This Agreement and the Florida Revised Limited Liability Company Act, Chapter 605, Florida Statutes (the "Act"), govern the Company. Where this Agreement is silent, the Act applies.</p>
-
-<p class="section"><b>2. Name and Addresses.</b> The Company's name is {{ llc_name }} (the "Company"). Its principal office is {{ principal_address }}, and its mailing address is {{ mailing_address }}. The Members may change either address and will update the Company's state records when doing so.</p>
-
-<p class="section"><b>3. Registered Agent.</b> The Company's registered agent is {{ registered_agent_name }}, at {{ registered_agent_florida_address }}, as stated in the Articles of Organization.</p>
-
-<p class="section"><b>4. Purpose.</b> The Company may carry on any lawful business permitted under the Act.</p>
-
-<p class="section"><b>5. Term.</b> The Company continues until it is dissolved under Section 18.</p>
-
-<p class="section"><b>6. Members and Ownership.</b> Each Member's name, address, contribution and ownership percentage ("Percentage") are listed in Schedule A. The Percentages total 100%. A "Majority in Interest" means Members holding more than 50% of all Percentages.</p>
-
-<p class="section"><b>7. Capital Contributions.</b> Each Member's initial contribution is listed in Schedule A. No Member must contribute more unless all Members agree in writing. No Member earns interest on a contribution or may withdraw it except as this Agreement provides.</p>
-
-{% if management == "manager" %}
-<p class="section"><b>8. Management.</b> The Company is managed by {{ manager_names }} (each a "Manager"), who handle its day-to-day business. A Majority in Interest may remove or replace a Manager by written notice.</p>
-{% else %}
-<p class="section"><b>8. Management.</b> The Members manage the Company. Ordinary business decisions are made by a Majority in Interest. Any Member may sign routine documents to carry out decisions already made.</p>
-{% endif %}
-
-<p class="section"><b>9. Keeping the Company Separate.</b> The Members will keep the Company's money, accounts and records separate from the Members' personal affairs; sign Company documents in the Company's name; and hold Company property in the Company's name.</p>
-
-<p class="section"><b>9A. Decisions That Need Every Member.</b> The Company may not do any of the following without the written consent of all Members: amend this Agreement or the Articles; admit a new Member; sell, lease or transfer all or substantially all of its assets; merge, convert or reorganize; borrow or guarantee more than {{ borrowing_limit }} in a single transaction; change how the Company is taxed; or dissolve, except under Section 18.</p>
-
-<p class="section"><b>9B. How Members Decide.</b> Members may decide at a meeting, by video or phone, or by written consent, including by email or electronic signature, without a meeting. Any Member may call a meeting with at least five days' notice.</p>
-
-<p class="section"><b>10. Limited Liability.</b> The Members are not personally liable for the Company's debts, obligations or liabilities solely because of being members or acting as its manager, except as the Act provides.</p>
-
-<p class="section"><b>11. Profits, Losses and Distributions.</b> Profits and losses are shared in proportion to Percentages. Distributions are made to all Members at the same time, in proportion to Percentages, when a Majority in Interest decides. No distribution may be made if, afterward, the Company could not pay its debts as they come due, or its total assets would be less than its total liabilities.</p>
-
-<p class="section"><b>12. Taxes and Fiscal Year.</b> For federal income tax purposes, the Company is treated under the default rules for a limited liability company with more than one member unless the Members make a different election under Section 9A. {{ partnership_representative }} acts as the Company's representative with the tax authorities. The Members should decide any election with a tax professional. The fiscal year is the calendar year.</p>
-
-<p class="section"><b>13. Records and Annual Report.</b> The Company keeps, at its principal office or electronically: its Articles of Organization, this Agreement and any amendments, tax returns, financial statements, a record of contributions and distributions, and Schedule A as updated. Every Member may inspect and copy them on reasonable notice. A Majority in Interest names who files the Company's annual report each year between January 1 and May 1.</p>
-
-<p class="section"><b>14. Indemnification.</b> To the fullest extent the Act allows, the Company will indemnify and hold harmless each Member, and any Manager, against losses, claims and expenses arising from acting in good faith on the Company's behalf. This does not cover conduct the Act does not permit a company to indemnify.</p>
-
-<p class="section"><b>15. Transfers.</b> A Member may not sell, give or pledge any part of their interest without first offering it, in writing and on the same terms, to the other Members in proportion to their Percentages. The other Members have 30 days to accept. If they decline, the transfer may proceed within 60 days on the same terms, and the buyer becomes a Member only with the written consent of all other Members. A transferee who is not admitted receives only the transferring Member's share of distributions.</p>
-
-<p class="section"><b>16. Death, Incapacity or Withdrawal.</b> If a Member dies, becomes legally incapacitated or withdraws with the consent of the other Members, the Company or the remaining Members may buy that Member's interest at fair value. Fair value is the amount the parties agree, or if they cannot agree within 60 days, the amount set by an independent appraiser they choose together. The purchase price may be paid over up to {{ payment_period_months }} months. A Member may not withdraw without the consent of a Majority in Interest of the other Members.</p>
-
-<p class="section"><b>17. Disagreements.</b> If the Members cannot agree on a matter that needs their decision, they will first try in good faith to resolve it together, then through mediation in Florida, before any lawsuit.</p>
-
-<p class="section"><b>18. Dissolution.</b> The Company dissolves when all Members decide in writing, or when the Act requires. On dissolution the Company pays or provides for its debts, then distributes remaining assets to the Members in proportion to their Percentages, and files articles of dissolution with the Division of Corporations.</p>
-
-<p class="section"><b>19. General.</b> This Agreement is the entire agreement about the Company's affairs and replaces any earlier understanding. Florida law governs it. If any part is found unenforceable, the rest remains in effect.</p>
-
-<p class="section"><b>19A. Amendments.</b> This Agreement may be changed only in a writing signed by all Members.</p>
-
-<h2 class="block-heading">Signatures</h2>
-
-<table class="sig">
-  {% for m in members %}
+<table class="facts">
   <tr>
-    <td class="sig-name"><div class="rule"></div><p class="signature-caption">MEMBER: {{ m.name }}</p></td>
-    <td class="sig-date"><div class="rule"></div><p class="signature-caption">Date</p></td>
+    <td><span class="label">Document Number</span><span class="value">{{ document_number }}</span></td>
+    <td><span class="label">Filed</span><span class="value">{{ filing_date }}</span></td>
+    <td><span class="label">Effective</span><span class="value">{{ effective_date }}</span></td>
   </tr>
-  {% endfor %}
 </table>
 
-<h2 class="block-heading">Schedule A — Members</h2>
-<table class="schedule">
-  <thead>
-    <tr><th>Member</th><th>Address</th><th>Initial contribution</th><th>Percentage</th></tr>
-  </thead>
-  <tbody>
+<p class="cite-note">Statute references in brackets are to the Florida Revised Limited Liability Company Act, Chapter 605, Florida Statutes (2026), unless another source is named.</p>
+
+<p class="preamble">This Operating Agreement (the “Agreement”) is made effective {{ effective_date }} by the persons listed in Schedule A (each a “Member” and together the “Members”). {{ oa.cite("§ 605.0102(45)", "§ 605.0106(2)") }}</p>
+
+{% call oa.clause("1", "Formation") %}
+The Company was formed as a Florida limited liability company by filing Articles of Organization with the Florida Department of State, Division of Corporations, on {{ filing_date }}, Document Number {{ document_number }}. This Agreement and the Florida Revised Limited Liability Company Act, Chapter 605, Florida Statutes (the “Act”), govern the Company. Where this Agreement is silent, the Act applies. {{ oa.cite("§ 605.0105(1)–(2)", "§ 605.0104(1)") }}
+{% endcall %}
+
+{% call oa.clause("2", "Name and Addresses") %}
+The Company’s name is {{ llc_name }} (the “Company”). {{ oa.cite("§ 605.0112(1)") }} Its principal office is {{ principal_address }}, and its mailing address is {{ mailing_address }}. The Members may change either address and will update the Company’s state records when doing so. {{ oa.cite("§ 605.0212") }}
+{% endcall %}
+
+{% call oa.clause("3", "Registered Agent") %}
+The Company’s registered agent is {{ registered_agent_name }}, at {{ registered_agent_florida_address }}, as stated in the Articles of Organization. {{ oa.cite("§ 605.0113(1)") }}
+{% endcall %}
+
+{% call oa.clause("4", "Purpose") %}
+The Company may carry on any lawful business permitted under the Act. {{ oa.cite("§ 605.0108") }}
+{% endcall %}
+
+{% call oa.clause("5", "Term") %}
+The Company continues until it is dissolved under Section 18. {{ oa.cite("§ 605.0108", "§ 605.0701") }}
+{% endcall %}
+
+{% call oa.clause("6", "Members and Ownership") %}
+Each Member’s name, address, contribution and ownership percentage (“Percentage”) are listed in Schedule A. The Percentages total 100%. A “Majority in Interest” means Members holding more than 50% of all Percentages. {{ oa.cite("§ 605.0102(37)") }}
+{% endcall %}
+
+{% call oa.clause("7", "Capital Contributions") %}
+Each Member’s initial contribution is listed in Schedule A. No Member must contribute more unless every Member agrees in a writing that Member signs. {{ oa.cite("§ 605.0403(1)") }} No Member earns interest on a contribution or may withdraw it except as this Agreement provides. {{ oa.cite("§ 605.0404") }}
+{% endcall %}
+
+{% call oa.clause("8", "Management") %}
+{% if management == "manager" %}
+The Company is managed by {{ manager_names }} (each a “Manager”), who handle its day-to-day business. {{ oa.cite("§ 605.0407", "§ 605.04073(2)(b)") }} A Majority in Interest may remove or replace a Manager by written notice. {{ oa.cite("§ 605.0105(1)") }}
+{% else %}
+The Members manage the Company. Ordinary business decisions are made by a Majority in Interest. {{ oa.cite("§ 605.04073(1)(c)") }} Any Member may sign routine documents to carry out decisions already made. {{ oa.cite("§ 605.04074(1)(a)") }}
+{% endif %}
+{% endcall %}
+
+{% call oa.clause("9", "Keeping the Company Separate") %}
+The Members will keep the Company’s money, accounts and records separate from the Members’ personal affairs; sign Company documents in the Company’s name; and hold Company property in the Company’s name. {{ oa.cite("§ 605.0108", "§ 605.0105(1)") }}
+{% endcall %}
+
+{% call oa.clause("9A", "Decisions That Need Every Member") %}
+The Company may not do any of the following without the written consent of all Members: amend this Agreement or the Articles; admit a new Member; sell, lease or transfer all or substantially all of its assets; merge, convert or reorganize; borrow or guarantee more than {{ borrowing_limit }} in a single transaction; change how the Company is taxed; or dissolve, except under Section 18. {{ oa.cite("§ 605.04073(1)(d)", "§ 605.0401(3)(c)", "§ 605.0701(2)", "§ 605.0105(1), (3)(m)") }}
+{% endcall %}
+
+{% call oa.clause("9B", "How Members Decide") %}
+Members may decide at a meeting, by video or phone, or by written consent, including by email or electronic signature, without a meeting. {{ oa.cite("§ 605.04073(4), (6)", "§ 668.50(7), Fla. Stat.") }} Any Member may call a meeting with at least five days’ notice. If Members act by written consent without every Member signing, the Company will notify each Member who did not consent within 10 days after the action. {{ oa.cite("§ 605.04073(4)") }}
+{% endcall %}
+
+{% call oa.clause("10", "Limited Liability") %}
+The Members are not personally liable for the Company’s debts, obligations or liabilities solely because of being members or acting as its manager, except as the Act provides. {{ oa.cite("§ 605.0304") }}
+{% endcall %}
+
+{% call oa.clause("11", "Profits, Losses and Distributions") %}
+Profits and losses are shared in proportion to Percentages. Distributions are made to all Members at the same time, in proportion to Percentages, when a Majority in Interest decides. {{ oa.cite("§ 605.0404", "§ 605.0105(1)") }} No distribution may be made if, afterward, the Company could not pay its debts as they come due, or its total assets would be less than its total liabilities. {{ oa.cite("§ 605.0405(1)", "§ 605.0105(4)(a)2") }}
+{% endcall %}
+
+{% call oa.clause("12", "Taxes and Fiscal Year") %}
+For federal income tax purposes, the Company is treated under the default rules for a limited liability company with more than one member unless the Members make a different election under Section 9A. {{ oa.cite("26 C.F.R. § 301.7701-3(b)(1)(i)") }} {{ partnership_representative }} acts as the Company’s partnership representative under the Internal Revenue Code, if that person meets the IRS requirements at the time, including a U.S. taxpayer identification number, a U.S. street address and phone number, and availability to meet the IRS in the United States. The Members confirm or change the representative on the Company’s tax return each year. {{ oa.cite("26 C.F.R. § 301.6223-1") }} The Members should decide any election with a tax professional. The fiscal year is the calendar year.
+{% endcall %}
+
+{% call oa.clause("13", "Records and Annual Report") %}
+The Company keeps, at its principal office or electronically, the records the Act requires: a current list of the full name and last known address of each member and any manager; this Agreement and all amendments; the Articles of Organization and every other document filed with the Division of Corporations, with any powers of attorney used to sign them; its federal, state and local income tax returns and reports for the 3 most recent years; its financial statements for the 3 most recent years; and, unless Schedule A states them, a record of each member’s contributions and any agreed future contributions. The Company also keeps a record of distributions and Schedule A as updated. {{ oa.cite("§ 605.0410(1)") }} Every Member may inspect and copy them on reasonable notice. {{ oa.cite("§ 605.0410(2)–(3)", "§ 605.0105(3)(h)") }} A Majority in Interest names who files the Company’s annual report each year between January 1 and May 1. {{ oa.cite("§ 605.0212") }}
+{% endcall %}
+
+{% call oa.clause("14", "Indemnification") %}
+To the fullest extent the Act allows, the Company will indemnify and hold harmless each Member, and any Manager, against losses, claims and expenses arising from acting in good faith on the Company’s behalf. {{ oa.cite("§ 605.0408(2)") }} The Company will not indemnify anyone for conduct involving bad faith, willful or intentional misconduct or a knowing violation of law; a transaction from which that person received an improper personal benefit; an improper distribution; or a breach of the duties of loyalty, care or good faith under the Act. {{ oa.cite("§ 605.0105(3)(p)") }}
+{% endcall %}
+
+{% call oa.clause("15", "Transfers") %}
+A Member may not sell or give any part of their interest without first offering it, in writing and on the same terms, to the other Members in proportion to their Percentages. The other Members have 30 days to accept. If they decline, the transfer may proceed within 60 days on the same terms, and the buyer becomes a Member only with the written consent of all other Members. {{ oa.cite("§ 605.0502", "§ 605.0401(3)(c)") }} A transferee who is not admitted receives only the transferring Member’s share of distributions. {{ oa.cite("§ 605.0502") }} A Member may not pledge any part of their interest without the written consent of a Majority in Interest of the other Members. {{ oa.cite("§ 605.0502") }}
+{% endcall %}
+
+{% call oa.clause("16", "Death, Incapacity or Withdrawal") %}
+If a Member dies, becomes legally incapacitated or withdraws with the consent of the other Members, the Company or the remaining Members may buy that Member’s interest at fair value. {{ oa.cite("§ 605.0602", "§ 605.0504") }} Fair value is the amount the parties agree, or if they cannot agree within 60 days, the amount set by an independent appraiser they choose together. The purchase price may be paid over up to {{ payment_period_months }} months. A Member who withdraws without the consent of a Majority in Interest of the other Members breaches this Agreement and is liable to the Company and the other Members for any damages the withdrawal causes. {{ oa.cite("§ 605.0601") }}
+{% endcall %}
+
+{% call oa.clause("17", "Disagreements") %}
+If the Members cannot agree on a matter that needs their decision, they will first try in good faith to resolve it together, then through mediation in Florida, before any lawsuit. Either step may be skipped when a Member needs urgent court relief to prevent immediate harm. {{ oa.cite("§ 605.0105(3)(i), (k)") }}
+{% endcall %}
+
+{% call oa.clause("18", "Dissolution") %}
+The Company dissolves when all Members decide in writing, or when the Act requires. {{ oa.cite("§ 605.0701") }} On dissolution the Company pays or provides for its debts, then distributes remaining assets to the Members in proportion to their Percentages, {{ oa.cite("§ 605.0710", "§ 605.0105(1)") }} and files articles of dissolution with the Division of Corporations. {{ oa.cite("§ 605.0707") }}
+{% endcall %}
+
+{% call oa.clause("19", "General") %}
+This Agreement is the entire agreement about the Company’s affairs and replaces any earlier understanding. Florida law governs it. {{ oa.cite("§ 605.0104") }} If any part is found unenforceable, the rest remains in effect.
+{% endcall %}
+
+{% call oa.clause("19A", "Amendments") %}
+This Agreement may be changed only in a writing signed by all Members. {{ oa.cite("§ 605.04073(1)(d)") }}
+{% endcall %}
+
+<section class="sign-block">
+  <h2 class="part-heading">Signatures</h2>
+  <table class="sig">
     {% for m in members %}
+    <tr><td class="who role" colspan="2">Member</td></tr>
     <tr>
-      <td>{{ m.name }}</td>
-      <td>{{ m.address }}</td>
-      <td>{% if m.contribution %}{{ m.contribution }}{% else %}<span class="blank">&nbsp;</span>{% endif %}</td>
-      <td>{{ m.percentage }}</td>
+      <td class="who"><div class="line"></div></td>
+      <td class="when"><div class="line"></div></td>
+    </tr>
+    <tr>
+      <td class="who caption"><span class="name">{{ m.name }}</span></td>
+      <td class="when caption">Date</td>
     </tr>
     {% endfor %}
-  </tbody>
-</table>
+  </table>
+  <p class="e-sign">Electronic signatures are valid. {{ oa.cite("§ 605.0106(2)", "§ 668.50(7), Fla. Stat.") }}</p>
+</section>
 
-<p class="footnote">Prepared from the information you provided at filing. This document is not legal or tax advice.</p>
+<section class="schedule-page">
+  <h2 class="part-heading">Schedule A — Members {{ oa.cite("§ 605.0410(1)(a), (f)") }}</h2>
+  <table class="schedule">
+    <thead>
+      <tr><th>Member</th><th>Address</th><th>Initial Contribution</th><th>Percentage</th></tr>
+    </thead>
+    <tbody>
+      {% for m in members %}
+      <tr>
+        <td>{{ m.name }}</td>
+        <td>{{ m.address }}</td>
+        <td>{% if m.contribution %}{{ m.contribution }}{% else %}<span class="blank">&nbsp;</span>{% endif %}</td>
+        <td class="num">{{ m.percentage }}</td>
+      </tr>
+      {% endfor %}
+      {% if management == "manager" %}
+      {% for mgr in managers %}
+      <tr class="manager">
+        <td>Manager: {{ mgr.name }}</td>
+        <td>{{ mgr.address }}</td>
+        <td>—</td>
+        <td class="num">—</td>
+      </tr>
+      {% endfor %}
+      {% endif %}
+    </tbody>
+  </table>
+  <p class="disclaimer">Prepared from the information you provided at filing. This document is not legal or tax advice.</p>
+</section>
 
 </body>
 </html>
