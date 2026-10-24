@@ -5,6 +5,7 @@ import { describeError } from "../db/describeError.js";
 import { resolveActiveOffers } from "../offers/catalog.js";
 import { createCheckoutSession, StripeApiError } from "../stripe/restClient.js";
 import { getEinExpressAvailability } from "../ein/capacity.js";
+import { houseAgentLineMissing } from "../offers/houseAgentRule.js";
 import { holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 
 export const checkoutRouter = Router();
@@ -79,8 +80,8 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
   }
 
   try {
-    const session = await pool.query<{ email: string | null; crm_deal_id: string | null }>(
-      "SELECT email, crm_deal_id FROM filing_sessions WHERE filing_session_id = $1",
+    const session = await pool.query<{ email: string | null; crm_deal_id: string | null; filing_data: { registered_agent_path?: string } | null }>(
+      "SELECT email, crm_deal_id, filing_data FROM filing_sessions WHERE filing_session_id = $1",
       [filingSessionId]
     );
     if (session.rowCount === 0) {
@@ -89,6 +90,25 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
     }
 
     const uniqueCodes = [...new Set(requestedItems.map((i) => i.offer_code))];
+
+    // Registered-agent billing rule: choosing Damian as agent means the
+    // 3-year agent service must be on the order (routes/../houseAgentRule.ts).
+    if (session.rows[0].filing_data?.registered_agent_path === "house") {
+      const paidAgent = await pool.query(
+        `SELECT 1 FROM orders
+          WHERE filing_session_id = $1 AND payment_status IN ('paid', 'authorized')
+            AND line_items @> '[{"offer_code":"REGISTERED_AGENT_3YR"}]'::jsonb
+          LIMIT 1`,
+        [filingSessionId]
+      );
+      if (houseAgentLineMissing("house", uniqueCodes, (paidAgent.rowCount ?? 0) > 0)) {
+        res.status(422).json({
+          error: "registered agent service is required when Damian Knowles is the registered agent",
+          required_offer_code: "REGISTERED_AGENT_3YR",
+        });
+        return;
+      }
+    }
     const resolved = await resolveActiveOffers(pool, uniqueCodes);
     const resolvedByCode = new Map(resolved.map((o) => [o.offer_code, o]));
 
