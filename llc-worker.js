@@ -29,7 +29,7 @@
  * POST /lead            → Name check lead capture → Zoho CRM
  * POST /contact         → Contact page form → Zoho CRM Lead
  * POST /guide-lead      → Formation Guide lead → Zoho CRM
- * POST /intake          → LLC intake form → Zoho CRM Contact + Deal
+ * POST /intake          → LLC intake form → Zoho CRM Contact (Deal is created only after verified payment)
  *
  * CRON
  * Every 10 minutes       → keepRenderWarm() — Render keep-alive
@@ -417,7 +417,10 @@ async function handleGuideLead(request, env) {
 
 /* ══════════════════════════════════════════════════════════
    ROUTE: POST /intake
-   LLC Intake Form → Zoho CRM Contact + Deal
+   LLC Intake Form → Zoho CRM Contact (no Deal — see below)
+
+   UPDATED 2026-10-23: intake no longer creates a Deal. Deals are
+   created only after verified Stripe payment (data spine webhook).
 
    UPDATED 2026-07-01:
    - Branches on body.lead_type so partial captures and
@@ -520,7 +523,9 @@ async function handleIntake(request, env) {
 
     /* ── Step 1: Create Contact in Zoho CRM ── */
     const contactRes = await fetch(
-      "https://www.zohoapis.com/crm/v2/Contacts",
+      body.email
+        ? "https://www.zohoapis.com/crm/v2/Contacts/upsert"
+        : "https://www.zohoapis.com/crm/v2/Contacts",
       {
         method: "POST",
         headers: {
@@ -528,6 +533,7 @@ async function handleIntake(request, env) {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
+          ...(body.email ? { duplicate_check_fields: ["Email"] } : {}),
           data: [
             {
               /* Personal fields — safe for missing values */
@@ -569,58 +575,16 @@ async function handleIntake(request, env) {
     const contactData = await contactRes.json();
     const contactId = contactData.data?.[0]?.details?.id || null;
 
-    /* ── Step 2: Create Deal linked to Contact ── */
-    const packageLabels = {
-      basic: "Basic — Florida LLC Filing ($125)",
-      standard: "Standard — LLC Filing + EIN + Operating Agreement ($349)",
-      concierge: "Concierge — Full-Service Formation with Dedicated Support ($1,999)",
-    };
-
-    const packageAmounts = {
-      basic: 125,
-      standard: 349,
-      concierge: 1999,
-    };
-
+    /* ── No Deal here (frozen architecture rule) ──
+       A Zoho CRM Deal is created only after a verified Stripe payment
+       (webhook -> data spine order_deal sync job), one per paid session.
+       Intake completion only creates/updates the Contact. */
     const pkg = body.package || "standard";
-
-    const dealBody = {
-      Deal_Name: `${body.llc_name} — ${packageLabels[pkg] || pkg}`,
-      Stage: "Intake Received",
-      Amount: packageAmounts[pkg] || 0,
-      Lead_Source: "LLC Intake Form",
-      Account_Name: { name: body.llc_name.trim() },
-      Description: summary,
-      Closing_Date: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
-        .toISOString()
-        .split("T")[0],
-    };
-
-    if (contactId) {
-      dealBody.Contact_Name = { id: contactId };
-    }
-
-    dealBody.Manual_Review_Required = Boolean(body.manual_review_required);
-
-    const dealRes = await fetch(
-      "https://www.zohoapis.com/crm/v2/Deals",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Zoho-oauthtoken ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ data: [dealBody] }),
-      }
-    );
-
-    const dealData = await dealRes.json();
-    const dealId = dealData.data?.[0]?.details?.id || null;
 
     return json({
       success: true,
       contact_id: contactId,
-      deal_id: dealId,
+      deal_id: null,
       llc_name: body.llc_name,
       package: pkg,
     });
