@@ -21,6 +21,13 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * post-payment fulfillment worker (buildPdfContext is the single shared
  * validator for both paths).
  *
+ * 2026-10-23: the PDF bytes are NEVER returned from this route. The
+ * customer receives the Articles PDF only after payment (Payment ->
+ * Webhook -> PDF -> Storage -> Customer Link). This route now only
+ * generates and stores the document server-side and answers with
+ * { status, byte_size, sha256 }. The post-payment customer link is not
+ * built yet (see the fulfillment worker, which stores the paid copy).
+ *
  * Idempotent per session: a pre-payment document already on record
  * (filing_documents.order_id IS NULL) is returned as-is rather than
  * regenerated — a retry or duplicate click does not re-call the external
@@ -35,14 +42,12 @@ filingDocumentRouter.post("/api/filing-session/:filingSessionId/pdf", async (req
   }
 
   try {
-    const existing = await pool.query<{ pdf_bytes: Buffer }>(
-      `SELECT pdf_bytes FROM filing_documents WHERE filing_session_id = $1 AND order_id IS NULL`,
+    const existing = await pool.query<{ byte_size: number; sha256: string }>(
+      `SELECT byte_size, sha256 FROM filing_documents WHERE filing_session_id = $1 AND order_id IS NULL`,
       [filingSessionId]
     );
     if (existing.rowCount) {
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", `inline; filename="articles-of-organization-${filingSessionId}.pdf"`);
-      res.status(200).send(existing.rows[0].pdf_bytes);
+      res.status(200).json({ status: "already_generated", byte_size: existing.rows[0].byte_size, sha256: existing.rows[0].sha256 });
       return;
     }
 
@@ -80,9 +85,7 @@ filingDocumentRouter.post("/api/filing-session/:filingSessionId/pdf", async (req
       [filingSessionId, pdfResult.pdfBytes.length, pdfResult.sha256, pdfResult.pdfBytes]
     );
 
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `inline; filename="articles-of-organization-${filingSessionId}.pdf"`);
-    res.status(200).send(pdfResult.pdfBytes);
+    res.status(200).json({ status: "generated", byte_size: pdfResult.pdfBytes.length, sha256: pdfResult.sha256 });
   } catch (err) {
     res.status(500).json({ error: "pdf generation failed", detail: describeError(err) });
   }
