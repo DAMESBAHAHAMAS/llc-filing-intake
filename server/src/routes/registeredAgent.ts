@@ -101,7 +101,15 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
       // HOUSE_REGISTERED_AGENT server-side regardless of filing_data, so
       // there's nothing to validate — this just records the choice and
       // marks the (non-existent, no-email) acceptance as satisfied.
-      await mergeIntoFilingData(filingSessionId, { registered_agent_path: "house" });
+      // undefined values are dropped when filing_data is serialised, so
+      // switching back from "own" to Damian removes every stored own-agent
+      // field instead of leaving stale data for the PDF or CRM.
+      await mergeIntoFilingData(filingSessionId, {
+        registered_agent_path: "house",
+        registered_agent_name: undefined,
+        registered_agent_florida_address: undefined,
+        registered_agent_email: undefined,
+      });
       await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'accepted' WHERE filing_session_id = $1`, [
         filingSessionId,
       ]);
