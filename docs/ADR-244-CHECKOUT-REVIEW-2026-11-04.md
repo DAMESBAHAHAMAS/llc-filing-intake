@@ -32,7 +32,7 @@
 | **What the record says** | The PDF route stores rather than returns a document, and its comments imply a customer link after payment. Under pay-after-acceptance, the customer needs evidence before final capture, and the stated link is not built. |
 | **Confirmed in the code** | Yes. `POST /api/orders/:orderId/proof-of-filing` recorded the proof and captured in one request. Nothing told the customer, so the code broke Damian's 29 Sep rule: funds are collected only after proof of filing is delivered. |
 | **Effect** | Functional. A customer could be charged with no proof sent to them. |
-| **Fix** | The route now emails the Sunbiz document number first, and collects only after Resend accepts it. If that fails, nothing is collected, the route answers 502, an ops alert goes out, and the reason is stored. A repeat call retries and does not send twice. The gate covers the hold capture and the saved-card charge. Adds migration 0020. |
+| **Fix** | The route now emails the Sunbiz document number first, and collects only after Resend accepts it. If that fails, nothing is collected, the route answers 502, an ops alert goes out, and the reason is stored. A repeat call retries and does not send twice. The gate covers the hold capture and the saved-card charge. Adds migration 0021 (numbered 0020 when this review ran). |
 | **Not built** | A customer link to the Articles PDF. Its storage and serving target is the open boundary 1 in `DECISIONS.md` (2026-09-09), so the comment now says so instead of implying a link. The proof sent is the Sunbiz document number, which is how the 2026-09-30 decision defines proof. |
 
 **Please check this reading.** The record's wording is "customer-facing acceptance evidence", and the document number by email meets that. If the filed PDF is required as well, boundary 1 must be decided first.
@@ -89,7 +89,7 @@ The record found no conflict in `436d0bc` or `616468c`, but asked for acceptance
 | An EIN-only order, 3D Secure, a declined or failed saved card | Covered in part by unit tests, not run on Stripe here. |
 | Cash App Pay and Klarna | Both appear on the Checkout page. Their hold behaviour is untested. |
 | The website pages | The API was driven by script, so the customer's browser journey on the site was not run. |
-| The deployed Worker and live database | Out of bounds for this test. Migration 0020 has not been run on the live database. |
+| The deployed Worker and live database | Out of bounds for this test. Migration 0021 has not been run on the live database. |
 | Concurrency | PGlite serialises connections. |
 
 ### Side effect to note
@@ -111,10 +111,10 @@ Found during this review and **not changed here**: they are outside the two name
 ## Before this can merge
 
 1. **Merge order with draft PR #7** (`claude/customer-order-emails`). Both change `routes/orders.ts`, and both send a filing email, so merging both unchanged sends the customer two. PR #7's is queued and does not gate collection. The rebase should keep this gate and drop PR #7's `filing_confirmation` send, or make this gate wait on it. The wording here matches PR #7's so that either can stand. `claude/charge-ein-when-issued` touches the same files.
-2. **Apply migration 0020 to the live database before deploying.** Render does not run migrations.
+2. **Apply migration 0021 to the live database before deploying.** Render does not run migrations.
 3. **Confirm `RESEND_API_KEY` and `RESEND_FROM_EMAIL`** on the service, plus `ORDER_EMAIL_REPLY_TO` unless the From address is a monitored mailbox. Without them nothing can be collected, which is the safe failure.
 4. **One real email** to a test address, before the live acceptance run.
 
 ## Rollback
 
-Revert this branch's commits, then apply `server/migrations-rollback/0020_orders_proof_delivery.rollback.sql`. The code must go first, because the gate reads those columns. Reverting removes the gate, and capture returns to the previous behaviour.
+Revert this branch's commits, then apply `server/migrations-rollback/0021_orders_proof_delivery.rollback.sql`. The code must go first, because the gate reads those columns. Reverting removes the gate, and capture returns to the previous behaviour.

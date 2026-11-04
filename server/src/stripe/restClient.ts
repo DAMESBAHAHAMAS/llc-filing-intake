@@ -120,6 +120,8 @@ export interface CreateCheckoutSessionParams {
   /** Written onto the PaymentIntent so payment_intent.* webhook events
    *  map back to the order without another Stripe call. */
   paymentIntentMetadata?: Record<string, string>;
+  /** Shown above Stripe's pay button (custom_text.submit.message). */
+  submitMessage?: string;
 }
 
 export interface StripeCheckoutSession {
@@ -149,6 +151,7 @@ export async function createCheckoutSession(params: CreateCheckoutSessionParams)
     customer_email: params.customerEmail,
     billing_address_collection: "required",
     metadata: params.metadata,
+    ...(params.submitMessage ? { custom_text: { submit: { message: params.submitMessage } } } : {}),
     ...(params.captureMode === "hold"
       ? {
           customer_creation: "always",
@@ -224,11 +227,17 @@ export async function retrievePaymentIntent(paymentIntentId: string): Promise<St
 
 /** Collects a held payment. The idempotency key makes a repeat call
  *  return the first result instead of attempting a second capture. */
-export async function capturePaymentIntent(paymentIntentId: string, idempotencyKey: string): Promise<StripePaymentIntent> {
+/** Collects a hold. With amountToCapture below the held amount, Stripe
+ *  collects only that much and releases the rest of the hold. */
+export async function capturePaymentIntent(
+  paymentIntentId: string,
+  idempotencyKey: string,
+  amountToCapture?: number
+): Promise<StripePaymentIntent> {
   return stripeRequest<StripePaymentIntent>(
     "POST",
     `/payment_intents/${encodeURIComponent(paymentIntentId)}/capture`,
-    {},
+    amountToCapture !== undefined ? { amount_to_capture: amountToCapture } : {},
     idempotencyKey
   );
 }

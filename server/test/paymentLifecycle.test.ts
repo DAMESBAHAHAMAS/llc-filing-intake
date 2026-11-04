@@ -73,6 +73,25 @@ describe("handlePaymentLifecycleEvent", () => {
     expect(c.writes).toHaveLength(0);
   });
 
+  it("records the separate service charge (EIN) without touching the order's payment state", async () => {
+    const c = fakeClient({ ...baseOrder, payment_status: "paid" });
+    const r = await handlePaymentLifecycleEvent(
+      c as never,
+      event("payment_intent.succeeded", { id: "pi_ein", metadata: { order_id: baseOrder.order_id, kind: "deferred_service" } })
+    );
+    expect(r.processingResult).toBe("deferred_service_collected");
+    expect(c.writes).toHaveLength(1);
+    expect(c.writes[0].sql).toMatch(/deferred_charged_at/);
+    expect(c.writes[0].sql).not.toMatch(/payment_status/);
+  });
+
+  it("does not mark the whole order refunded when only the service charge is refunded", async () => {
+    const c = fakeClient({ ...baseOrder, payment_status: "paid", deferred_payment_intent_id: "pi_ein" });
+    const r = await handlePaymentLifecycleEvent(c as never, event("charge.refunded", { id: "ch_2", payment_intent: "pi_ein", refunded: true }));
+    expect(r.processingResult).toBe("deferred_service_charge_refunded_stripe_only");
+    expect(c.writes).toHaveLength(0);
+  });
+
   it("reports an unknown order", async () => {
     const c = fakeClient(null);
     expect((await handlePaymentLifecycleEvent(c as never, event("payment_intent.succeeded", { id: "pi_x" }))).processingResult).toBe(

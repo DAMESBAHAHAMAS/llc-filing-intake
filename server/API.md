@@ -294,5 +294,5 @@ ops alert goes out, and `orders.proof_delivery_error` holds the reason.
 Calling the route again retries; a proof already delivered is not sent
 twice. An EIN-only order gets a completion notice, not the EIN itself.
 
-Needs `RESEND_API_KEY` and `RESEND_FROM_EMAIL`, and migration 0020 on the
+Needs `RESEND_API_KEY` and `RESEND_FROM_EMAIL`, and migration 0021 on the
 database. With either missing, nothing is collected.

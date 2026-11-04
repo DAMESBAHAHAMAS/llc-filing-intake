@@ -1,4 +1,4 @@
--- 0020: Record that proof of filing reached the customer before collection.
+-- 0021: Record that proof of filing reached the customer before collection.
 --
 -- Business rule (Damian, 29 Sep 2026): funds are collected only after proof
 -- of filing is delivered. Until now the code recorded the proof and captured

@@ -1120,12 +1120,12 @@ through this route. The customer still has no way to get a copy of the
 Articles PDF: its storage and serving target is the open boundary 1
 (2026-09-09), so this entry does not build that link.
 
-**Deploy order:** migration 0020 must reach the live database before this
+**Deploy order:** migration 0021 must reach the live database before this
 code, and `RESEND_API_KEY` and `RESEND_FROM_EMAIL` must be set. If either
 is missing, the failure is safe: nothing is collected.
 
 **Implemented by:** `server/src/proofDelivery/deliverProof.ts`,
-`server/src/routes/orders.ts`, migration 0020, on branch
+`server/src/routes/orders.ts`, migration 0021, on branch
 `claude/checkout-consistency`.
 
 **Supersedes:** nothing in the 2026-09-30 rule, which this enforces. It
@@ -1158,3 +1158,33 @@ says payment is being collected, not that it was. An EIN-only order records the
 EIN as its proof; that number is not emailed.
 
 **Supersedes:** —
+## 2026-10-02 — Services after the LLC filing are charged when complete; hold line at checkout
+
+**Decision (Damian, in chat, 2 Oct 2026 14:45 ET, "yes ... to all three"):**
+the three wording decisions in the Scorecard Launch Drafts doc. Decision 3
+changes the card-hold build: "Services such as EIN filing are charged when
+that service is complete, using the card you checked out with."
+
+**Build:** at checkout the hold still covers the whole order. A formation
+order with an EIN records `orders.deferred_cents` (migration 0022). At proof
+of filing, `POST /api/orders/:id/proof-of-filing` collects only
+`total - deferred` (Stripe partial capture releases the rest of the hold; the
+saved-card fallback charges the same reduced amount). When the EIN is issued,
+`POST /api/orders/:id/service-complete {service_ref}` charges the deferred
+amount to the saved card, once (idempotency key per order), and only after
+the formation part was collected. Its PaymentIntent carries
+`metadata.kind = deferred_service`; the webhook records it on the order
+(`deferred_charged_at`) and never changes the order's own payment state, and a
+refund of that charge alone is left to Stripe. An EIN-only order is
+unchanged: its whole total is collected when the EIN is issued.
+
+Held formation orders also show the approved line above Stripe's pay button
+(`custom_text.submit.message`): "Your card is held, not charged. We charge it
+only after your Florida LLC is filed. If filing takes more than 7 days, we
+charge this card once it's filed."
+
+**Verified:** 102 tests pass against a fresh Postgres 16 with migrations
+0001–0019 (numbered 0022 since, because 0019 is the Scorecard migration on main), including partial capture, the reduced saved-card fallback, the
+service charge (once, never before filing), and the webhook handling.
+**Not yet verified:** a partial capture and a deferred charge against Stripe
+test mode.
