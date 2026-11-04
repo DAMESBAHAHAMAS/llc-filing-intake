@@ -83,6 +83,16 @@ the Offer Master (`offers` table); see `server/migrations/0012_offer_master.sql`
 for the current catalog and `DECISIONS.md` for how it was populated (real,
 pre-existing Stripe test-mode objects, discovered not invented).
 
+An LLC filing order (`FASTTRACK`, `PREMIUM` or `DIY_STATE_FEE`) answers
+**422** with `code: "filing_authorization_required"` unless
+`filing_data.filing_authorization.accepted` is exactly `true`. The website
+writes that record at intake.
+
+Every session is card only. A held session shows the saved-card
+authorization above the pay button, and the order records the text Stripe
+reports it showed (`saved_card_authorization_text`) with the moment checkout
+completed (`saved_card_authorized_at`).
+
 Request:
 ```json
 {
@@ -187,12 +197,24 @@ announce, and sent by `orderEmails/worker.ts` within about 30 seconds.
 | Email | Sent when | Queued by |
 |---|---|---|
 | Welcome, order confirmation, intake summary | Checkout completes, as a hold or a payment | `POST /api/webhooks/stripe` |
-| Filing confirmation | Proof of filing is recorded on a held, released or paid order | `POST /api/orders/:orderId/proof-of-filing` |
+| Saved card declined after filing | The saved card refuses a charge | `POST /api/orders/:orderId/proof-of-filing`, `service-complete` |
+| Agent declined, or no answer in 7 days | The customer's own agent falls through | `POST /api/registered-agent/decline`, the card-hold poller |
+| Order cancelled | The order is cancelled | `POST /api/orders/:orderId/cancel` |
 
-Each email is queued at most once per order, and the Resend idempotency key
-is `order-email/<order_id>/<type>`. A failed send retries on the CRM backoff
-schedule, alerts on the first failure and when it gives up, and never affects
-payment or fulfilment.
+The filing confirmation is not queued. It gates collection, so it is sent
+once, inline, by `POST /api/orders/:orderId/proof-of-filing`, and appears in
+the list below as `filing_confirmation`.
+
+Each email is queued at most once per order (the agent notice, once per agent
+asked). The worker decides at send time, from the order as it stands: a
+released, refunded, failed or cancelled order gets no hold wording, and the
+email is marked `skipped` with the reason in `last_error`. A test-mode order
+emails only reserved test addresses (`example.com`, `.test`, `.invalid` and
+similar). The Resend idempotency key is
+`order-email/<order_id>/<type>/<content hash>`, so a retry with the same
+content cannot send twice and a re-rendered retry is not refused. A failed
+send retries on the CRM backoff schedule, alerts on the first failure and when
+it gives up, and never affects payment or fulfilment.
 
 ### `GET /api/orders/:orderId/emails`
 
@@ -207,8 +229,10 @@ Operator only (`x-operator-key`). Shows what the customer was sent.
 }
 ```
 
-`status` is `pending` (queued or waiting to retry), `processing`, `sent` or
-`dead_letter` (gave up; the customer did not get it).
+`status` is `pending` (queued or waiting to retry), `processing`, `sent`,
+`skipped` (deliberately not sent; `last_error` says why), `failed` (a filing
+confirmation that has not gone yet) or `dead_letter` (gave up; the customer
+did not get it, and the resend route below puts it back).
 
 ## EIN Filing Express capacity
 
@@ -294,5 +318,67 @@ ops alert goes out, and `orders.proof_delivery_error` holds the reason.
 Calling the route again retries; a proof already delivered is not sent
 twice. An EIN-only order gets a completion notice, not the EIN itself.
 
-Needs `RESEND_API_KEY` and `RESEND_FROM_EMAIL`, and migration 0021 on the
-database. With either missing, nothing is collected.
+This email is the filing confirmation, and the only one: the order email
+queue does not send it. It is refused for a test-mode order at a real
+address, so that order collects nothing.
+
+If the saved card is declined, the route answers 502 with
+`status: "saved_card_declined"`, the customer is emailed once to arrange
+another way to pay, and ops is alerted. Calling the route again tries the
+card again under a new Stripe idempotency key. After an unknown outcome
+(network failure, Stripe 5xx) the key stays the same, so a retry cannot
+charge twice.
+
+Refused with 409 for a cancelled order and for an order with no filing in
+it, before anything is recorded.
+
+Needs `RESEND_API_KEY` and `RESEND_FROM_EMAIL`, and migrations 0021 to 0023
+on the database. With either setting missing, nothing is collected.
+
+## `POST /api/orders/:orderId/service-complete` (operator key)
+
+Body: `{ "service_ref": "<the EIN that was issued>" }`. Charges the part of
+a formation order that was deferred until the service is complete, to the
+saved card, once, and only after the formation part was collected. A decline
+is handled as above. `service_ref` is kept on the order and never reaches
+Stripe metadata or an ops alert.
+
+## `POST /api/orders/:orderId/cancel` (operator key)
+
+Body: `{ "reason"?: string }`. For a customer who cancels, or a filing that
+cannot go ahead. Marks the order cancelled first, stops filing, ends any live
+agent link, closes the Deal, releases any hold and emails the customer. A
+cancelled order is never filed and its saved card is never charged.
+Refused with 409 once the filing is submitted or recorded, and for a paid
+order, which is a refund. If the release fails the route answers 502, and
+calling it again retries the release alone.
+
+## `POST /api/orders/:orderId/emails/:emailType/resend` (operator key)
+
+Puts a dead-lettered customer email back in the queue with fresh attempts.
+The worker decides again from the order as it stands, so a resend cannot
+carry stale wording. 409 if nothing of that type is dead-lettered. For the
+filing confirmation, call proof of filing again instead.
+
+## Customer's own registered agent
+
+An order that is held or paid, and waiting for the customer's own agent:
+
+- **Accepts:** filing starts, on a held, paid or released order. A released
+  hold raises an ops alert, because filing then starts with no hold behind
+  it. The saved card is charged after Florida confirms.
+- **Declines, or no answer in 7 days:** the customer is emailed, ops is
+  alerted and the order stays open. The second case comes from the card-hold
+  poller.
+- **Customer names another agent:** `POST /registered-agent/select` asks the
+  new agent at once and answers `acceptance_email_sent`.
+- **Customer switches to Damian:** answers 409 with `required_offer_code`
+  unless the 3-year agent service is on a held or paid order.
+- **Customer cancels:** see above.
+
+## Saved card
+
+The card-hold poller detaches the saved card once an order closes: paid with
+no service charge to come, refunded, or cancelled. Refunds on earlier charges
+still work. A failure is retried on the next pass, with one ops alert. The
+Stripe key needs write access to PaymentMethods.

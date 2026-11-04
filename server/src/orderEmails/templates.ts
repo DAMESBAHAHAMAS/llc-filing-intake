@@ -231,11 +231,13 @@ function paymentTerms(ctx: OrderEmailContext): Block[] {
   const later = ctx.laterService ? [p(LATER_SERVICES_LINE)] : [];
   if (ctx.paymentMode === "paid") return [p(`We charged ${total} at checkout.`), p(REPLY_LINE)];
   if (ctx.paymentMode === "collected") return [p(`We charged your card for this order.`), ...later, p(REPLY_LINE)];
+  // With a service charged later, the filing is not the whole order total.
+  const whatIsCharged = ctx.laterService ? "your LLC filing" : "the order total";
   const charged = ctx.sunbizFiling
-    ? "We charge the order total only after the Florida Division of Corporations confirms that your LLC has been filed, and we send you your filing confirmation."
+    ? `We charge ${whatIsCharged} only after the Florida Division of Corporations confirms that your LLC has been filed, and we send you your filing confirmation.`
     : "We charge your card only after your filing is complete. We email you when it is.";
   const lapse = ctx.sunbizFiling
-    ? "Holds last about 7 days. If your hold ends before Florida confirms your filing, we charge the card you authorized at checkout once, for the order total, after Florida confirms it."
+    ? `Holds last about 7 days. If your hold ends before Florida confirms your filing, we charge the card you authorized at checkout once, for ${whatIsCharged}, after Florida confirms it.`
     : "Holds last about 7 days. If your hold ends before your filing is complete, we charge the card you authorized at checkout once, for the order total, after it is complete.";
   return [
     p(`We placed a hold of ${total} on your card. A hold is not a charge: the amount is reserved, not collected.`),

@@ -1136,8 +1136,7 @@ replaces the sequence in `db5a162`'s comment in
 **What exists now (branch `claude/customer-order-emails`):** four
 transactional emails in `server/src/orderEmails/`. Welcome, order
 confirmation and intake summary are queued by the Stripe webhook when
-checkout completes. The filing confirmation is queued with proof of filing.
-Before this, a paying customer received nothing from this service: the only
+checkout completes. Before this, a paying customer received nothing from this service: the only
 Resend senders were the registered-agent acceptance email, ops alerts and
 the Scorecard.
 
@@ -1152,10 +1151,9 @@ savepoint, so it cannot abort the payment transaction.
 
 **Wording:** payment lines follow the published Terms
 (`PaymentCancellationRefunds` in florida-business-launchpad). Disclaimer as
-approved under R #231. The filing confirmation is queued before collection
-is requested, so it does not depend on the capture succeeding, and its wording
-says payment is being collected, not that it was. An EIN-only order records the
-EIN as its proof; that number is not emailed.
+approved under R #231. An EIN-only order records the EIN as its proof; that
+number is not emailed. The filing confirmation is no longer queued: see the
+"Payment release candidate" entry below.
 
 **Supersedes:** —
 ## 2026-10-02 — Services after the LLC filing are charged when complete; hold line at checkout
@@ -1188,3 +1186,82 @@ charge this card once it's filed."
 service charge (once, never before filing), and the webhook handling.
 **Not yet verified:** a partial capture and a deferred charge against Stripe
 test mode.
+
+## 2026-11-04 — Payment release candidate: one filing confirmation, holds that survive their outcomes, and migration numbers
+
+**Damian's rule, stated for this work:** he pays Sunbiz first, and the
+customer's card is charged only after Florida confirms the filing with a
+document number. Wording target: the "No Payment Until Confirmation" draft of
+4 Nov 2026.
+
+**Branch:** `claude/payment-release-candidate` brings PR #7, PR #8 and
+`claude/charge-ein-when-issued` together with regular merges. Draft, not
+merged, not deployed.
+
+**Migration numbers.** `LIVE-PAYMENTS-CHECKLIST.md` (website repo) reserves
+0020 for `0020_offer_master_live_prices.sql`, so the reservation stands and the
+drafts moved: PR #8's proof delivery is 0021, the EIN migration is 0022 (it was
+0019, which main already uses for the Scorecard tables), and this work is 0023.
+The runner applies any unapplied file in filename order, so a later 0020 still
+runs. These numbers apply only to migrations that had not reached main.
+
+**One filing confirmation.** There is one, it goes through the gate in
+`proofDelivery/deliverProof.ts`, and collection happens only after the provider
+accepts it. PR #7's queued `filing_confirmation` is gone, and its template is
+now the only one, so the wording and the redaction are shared. This replaces
+the part of the 2026-11-04 customer-emails entry that queued it, which has been
+edited because that entry had not reached main.
+
+**Queued emails decide at send time.** A retry can run hours after it was
+queued, so the worker reads the order first. Released, refunded, failed and
+cancelled orders get no hold wording; the job is marked `skipped` with the
+reason. A hold since collected says charged. The stored `payment_mode` is no
+longer read for wording.
+
+**A held order and its registered agent.** Acceptance advances held orders,
+which is nearly all of them. A released hold advances too: the agent can take
+the full 7 days a hold lasts, and the customer authorized the saved card for
+that case. That needed `orders_fulfillment_requires_paid` widened (0023), and
+it raises an ops alert, because Damian then pays Sunbiz with no hold behind the
+order and the saved card can still decline. A decline, or 7 days of silence,
+emails the customer and alerts ops, and the order stays open.
+
+**Switching to Damian.** Advancing held orders would otherwise let a customer
+whose agent declined switch to Damian without the 3-year service. The select
+route now refuses that with 409 and `required_offer_code`, as checkout does.
+
+**Cancelling.** `POST /api/orders/:id/cancel` is an operator route, because
+customers cancel by email. It marks the order before calling Stripe, so nothing
+can file it or charge it meanwhile. This is what separates a cancelled order
+from a lapsed hold: only a cancelled order is barred from the saved card.
+`release-hold` alone still leaves the order open.
+
+**Saved-card retries.** Stripe stores declines under an idempotency key, so
+each decline moves to a new attempt number. An unknown outcome keeps the key,
+because a new key after a lost response could charge twice. For the same
+reason the saved card is now used only when Stripe says the hold really ended:
+`payment_intent_unexpected_state` also means already captured.
+
+**Recording the authorization.** Stripe records no acceptance for
+`custom_text`. The completed session does report the exact text shown, so the
+order keeps that with the moment checkout completed. A required tick box
+(`consent_collection.terms_of_service`) would record acceptance properly, but
+needs a Terms URL in the Stripe account and adds a step, so that is left for
+Damian.
+
+**Detaching.** The card comes off the Customer once the order closes, because
+the customer agreed "we use the saved card only for this order". The card-hold
+poller does it, since a webhook must not call out inside its transaction.
+The live restricted key needs PaymentMethods write, not read.
+
+**A test-mode event never emails a real address.** Only reserved domains pass.
+A `+test` tag does not, because that still reaches a real inbox.
+
+**Rationale:** each item above is a defect found reviewing PR #7 and PR #8, or
+a gap between the code and the customer promise. Tested in Stripe test mode on
+isolated PGlite; results are in the draft PR for this branch.
+
+**Not decided here, for Damian:** the wording questions listed in that PR.
+
+**Supersedes:** the filing confirmation part of the 2026-11-04 customer-emails
+entry. The 2026-10-02 hold line stays, and moves below the pay button.

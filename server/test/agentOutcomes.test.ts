@@ -242,8 +242,8 @@ describe("the agent does not answer", () => {
   it("does not notify twice", async () => {
     await order("authorized");
     await ask(new Date(now.getTime() - 8 * DAY));
-    await runAgentAcceptanceSweepOnce(state.db, now);
-    await runAgentAcceptanceSweepOnce(state.db, now);
+    expect((await runAgentAcceptanceSweepOnce(state.db, now)).notified).toBe(1);
+    expect((await runAgentAcceptanceSweepOnce(state.db, now)).notified).toBe(0);
     expect(alerts.send).toHaveBeenCalledTimes(1);
     expect(await runEmails(state.db, realOrderEmailSender)).toBe(1);
   });

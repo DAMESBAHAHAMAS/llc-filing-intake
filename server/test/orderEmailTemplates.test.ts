@@ -110,6 +110,8 @@ describe("order confirmation", () => {
   it("says when a later service is charged", () => {
     const { text } = buildOrderEmail("order_confirmation", row({ deferred_cents: 7500 }), "hold");
     expect(text).toContain("Services such as EIN filing are charged when that service is complete, using the card you checked out with.");
+    expect(text).toContain("We charge your LLC filing only after");
+    expect(text).not.toContain("for the order total");
     expect(buildOrderEmail("order_confirmation", row(), "hold").text).not.toContain("EIN");
   });
 

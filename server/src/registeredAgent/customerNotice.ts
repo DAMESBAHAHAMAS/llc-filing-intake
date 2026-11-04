@@ -37,7 +37,7 @@ const OPS_LINE: Record<AgentProblem, string> = {
  * Tells the customer and ops, once per agent asked. The order is not
  * touched: it stays open for the customer to name another agent or cancel.
  */
-export async function notifyAgentProblem(pool: Pool, order: Pick<OpenFilingOrder, "order_id" | "filing_session_id">, acceptanceId: string, problem: AgentProblem): Promise<void> {
+export async function notifyAgentProblem(pool: Pool, order: Pick<OpenFilingOrder, "order_id" | "filing_session_id">, acceptanceId: string, problem: AgentProblem): Promise<boolean> {
   const { isNew } = await queueOrderEmail(pool, {
     orderId: order.order_id,
     filingSessionId: order.filing_session_id,
@@ -49,6 +49,7 @@ export async function notifyAgentProblem(pool: Pool, order: Pick<OpenFilingOrder
   if (isNew) {
     await sendOpsAlert("Registered agent needs replacing", `Order ${order.order_id}: ${OPS_LINE[problem]} The customer has been asked to name another agent or cancel. Filing is on hold, and the order stays open.`);
   }
+  return isNew;
 }
 
 /**
@@ -76,8 +77,7 @@ export async function runAgentAcceptanceSweepOnce(pool: Pool, now: Date = new Da
       const acceptance = latest.rows[0];
       const key = String(acceptance?.id ?? "none");
       if (acceptance?.status === "declined") {
-        await notifyAgentProblem(pool, order, key, "declined");
-        notified++;
+        if (await notifyAgentProblem(pool, order, key, "declined")) notified++;
         continue;
       }
       const askedAt = acceptance?.requested_at ?? order.authorized_at ?? order.paid_at;
@@ -90,8 +90,7 @@ export async function runAgentAcceptanceSweepOnce(pool: Pool, now: Date = new Da
         `UPDATE filing_sessions SET registered_agent_status = 'expired' WHERE filing_session_id = $1 AND registered_agent_status IS DISTINCT FROM 'accepted'`,
         [order.filing_session_id]
       );
-      await notifyAgentProblem(pool, order, key, "not_accepted");
-      notified++;
+      if (await notifyAgentProblem(pool, order, key, "not_accepted")) notified++;
     } catch (err) {
       console.error(`[agent sweep] order ${order.order_id}:`, describeError(err));
     }
