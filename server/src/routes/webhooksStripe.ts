@@ -6,6 +6,7 @@ import { verifyStripeSignature, WebhookSignatureError } from "../stripe/webhookS
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
 import { alertEmailsNotQueued, CHECKOUT_EMAIL_TYPES, enqueueCustomerEmails } from "../orderEmails/worker.js";
+import { enqueueDealUpdate, type TxClient } from "../payments/dealUpdates.js";
 import {
   classifyCheckoutCompletion,
   fulfillmentAfterPaymentEnds,
@@ -17,6 +18,8 @@ export const stripeWebhookRouter = Router();
 interface MinimalStripeEvent {
   id: string;
   type: string;
+  /** false on a test-mode event. Absent is treated as live. */
+  livemode?: boolean;
   data: { object: Record<string, unknown> };
 }
 
@@ -99,6 +102,7 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
         payment_status?: string;
         payment_intent?: string | null;
         metadata?: Record<string, string> | null;
+        custom_text?: { submit?: { message?: string } | null } | null;
       };
       const orderRes = await client.query<{
         order_id: string;
@@ -107,8 +111,9 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
         total_cents: number;
         line_items: Array<{ offer_code?: string }>;
         payment_status: string;
+        capture_mode: string | null;
       }>(
-        `SELECT order_id, filing_session_id, product, total_cents, line_items, payment_status
+        `SELECT order_id, filing_session_id, product, total_cents, line_items, payment_status, capture_mode
          FROM orders WHERE stripe_checkout_session_id = $1 FOR UPDATE`,
         [session.id]
       );
@@ -123,7 +128,7 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
         // "paid": collected at checkout. "authorized": a card hold under the
         // pay-after-filing rule (checkout.ts) — filing starts now, money is
         // collected when proof of filing is recorded (routes/orders.ts).
-        const completion = classifyCheckoutCompletion(session.payment_status, session.payment_intent, order.payment_status);
+        const completion = classifyCheckoutCompletion(session.payment_status, session.payment_intent, order.payment_status, order.capture_mode);
         const held = completion === "authorized";
         if (completion !== "ignore") {
           const requiresFiling = needsSunbizFiling(order.line_items ?? []);
@@ -150,13 +155,24 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
           await client.query(
             held
               ? `UPDATE orders
-                 SET payment_status = 'authorized', authorized_at = now(), stripe_payment_intent_id = $2${fulfillmentReady ? ", fulfillment_status = 'ready', fulfillment_ready_at = now()" : ""}
+                 SET payment_status = 'authorized', authorized_at = now(), stripe_payment_intent_id = $2, stripe_livemode = $3${fulfillmentReady ? ", fulfillment_status = 'ready', fulfillment_ready_at = now()" : ""}
                  WHERE order_id = $1`
               : `UPDATE orders
-                 SET payment_status = 'paid', paid_at = now(), stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, $2)${fulfillmentReady ? ", fulfillment_status = 'ready', fulfillment_ready_at = now()" : ""}
+                 SET payment_status = 'paid', paid_at = now(), stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, $2), stripe_livemode = $3${fulfillmentReady ? ", fulfillment_status = 'ready', fulfillment_ready_at = now()" : ""}
                  WHERE order_id = $1`,
-            [orderId, session.payment_intent ?? null]
+            [orderId, session.payment_intent ?? null, event.livemode !== false]
           );
+
+          // Stripe records no acceptance for custom_text. What it does give
+          // is the exact text this session showed, so the order keeps that
+          // with the moment the customer completed checkout.
+          const authorizationShown = session.custom_text?.submit?.message;
+          if (held && authorizationShown) {
+            await client.query(`UPDATE orders SET saved_card_authorized_at = now(), saved_card_authorization_text = $2 WHERE order_id = $1`, [
+              orderId,
+              authorizationShown,
+            ]);
+          }
 
           const sessionRow = await client.query(
             `SELECT email, full_name, phone, entity_name_primary, crm_lead_id, utm_source, utm_medium, utm_campaign
@@ -371,8 +387,6 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
   }
 });
 
-type TxClient = { query: (text: string, params?: unknown[]) => Promise<{ rows: any[]; rowCount: number | null }> };
-
 /**
  * PaymentIntent / Charge lifecycle for card holds:
  *  - payment_intent.succeeded: the hold was collected (or the saved-card
@@ -399,7 +413,7 @@ export async function handlePaymentLifecycleEvent(
   const uuidLike = /^[0-9a-f-]{36}$/i;
 
   const found = await client.query(
-    `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at, deferred_payment_intent_id
+    `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at, deferred_payment_intent_id, cancelled_at
      FROM orders
      WHERE ($1::uuid IS NOT NULL AND order_id = $1::uuid) OR ($2::text IS NOT NULL AND stripe_payment_intent_id = $2::text)
      ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
@@ -414,6 +428,7 @@ export async function handlePaymentLifecycleEvent(
     crm_deal_id: string | null;
     proof_of_filing_at: Date | null;
     deferred_payment_intent_id?: string | null;
+    cancelled_at?: Date | null;
   };
 
   // The separate charge for a service completed after the filing (EIN).
@@ -462,10 +477,13 @@ export async function handlePaymentLifecycleEvent(
        WHERE order_id = $1`,
       [order.order_id, fulfillmentAfterPaymentEnds(order.fulfillment_status)]
     );
-    await enqueueDealUpdate(client, order, {
-      target_stage: process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED",
-      extra_fields: { Payment_Status: "Hold Released" },
-    });
+    // A cancelled order's Deal was already closed by the cancel route.
+    if (!order.cancelled_at) {
+      await enqueueDealUpdate(client, order, {
+        target_stage: process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED",
+        extra_fields: { Payment_Status: "Hold Released" },
+      });
+    }
     console.error(
       `[payments] hold released for order ${order.order_id} (reason: ${obj.cancellation_reason ?? "unknown"}; fulfillment was ${order.fulfillment_status})`
     );
@@ -484,41 +502,4 @@ export async function handlePaymentLifecycleEvent(
     extra_fields: { Payment_Status: "Refunded" },
   });
   return { processingResult: "refunded", orderId: order.order_id };
-}
-
-/**
- * Queues a Deal update for an order's Deal, if one is known. A Deal this
- * data spine created itself (a synced order_deal job for the order) is
- * updated directly; a Deal id that came from intake metadata keeps the
- * email-ownership check in zoho/client.ts.
- */
-async function enqueueDealUpdate(
-  client: TxClient,
-  order: { order_id: string; filing_session_id: string; crm_deal_id: string | null },
-  update: { target_stage: string; extra_fields: Record<string, unknown> }
-): Promise<boolean> {
-  if (!order.crm_deal_id) return false;
-  const own = await client.query(
-    `SELECT 1 FROM crm_sync_queue WHERE order_id = $1 AND sync_type = 'order_deal' AND status = 'synced' LIMIT 1`,
-    [order.order_id]
-  );
-  const email = await client.query(`SELECT email FROM filing_sessions WHERE filing_session_id = $1`, [order.filing_session_id]);
-  const expectedEmail = email.rows[0]?.email as string | undefined;
-  if (!own.rowCount && !expectedEmail) return false;
-  await client.query(
-    `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot)
-     VALUES ($1, $2, 'deal_stage_update', $3)`,
-    [
-      order.filing_session_id,
-      order.order_id,
-      JSON.stringify({
-        crm_deal_id: order.crm_deal_id,
-        target_stage: update.target_stage,
-        expected_email: expectedEmail ?? "",
-        extra_fields: update.extra_fields,
-        server_created: Boolean(own.rowCount),
-      }),
-    ]
-  );
-  return true;
 }

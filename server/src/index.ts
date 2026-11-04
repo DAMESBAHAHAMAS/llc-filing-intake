@@ -16,6 +16,8 @@ import { scorecardRouter } from "./routes/scorecard.js";
 import { runScorecardTick } from "./scorecard/service.js";
 import { realScorecardSender } from "./scorecard/sender.js";
 import { runHoldSweepOnce } from "./fulfillment/holdSweep.js";
+import { runSavedCardCleanupOnce } from "./payments/savedCardCleanup.js";
+import { runAgentAcceptanceSweepOnce } from "./registeredAgent/customerNotice.js";
 import { realOrderEmailSender } from "./orderEmails/sender.js";
 import { runOnce as runOrderEmailsOnce } from "./orderEmails/worker.js";
 import { pool } from "./db/pool.js";
@@ -107,14 +109,22 @@ if (fulfillmentPollerIntervalMs > 0) {
 
 /**
  * Card-hold watch (pay-after-filing): records hold expiry times and flags
- * held orders nearing expiry without proof of filing. Every 15 minutes by
- * default; HOLD_SWEEP_INTERVAL_MS=0 disables it.
+ * held orders nearing expiry without proof of filing. The same pass asks
+ * customers to replace agents who never answered, and detaches saved cards
+ * from closed orders. Every 15 minutes by default;
+ * HOLD_SWEEP_INTERVAL_MS=0 disables it.
  */
 const holdSweepIntervalMs = Number(process.env.HOLD_SWEEP_INTERVAL_MS ?? 15 * 60_000);
 if (holdSweepIntervalMs > 0) {
   setInterval(() => {
     runHoldSweepOnce(pool).catch((err) => {
       console.error("[hold sweep] tick failed", err);
+    });
+    runAgentAcceptanceSweepOnce(pool).catch((err) => {
+      console.error("[agent sweep] tick failed", err);
+    });
+    runSavedCardCleanupOnce(pool).catch((err) => {
+      console.error("[saved card] tick failed", err);
     });
   }, holdSweepIntervalMs);
   console.log(`Card-hold watch running every ${holdSweepIntervalMs}ms`);
