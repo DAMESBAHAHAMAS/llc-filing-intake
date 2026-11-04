@@ -282,7 +282,23 @@ email-provider credentials configured, so no email is actually sent (see
 `DECISIONS.md`). The frontend/ops needs its own way to deliver
 `acceptance_url` until that's built.
 
-### `POST /api/registered-agent/accept` — `{ "token": "..." }` → `{ "status": "accepted" }`
+### `POST /api/registered-agent/acceptance` — `{ "token": "..." }`
+
+Read-only. What the website's `/registered-agent/accept` page shows the agent.
+
+```json
+{ "status": "open", "llc_name": "...", "registered_agent_name": "...", "registered_agent_florida_address": "...", "expires_at": "2026-11-11T15:00:00.000Z" }
+```
+
+A link that has been used or has ended answers only `{ "status": "accepted" | "declined" | "expired" }`.
+A link for an agent the customer has since replaced reads as `expired`. An
+unknown token is a 404.
+
+### `POST /api/registered-agent/accept` — `{ "token": "...", "wording_version"?: "..." }` → `{ "status": "accepted" }`
+
+`wording_version` records the statement the agent agreed to on the website in
+`acceptance_version`, in place of the version stored when the link was emailed.
+
 ### `POST /api/registered-agent/decline` — `{ "token": "..." }` → `{ "status": "declined" }`
 ### `GET /api/registered-agent/status/:filingSessionId` → `{ "registered_agent_status": "accepted" | "pending" | ... | null }`
 

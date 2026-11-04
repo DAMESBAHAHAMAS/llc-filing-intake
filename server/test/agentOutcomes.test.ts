@@ -270,6 +270,76 @@ describe("the agent does not answer", () => {
   });
 });
 
+describe("the accept page", () => {
+  const details = (token = TOKEN) => post("/api/registered-agent/acceptance", { token });
+  const acceptance = async () =>
+    (await state.db.query(`SELECT status, acceptance_version FROM registered_agent_acceptances WHERE acceptance_token_id = $1`, [TOKEN])).rows[0];
+
+  it("shows what the email shows, and changes nothing by being opened", async () => {
+    await order("authorized");
+    const requestedAt = new Date();
+    await ask(requestedAt);
+    const r = await details();
+    expect(r.status).toBe(200);
+    expect(r.json).toEqual({
+      status: "open",
+      llc_name: "Sol Ventures LLC",
+      registered_agent_name: "Rae Agent",
+      registered_agent_florida_address: "5 Bay Rd, Tampa, FL 33601",
+      expires_at: new Date(requestedAt.getTime() + 7 * DAY).toISOString(),
+    });
+    expect(await acceptance()).toEqual({ status: "acceptance_requested", acceptance_version: "v1" });
+    expect(await sessionStatus()).toBe("acceptance_requested");
+    expect(await orderRow()).toEqual({ payment_status: "authorized", fulfillment_status: "not_ready" });
+  });
+
+  it("reports a used, expired or replaced link without its details", async () => {
+    await order("authorized");
+    await ask();
+    await post("/api/registered-agent/accept", { token: TOKEN });
+    expect((await details()).json).toEqual({ status: "accepted" });
+
+    await state.db.query(`DELETE FROM registered_agent_acceptances`);
+    await ask();
+    await post("/api/registered-agent/decline", { token: TOKEN });
+    expect((await details()).json).toEqual({ status: "declined" });
+
+    await state.db.query(`DELETE FROM registered_agent_acceptances`);
+    await ask(new Date(Date.now() - 8 * DAY));
+    expect((await details()).json).toEqual({ status: "expired" });
+
+    await state.db.query(`DELETE FROM registered_agent_acceptances`);
+    await ask();
+    await state.db.query(`UPDATE filing_sessions SET filing_data = $1`, [JSON.stringify({ llc_name: "Sol Ventures LLC", registered_agent_path: "house" })]);
+    expect((await details()).json).toEqual({ status: "expired" });
+  });
+
+  it("refuses an unknown or missing token", async () => {
+    expect((await details("nope")).status).toBe(404);
+    expect((await post("/api/registered-agent/acceptance", {})).status).toBe(400);
+  });
+
+  it("records the wording accepted, and ignores a version that isn't one", async () => {
+    await order("authorized");
+    await ask();
+    await post("/api/registered-agent/accept", { token: TOKEN, wording_version: "agent-acceptance-2026-11-04" });
+    expect(await acceptance()).toEqual({ status: "accepted", acceptance_version: "agent-acceptance-2026-11-04" });
+
+    await state.db.query(`DELETE FROM registered_agent_acceptances`);
+    await ask();
+    await post("/api/registered-agent/accept", { token: TOKEN, wording_version: "<script>" });
+    expect(await acceptance()).toEqual({ status: "accepted", acceptance_version: "v1" });
+  });
+
+  it("emails the path the website serves", async () => {
+    await order("authorized");
+    const { dispatchAcceptanceEmail } = await import("../src/registeredAgent/acceptanceEmail.js");
+    expect((await dispatchAcceptanceEmail(state.db, filingSessionId)).ok).toBe(true);
+    const { rows } = await state.db.query(`SELECT acceptance_token_id FROM registered_agent_acceptances ORDER BY created_at DESC LIMIT 1`);
+    expect(resend.send.mock.calls.at(-1)?.[0].text).toContain(`https://example.com/registered-agent/accept?token=${encodeURIComponent(rows[0].acceptance_token_id)}`);
+  });
+});
+
 describe("a test-mode order", () => {
   it("does not email a real agent", async () => {
     await order("authorized");

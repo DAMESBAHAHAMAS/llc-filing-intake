@@ -1358,3 +1358,23 @@ run on this account breaks the "no writes to a deployed database" rule.
 
 **Supersedes:** nothing.
 
+## 2026-11-04 — The agent's acceptance page reads its details by token and records the wording
+
+The website's `/registered-agent/accept` page has to show the agent what they
+are accepting, and no route gave it that. `POST /api/registered-agent/acceptance`
+now answers with the LLC name, agent name, address and expiry for a live token,
+and only a status for a used, expired or replaced one. It writes nothing, and it
+is a POST so the token stays out of request logs. The details match what the
+email already sends to the same address.
+
+`POST /api/registered-agent/accept` takes an optional `wording_version`, stored
+in `acceptance_version`. Florida's online form has the agent's acceptance typed
+as a name, and Damian does the typing, so the record has to show the agent agreed
+to that as well as to the appointment. The accept and decline behaviour is
+otherwise unchanged. The route in `acceptanceEmail.ts`,
+`/registered-agent/accept?token=`, matches the page, so the email did not change.
+
+**Rationale:** `s. 605.0113` needs the agent's acceptance, and the Division treats
+typing a name without permission as forgery (`SUNBIZ-FILING-PLAN.md`).
+
+**Supersedes:** nothing.

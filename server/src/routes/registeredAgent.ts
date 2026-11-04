@@ -322,13 +322,83 @@ async function resolveActionableAcceptance(token: string) {
   return { found: true as const, actionable: true as const, row };
 }
 
-/** POST /api/registered-agent/accept — { token } */
+/**
+ * POST /api/registered-agent/acceptance — { token }
+ *
+ * What the website's accept page shows the agent before they answer: the same
+ * facts as the email, and nothing about the customer. Read-only, so opening
+ * the link (or a mail scanner following it) changes nothing. POST keeps the
+ * token out of request logs. An asked agent who has been replaced has nothing
+ * to accept, so that link reads as expired.
+ */
+registeredAgentRouter.post("/api/registered-agent/acceptance", async (req, res) => {
+  const token = typeof (req.body as Record<string, unknown>)?.token === "string" ? (req.body as Record<string, unknown>).token as string : "";
+  if (!token) {
+    res.status(400).json({ error: "token is required" });
+    return;
+  }
+
+  try {
+    const { rows } = await pool.query<{
+      status: string;
+      requested_at: Date | string | null;
+      registered_agent_name: string;
+      filing_data: Record<string, unknown> | null;
+    }>(
+      `SELECT a.status, a.requested_at, a.registered_agent_name, s.filing_data
+       FROM registered_agent_acceptances a JOIN filing_sessions s ON s.filing_session_id = a.filing_session_id
+       WHERE a.acceptance_token_id = $1`,
+      [token]
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "unknown or invalid token" });
+      return;
+    }
+
+    const row = rows[0];
+    if (row.status === "accepted" || row.status === "declined") {
+      res.status(200).json({ status: row.status });
+      return;
+    }
+    const filingData = row.filing_data ?? {};
+    const expiresAt = row.requested_at ? new Date(new Date(row.requested_at).getTime() + ACCEPTANCE_TOKEN_TTL_MS) : null;
+    const stillAsked =
+      row.status === "acceptance_requested" &&
+      (!expiresAt || expiresAt.getTime() > Date.now()) &&
+      filingData.registered_agent_path === "customer" &&
+      filingData.registered_agent_name === row.registered_agent_name;
+    if (!stillAsked) {
+      res.status(200).json({ status: "expired" });
+      return;
+    }
+    res.status(200).json({
+      status: "open",
+      llc_name: filingData.llc_name,
+      registered_agent_name: row.registered_agent_name,
+      registered_agent_florida_address: filingData.registered_agent_florida_address,
+      expires_at: expiresAt,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "acceptance lookup failed", detail: describeError(err) });
+  }
+});
+
+/**
+ * POST /api/registered-agent/accept — { token, wording_version? }
+ *
+ * wording_version names the statement the agent agreed to on the website,
+ * including permission to enter their name on the filing. It replaces the
+ * version stored when the link was emailed, so the row records the words
+ * actually accepted.
+ */
 registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
   const token = typeof (req.body as Record<string, unknown>)?.token === "string" ? (req.body as Record<string, unknown>).token as string : "";
   if (!token) {
     res.status(400).json({ error: "token is required" });
     return;
   }
+  const wordingVersion = (req.body as Record<string, unknown>).wording_version;
+  const acceptedWording = typeof wordingVersion === "string" && /^[a-z0-9-]{1,64}$/.test(wordingVersion) ? wordingVersion : null;
 
   try {
     const resolved = await resolveActionableAcceptance(token);
@@ -343,8 +413,10 @@ registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
 
     const clientIp = req.ip ?? req.socket.remoteAddress ?? null;
     await pool.query(
-      `UPDATE registered_agent_acceptances SET status = 'accepted', accepted_at = now(), accepted_ip = $2 WHERE id = $1`,
-      [resolved.row.id, clientIp]
+      `UPDATE registered_agent_acceptances
+       SET status = 'accepted', accepted_at = now(), accepted_ip = $2, acceptance_version = COALESCE($3, acceptance_version)
+       WHERE id = $1`,
+      [resolved.row.id, clientIp, acceptedWording]
     );
     await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'accepted' WHERE filing_session_id = $1`, [
       resolved.row.filing_session_id,
