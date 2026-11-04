@@ -16,6 +16,8 @@ import { scorecardRouter } from "./routes/scorecard.js";
 import { runScorecardTick } from "./scorecard/service.js";
 import { realScorecardSender } from "./scorecard/sender.js";
 import { runHoldSweepOnce } from "./fulfillment/holdSweep.js";
+import { realOrderEmailSender } from "./orderEmails/sender.js";
+import { runOnce as runOrderEmailsOnce } from "./orderEmails/worker.js";
 import { pool } from "./db/pool.js";
 import { realZohoClient } from "./zoho/client.js";
 import { runOnce } from "./sync/worker.js";
@@ -116,6 +118,21 @@ if (holdSweepIntervalMs > 0) {
     });
   }, holdSweepIntervalMs);
   console.log(`Card-hold watch running every ${holdSweepIntervalMs}ms`);
+}
+
+/**
+ * Customer order emails: sends what the Stripe webhook and proof-of-filing
+ * route queued (orderEmails/worker.ts). Every 30 seconds by default;
+ * ORDER_EMAIL_POLLER_INTERVAL_MS=0 disables.
+ */
+const orderEmailPollerIntervalMs = Number(process.env.ORDER_EMAIL_POLLER_INTERVAL_MS ?? 30_000);
+if (orderEmailPollerIntervalMs > 0) {
+  setInterval(() => {
+    runOrderEmailsOnce(pool, realOrderEmailSender, `order-email-poller-${process.pid}`).catch((err) => {
+      console.error("[order email poller] tick failed", err);
+    });
+  }, orderEmailPollerIntervalMs);
+  console.log(`Order email poller running every ${orderEmailPollerIntervalMs}ms`);
 }
 
 /**
