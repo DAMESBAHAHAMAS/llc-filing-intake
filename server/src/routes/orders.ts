@@ -12,6 +12,7 @@ import {
 import { holdNoLongerCapturable } from "../payments/holdState.js";
 import { sendOpsAlert } from "../ops/alerts.js";
 import { deliverProofToCustomer } from "../proofDelivery/deliverProof.js";
+import { listOrderEmails } from "../orderEmails/worker.js";
 
 export const ordersRouter = Router();
 
@@ -161,6 +162,19 @@ ordersRouter.post("/api/orders/:orderId/release-hold", async (req, res) => {
     res.status(200).json({ order_id: order.order_id, status: "release_requested", payment_intent_status: cancelled.status });
   } catch (err) {
     res.status(502).json({ error: "release failed", detail: describeError(err) });
+  }
+});
+
+/** GET /api/orders/:orderId/emails — what was sent to the customer, what failed and why. */
+ordersRouter.get("/api/orders/:orderId/emails", async (req, res) => {
+  if (!operatorAuthorized(req)) {
+    res.status(401).json({ error: "operator key required" });
+    return;
+  }
+  try {
+    res.status(200).json({ order_id: req.params.orderId, emails: await listOrderEmails(pool, req.params.orderId) });
+  } catch (err) {
+    res.status(500).json({ error: "email lookup failed", detail: describeError(err) });
   }
 });
 

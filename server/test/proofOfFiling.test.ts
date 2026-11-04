@@ -11,18 +11,21 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 const db = vi.hoisted(() => ({
   order: null as null | Record<string, unknown>,
   queries: [] as string[],
+  failEmailQueue: false,
 }));
-vi.mock("../src/db/pool.js", () => ({
-  pool: {
-    query: vi.fn(async (sql: string) => {
-      db.queries.push(sql);
-      if (/^\s*UPDATE orders\s+SET proof_of_filing_ref/.test(sql) || /^\s*SELECT order_id, payment_status/.test(sql)) {
-        return { rows: db.order ? [db.order] : [], rowCount: db.order ? 1 : 0 };
-      }
-      return { rows: [], rowCount: 1 };
-    }),
-  },
-}));
+const alerts = vi.hoisted(() => ({ send: vi.fn(async () => ({ channel: "log", ok: true })) }));
+vi.mock("../src/ops/alerts.js", () => ({ sendOpsAlert: alerts.send }));
+vi.mock("../src/db/pool.js", () => {
+  const query = vi.fn(async (sql: string) => {
+    db.queries.push(sql);
+    if (db.failEmailQueue && /INSERT INTO crm_sync_queue/.test(sql)) throw new Error("queue unavailable");
+    if (/^\s*UPDATE orders\s+SET proof_of_filing_ref/.test(sql) || /^\s*SELECT order_id, payment_status/.test(sql)) {
+      return { rows: db.order ? [db.order] : [], rowCount: db.order ? 1 : 0 };
+    }
+    return { rows: [], rowCount: 1 };
+  });
+  return { pool: { query, connect: vi.fn(async () => ({ query, release: () => undefined })) } };
+});
 
 const stripe = vi.hoisted(() => ({
   capture: vi.fn(),
@@ -66,8 +69,11 @@ afterAll(async () => {
 });
 beforeEach(() => {
   db.queries = [];
+  db.failEmailQueue = false;
+  alerts.send.mockClear();
   db.order = {
     order_id: "ord-1",
+    filing_session_id: "fs-1",
     payment_status: "authorized",
     stripe_payment_intent_id: "pi_hold",
     total_cents: 49900,
@@ -107,7 +113,7 @@ describe("POST /api/orders/:orderId/proof-of-filing", () => {
     expect(stripe.capture).toHaveBeenCalledWith("pi_hold", "capture-ord-1");
     expect(stripe.charge).not.toHaveBeenCalled();
     // Proof is written before any money moves.
-    expect(db.queries[0]).toMatch(/proof_of_filing_ref/);
+    expect(db.queries.find((q) => !/^BEGIN/.test(q))).toMatch(/proof_of_filing_ref/);
     // The route never marks the order paid itself — the webhook does.
     expect(db.queries.join("\n")).not.toMatch(/payment_status = 'paid'/);
   });

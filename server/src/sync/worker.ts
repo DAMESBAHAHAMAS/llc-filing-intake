@@ -20,6 +20,7 @@ export interface ClaimedJob {
  * short transaction that commits immediately. The row lock is NOT held
  * during the external Zoho call that follows; 'processing' status alone
  * keeps other workers off this row until the outcome is recorded.
+ * Customer emails share this table but are orderEmails/worker.ts's jobs.
  */
 export async function claimNextJob(pool: Pool, lockedBy: string): Promise<ClaimedJob | null> {
   const client = await pool.connect();
@@ -27,7 +28,7 @@ export async function claimNextJob(pool: Pool, lockedBy: string): Promise<Claime
     await client.query("BEGIN");
     const picked = await client.query<{ id: number }>(
       `SELECT id FROM crm_sync_queue
-       WHERE status = 'pending' AND run_after <= now()
+       WHERE status = 'pending' AND run_after <= now() AND sync_type NOT LIKE 'customer_email_%'
        ORDER BY run_after ASC
        LIMIT 1
        FOR UPDATE SKIP LOCKED`

@@ -1131,3 +1131,30 @@ is missing, the failure is safe: nothing is collected.
 **Supersedes:** nothing in the 2026-09-30 rule, which this enforces. It
 replaces the sequence in `db5a162`'s comment in
 `server/src/routes/filingDocument.ts`.
+## 2026-11-04 — Customer order emails run through crm_sync_queue, sent by their own worker
+
+**What exists now (branch `claude/customer-order-emails`):** four
+transactional emails in `server/src/orderEmails/`. Welcome, order
+confirmation and intake summary are queued by the Stripe webhook when
+checkout completes. The filing confirmation is queued with proof of filing.
+Before this, a paying customer received nothing from this service: the only
+Resend senders were the registered-agent acceptance email, ops alerts and
+the Scorecard.
+
+**Rationale:** the frozen rule keeps email out of the webhook handler, and
+the rule for the queue is that a job commits with the state it follows.
+`crm_sync_queue` already has backoff and dead letters, so no migration was
+needed. Jobs use `sync_type` `customer_email_<type>`; `sync/worker.ts` skips
+them, so a mail failure never changes `crm_sync_status`. One email per order
+is enforced by `NOT EXISTS` under the order's row lock, plus a Resend
+idempotency key for a retry after a lost response. Queueing sits behind a
+savepoint, so it cannot abort the payment transaction.
+
+**Wording:** payment lines follow the published Terms
+(`PaymentCancellationRefunds` in florida-business-launchpad). Disclaimer as
+approved under R #231. The filing confirmation is queued before collection
+is requested, so it does not depend on the capture succeeding, and its wording
+says payment is being collected, not that it was. An EIN-only order records the
+EIN as its proof; that number is not emailed.
+
+**Supersedes:** —
