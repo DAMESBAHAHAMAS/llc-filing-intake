@@ -173,6 +173,37 @@ above.
 
 ---
 
+## Customer order emails
+
+Queued in `crm_sync_queue`, in the same transaction as the state they
+announce, and sent by `orderEmails/worker.ts` within about 30 seconds.
+
+| Email | Sent when | Queued by |
+|---|---|---|
+| Welcome, order confirmation, intake summary | Checkout completes, as a hold or a payment | `POST /api/webhooks/stripe` |
+| Filing confirmation | Proof of filing is recorded on a held, released or paid order | `POST /api/orders/:orderId/proof-of-filing` |
+
+Each email is queued at most once per order, and the Resend idempotency key
+is `order-email/<order_id>/<type>`. A failed send retries on the CRM backoff
+schedule, alerts on the first failure and when it gives up, and never affects
+payment or fulfilment.
+
+### `GET /api/orders/:orderId/emails`
+
+Operator only (`x-operator-key`). Shows what the customer was sent.
+
+```json
+{
+  "order_id": "uuid",
+  "emails": [
+    { "email_type": "welcome", "status": "sent", "attempts": 0, "last_error": null, "provider_message_id": "re_...", "sent_at": "2026-11-04T15:00:00.000Z" }
+  ]
+}
+```
+
+`status` is `pending` (queued or waiting to retry), `processing`, `sent` or
+`dead_letter` (gave up; the customer did not get it).
+
 ## EIN Filing Express capacity
 
 ### `GET /api/ein-express/availability`
