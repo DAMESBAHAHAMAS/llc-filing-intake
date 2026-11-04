@@ -1,3 +1,4 @@
+import { looksLikePoBox } from "../registeredAgent/poBox.js";
 import { HOUSE_REGISTERED_AGENT, type FilingSessionRecord } from "./types.js";
 
 export type PdfContextResult =
@@ -61,6 +62,7 @@ export function buildPdfContext(
   } else if (filingData.registered_agent_path === "customer") {
     if (!isNonEmptyString(filingData.registered_agent_name)) missing.push("registered_agent_name");
     if (!isNonEmptyString(filingData.registered_agent_florida_address)) missing.push("registered_agent_florida_address");
+    else if (looksLikePoBox(filingData.registered_agent_florida_address)) missing.push("registered_agent_florida_address (a physical street address, no P.O. Box)");
     if (registeredAgentAcceptanceStatus !== "accepted") {
       // Typing a name is not acceptance (frozen rule) — this is a hard
       // gate, not a soft warning.
@@ -99,4 +101,14 @@ export function buildPdfContext(
       other_provisions: filingData.other_provisions ?? "",
     },
   };
+}
+
+/**
+ * What stops the Articles being built, asked before any card is held. The
+ * customer's own agent cannot have accepted yet at checkout, because they are
+ * asked only once payment is secured, so acceptance is not counted here.
+ */
+export function articlesBlockers(filingData: Partial<FilingSessionRecord> | null): string[] {
+  const result = buildPdfContext(filingData ?? {}, "accepted");
+  return result.ok ? [] : result.missingFields;
 }

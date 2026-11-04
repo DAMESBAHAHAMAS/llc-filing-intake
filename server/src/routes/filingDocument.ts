@@ -21,12 +21,17 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * post-payment fulfillment worker (buildPdfContext is the single shared
  * validator for both paths).
  *
- * 2026-10-23: the PDF bytes are NEVER returned from this route. The
- * customer receives the Articles PDF only after payment (Payment ->
- * Webhook -> PDF -> Storage -> Customer Link). This route now only
+ * 2026-10-23: the PDF bytes are NEVER returned from this route. It only
  * generates and stores the document server-side and answers with
- * { status, byte_size, sha256 }. The post-payment customer link is not
- * built yet (see the fulfillment worker, which stores the paid copy).
+ * { status, byte_size, sha256 }.
+ *
+ * Corrected 2026-11-04: filing orders are paid after filing (DECISIONS.md,
+ * 2026-09-30), so the sequence is hold -> filing -> proof of filing
+ * delivered -> collection. The proof the customer receives before
+ * collection is the Sunbiz document number, sent by
+ * proofDelivery/deliverProof.ts. No route serves the Articles PDF to a
+ * customer: the fulfillment worker stores a copy, and how that copy is
+ * served is still undecided (DECISIONS.md, 2026-09-09, boundary 1).
  *
  * Idempotent per session: a pre-payment document already on record
  * (filing_documents.order_id IS NULL) is returned as-is rather than

@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { Pool } from "pg";
 import { realEmailSender } from "./emailSender.js";
+import { blockedByTestMode, TEST_MODE_NOT_SENT } from "../orderEmails/testAddress.js";
 
 /** Same values as routes/registeredAgent.ts's existing token/TTL
  *  constants — kept here too since this module is the other caller of
@@ -52,10 +53,9 @@ export async function dispatchAcceptanceEmail(pool: Pool, filingSessionId: strin
   // Bridging field only — see routes/registeredAgent.ts's POST
   // /registered-agent/select comment on why email lives here pre-send
   // (pdf/types.ts's FilingSessionRecord has no email field; it's not PDF
-  // content). Once a registered_agent_acceptances row exists, that row's
-  // own email is authoritative instead (a reissue must keep using the
-  // email it already sent to/heard back from, even if filing_data were
-  // ever edited afterward).
+  // content). It wins over the last acceptance row: when an agent declines
+  // and the customer names another, that row still holds the old agent's
+  // address, and the new request must not go there.
   const bridgedEmail = typeof filingData.registered_agent_email === "string" ? filingData.registered_agent_email : "";
 
   const lastAcceptance = await pool.query<{ registered_agent_email: string }>(
@@ -63,7 +63,7 @@ export async function dispatchAcceptanceEmail(pool: Pool, filingSessionId: strin
      WHERE filing_session_id = $1 ORDER BY created_at DESC LIMIT 1`,
     [filingSessionId]
   );
-  const registeredAgentEmail = lastAcceptance.rows[0]?.registered_agent_email || bridgedEmail;
+  const registeredAgentEmail = bridgedEmail || lastAcceptance.rows[0]?.registered_agent_email;
 
   if (!llcName || !registeredAgentName || !registeredAgentAddress || !registeredAgentEmail) {
     return { ok: false, reason: "incomplete registered-agent data on filing_session — nothing to send" };
@@ -82,14 +82,21 @@ export async function dispatchAcceptanceEmail(pool: Pool, filingSessionId: strin
   const expiresAt = new Date(requestedAt.getTime() + ACCEPTANCE_TOKEN_TTL_MS);
   const acceptanceUrl = `${frontendBaseUrl}/registered-agent/accept?token=${encodeURIComponent(token)}`;
 
-  const emailResult = await realEmailSender.sendRegisteredAgentAcceptanceEmail({
-    toEmail: registeredAgentEmail,
-    toName: registeredAgentName,
-    llcName,
-    registeredAgentFloridaAddress: registeredAgentAddress,
-    acceptanceUrl,
-    expiresAt,
-  });
+  // A test-mode order never emails a real agent.
+  const payment = await pool.query<{ stripe_livemode: boolean | null }>(
+    `SELECT stripe_livemode FROM orders WHERE filing_session_id = $1 AND stripe_livemode IS NOT NULL ORDER BY created_at DESC LIMIT 1`,
+    [filingSessionId]
+  );
+  const emailResult = blockedByTestMode(payment.rows[0]?.stripe_livemode, registeredAgentEmail)
+    ? { ok: false, error: TEST_MODE_NOT_SENT }
+    : await realEmailSender.sendRegisteredAgentAcceptanceEmail({
+        toEmail: registeredAgentEmail,
+        toName: registeredAgentName,
+        llcName,
+        registeredAgentFloridaAddress: registeredAgentAddress,
+        acceptanceUrl,
+        expiresAt,
+      });
 
   if (!emailResult.ok) {
     await pool.query(

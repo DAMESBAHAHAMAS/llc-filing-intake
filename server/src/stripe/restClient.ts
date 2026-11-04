@@ -120,6 +120,10 @@ export interface CreateCheckoutSessionParams {
   /** Written onto the PaymentIntent so payment_intent.* webhook events
    *  map back to the order without another Stripe call. */
   paymentIntentMetadata?: Record<string, string>;
+  /** Shown above Stripe's pay button (custom_text.submit.message). */
+  submitMessage?: string;
+  /** Shown below Stripe's pay button (custom_text.after_submit.message). */
+  afterSubmitMessage?: string;
 }
 
 export interface StripeCheckoutSession {
@@ -129,15 +133,16 @@ export interface StripeCheckoutSession {
   status: string;
   client_reference_id: string | null;
   customer_details?: { email?: string | null; address?: { country?: string | null } | null } | null;
+  payment_method_types?: string[];
 }
 
 /**
- * Creates a Stripe hosted Checkout Session. Deliberately does NOT set
- * payment_method_types — leaving it unset lets Stripe pick eligible
- * methods per the Dashboard configuration and the customer's location,
- * which is what makes non-US billing addresses and international cards
- * work without this code needing to special-case them (frozen rule:
- * international must work end-to-end, nothing here assumes a US ZIP).
+ * Creates a Stripe hosted Checkout Session, card only. A hold needs a card:
+ * manual capture and off-session reuse do not work on delayed or
+ * buy-now-pay-later methods, and the Dashboard otherwise offers them. Cards
+ * from any country, Apple Pay and Google Pay are all type card, so
+ * international customers are not affected (frozen rule: international
+ * must work end-to-end, nothing here assumes a US ZIP).
  */
 export async function createCheckoutSession(params: CreateCheckoutSessionParams): Promise<StripeCheckoutSession> {
   return stripeRequest<StripeCheckoutSession>("POST", "/checkout/sessions", {
@@ -148,7 +153,16 @@ export async function createCheckoutSession(params: CreateCheckoutSessionParams)
     cancel_url: params.cancelUrl,
     customer_email: params.customerEmail,
     billing_address_collection: "required",
+    payment_method_types: ["card"],
     metadata: params.metadata,
+    ...(params.submitMessage || params.afterSubmitMessage
+      ? {
+          custom_text: {
+            ...(params.submitMessage ? { submit: { message: params.submitMessage } } : {}),
+            ...(params.afterSubmitMessage ? { after_submit: { message: params.afterSubmitMessage } } : {}),
+          },
+        }
+      : {}),
     ...(params.captureMode === "hold"
       ? {
           customer_creation: "always",
@@ -174,6 +188,12 @@ export async function createCheckoutSession(params: CreateCheckoutSessionParams)
 
 export async function retrieveCheckoutSession(sessionId: string): Promise<StripeCheckoutSession> {
   return stripeRequest<StripeCheckoutSession>("GET", `/checkout/sessions/${encodeURIComponent(sessionId)}`);
+}
+
+/** Closes an open Checkout Session so it can no longer be paid. Stripe
+ *  refuses this once the session is complete or already expired. */
+export async function expireCheckoutSession(sessionId: string): Promise<StripeCheckoutSession> {
+  return stripeRequest<StripeCheckoutSession>("POST", `/checkout/sessions/${encodeURIComponent(sessionId)}/expire`, {});
 }
 
 export interface StripePrice {
@@ -223,12 +243,18 @@ export async function retrievePaymentIntent(paymentIntentId: string): Promise<St
 }
 
 /** Collects a held payment. The idempotency key makes a repeat call
- *  return the first result instead of attempting a second capture. */
-export async function capturePaymentIntent(paymentIntentId: string, idempotencyKey: string): Promise<StripePaymentIntent> {
+ *  return the first result instead of attempting a second capture. With
+ *  amountToCapture below the held amount, Stripe collects only that much
+ *  and releases the rest of the hold. */
+export async function capturePaymentIntent(
+  paymentIntentId: string,
+  idempotencyKey: string,
+  amountToCapture?: number
+): Promise<StripePaymentIntent> {
   return stripeRequest<StripePaymentIntent>(
     "POST",
     `/payment_intents/${encodeURIComponent(paymentIntentId)}/capture`,
-    {},
+    amountToCapture !== undefined ? { amount_to_capture: amountToCapture } : {},
     idempotencyKey
   );
 }
@@ -271,6 +297,12 @@ export async function chargeSavedCard(params: {
     },
     params.idempotencyKey
   );
+}
+
+/** Removes a saved card from its Customer, so it cannot be charged again.
+ *  Refunds on earlier charges still work after this. */
+export async function detachPaymentMethod(paymentMethodId: string): Promise<{ id: string }> {
+  return stripeRequest<{ id: string }>("POST", `/payment_methods/${encodeURIComponent(paymentMethodId)}/detach`, {});
 }
 
 /** Reads the hold expiry and extended-hold status from an expanded

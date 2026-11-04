@@ -71,7 +71,7 @@ Service: `llc-data-spine` → Environment.
 | `PDF_SERVICE_URL` | `https://llc-pdf-generator.onrender.com` | Fulfillment can't render; order parks at `requires_review` |
 | `PDF_SERVICE_API_KEY` | (PDF service key) | Same as above |
 | `SUNBIZ_PROXY_URL` | `https://sunbiz-proxy.onrender.com/api/sunbiz/check` | Server-side name check unavailable |
-| `RESEND_API_KEY` | (Resend dashboard → API Keys) | `registeredAgent/emailSender.ts` fails clearly, RA acceptance email not sent (CP11) |
+| `RESEND_API_KEY` | (Resend dashboard → API Keys) | `registeredAgent/emailSender.ts` fails clearly, RA acceptance email not sent (CP11); customer order emails fail, retry and alert (`orderEmails/`) |
 | `RESEND_FROM_EMAIL` | an address on a domain verified in Resend | Same as above |
 | `ZOHO_DEAL_STAGE_ON_PAYMENT` | a Stage value confirmed against this org's live Deals picklist | No `deal_stage_update` job is enqueued at all (deliberately — see zoho/client.ts's comment); `orders.crm_deal_id` still gets set, just no stage change |
 
@@ -375,6 +375,11 @@ State these plainly rather than discovering them mid-test:
   no confirmation email, no RA acceptance email, but also no crash and
   no silent pretense of success. Blocked on provisioning the Resend
   account/domain — an infrastructure decision, not a coding task.
+- **Superseded, 2026-11-04:** the next item describes the Worker-created
+  Deal, which ended on 2026-10-23. The webhook now opens the Deal on a
+  verified hold or payment; see DECISIONS.md 2026-11-04. Kept for the
+  record, and it still applies to a session that already has a
+  `crm_deal_id`.
 - **Deal-stage update not yet enqueued (new, 2026-09-17).**
   `crm_deal_id` capture (Cloudflare Worker → `filing_sessions.crm_deal_id`
   → Stripe metadata → `orders.crm_deal_id`) works once the frontend's

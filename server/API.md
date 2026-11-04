@@ -83,6 +83,16 @@ the Offer Master (`offers` table); see `server/migrations/0012_offer_master.sql`
 for the current catalog and `DECISIONS.md` for how it was populated (real,
 pre-existing Stripe test-mode objects, discovered not invented).
 
+An LLC filing order (`FASTTRACK`, `PREMIUM` or `DIY_STATE_FEE`) answers
+**422** with `code: "filing_authorization_required"` unless
+`filing_data.filing_authorization.accepted` is exactly `true`. The website
+writes that record at intake.
+
+Every session is card only. A held session shows the saved-card
+authorization above the pay button, and the order records the text Stripe
+reports it showed (`saved_card_authorization_text`) with the moment checkout
+completed (`saved_card_authorized_at`).
+
 Request:
 ```json
 {
@@ -152,9 +162,21 @@ Response:
   "failure_reason": null,
   "fulfillment_status": "not_ready",
   "total_cents": 13400,
-  "currency": "usd"
+  "currency": "usd",
+  "cancelled": false,
+  "cancelled_at": null,
+  "sunbiz_submitted_at": null,
+  "sunbiz_rejected_at": null
 }
 ```
+
+`cancelled` is what separates a cancelled order from a lapsed hold, because
+both can show `payment_status: "released"`. A lapsed hold that is not
+cancelled is still charged to the saved card after Florida confirms, so only
+`cancelled: true` may say "you pay nothing". `fulfillment_status` is
+`transmitted` while a filing is with Florida and `rejected` after a rejection.
+The reasons for a cancellation or a rejection are not returned, because anyone
+with the order id can read this response.
 
 ### `POST /api/webhooks/stripe`
 
@@ -162,16 +184,68 @@ Stripe-only (not called by the frontend). Verified via
 `Stripe-Signature`; idempotent on `stripe_webhook_events.id`. Handles
 `checkout.session.completed`, `checkout.session.async_payment_succeeded`,
 `checkout.session.async_payment_failed`, `checkout.session.expired`. On
-a paid order that includes an actual Sunbiz filing (`FASTTRACK`,
+a held or paid order that includes an actual Sunbiz filing (`FASTTRACK`,
 `PREMIUM`, or `DIY_STATE_FEE`), sets `orders.fulfillment_status='ready'`
-so the fulfillment worker picks it up; always enqueues exactly one
-`order_deal` (paid) or `abandoned_cart` (failed) CRM job.
+so the fulfillment worker picks it up; enqueues one `order_deal` job
+(`held_deal` opens the Deal at SERVICE REQUESTED on a verified hold,
+`paid_deal` opens it at Closed Won on a checkout payment) or one
+`abandoned_cart` job (failed). A session that already holds a
+`crm_deal_id` gets a `deal_stage_update` job instead of a second Deal.
+Also handles `payment_intent.succeeded` (order paid, held Deal moves to
+Closed Won), `payment_intent.canceled` and `charge.refunded`. See
+`DECISIONS.md`, 2026-11-04.
 
 **Configure in the Stripe Dashboard:** endpoint URL
 `https://llc-data-spine.onrender.com/api/webhooks/stripe`, events listed
 above.
 
 ---
+
+## Customer order emails
+
+Queued in `crm_sync_queue`, in the same transaction as the state they
+announce, and sent by `orderEmails/worker.ts` within about 30 seconds.
+
+| Email | Sent when | Queued by |
+|---|---|---|
+| Welcome, order confirmation, intake summary | Checkout completes, as a hold or a payment | `POST /api/webhooks/stripe` |
+| Could not charge the card | Any failed charge after filing, whatever Stripe answered | `POST /api/orders/:orderId/proof-of-filing`, `service-complete` |
+| Florida rejected the filing | The rejection is recorded, once per rejection | `POST /api/orders/:orderId/filing-rejected` |
+| Agent declined, or no answer in 7 days | The customer's own agent falls through | `POST /api/registered-agent/decline`, the card-hold poller |
+| Order cancelled | The order is cancelled | `POST /api/orders/:orderId/cancel` |
+
+The filing confirmation is not queued. It gates collection, so it is sent
+once, inline, by `POST /api/orders/:orderId/proof-of-filing`, and appears in
+the list below as `filing_confirmation`.
+
+Each email is queued at most once per order (the agent notice, once per agent
+asked). The worker decides at send time, from the order as it stands: a
+released, refunded, failed or cancelled order gets no hold wording, and the
+email is marked `skipped` with the reason in `last_error`. A test-mode order
+emails only reserved test addresses (`example.com`, `.test`, `.invalid` and
+similar). The Resend idempotency key is
+`order-email/<order_id>/<type>/<content hash>`, so a retry with the same
+content cannot send twice and a re-rendered retry is not refused. A failed
+send retries on the CRM backoff schedule, alerts on the first failure and when
+it gives up, and never affects payment or fulfilment.
+
+### `GET /api/orders/:orderId/emails`
+
+Operator only (`x-operator-key`). Shows what the customer was sent.
+
+```json
+{
+  "order_id": "uuid",
+  "emails": [
+    { "email_type": "welcome", "status": "sent", "attempts": 0, "last_error": null, "provider_message_id": "re_...", "sent_at": "2026-11-04T15:00:00.000Z" }
+  ]
+}
+```
+
+`status` is `pending` (queued or waiting to retry), `processing`, `sent`,
+`skipped` (deliberately not sent; `last_error` says why), `failed` (a filing
+confirmation that has not gone yet) or `dead_letter` (gave up; the customer
+did not get it, and the resend route below puts it back).
 
 ## EIN Filing Express capacity
 
@@ -208,7 +282,23 @@ email-provider credentials configured, so no email is actually sent (see
 `DECISIONS.md`). The frontend/ops needs its own way to deliver
 `acceptance_url` until that's built.
 
-### `POST /api/registered-agent/accept` — `{ "token": "..." }` → `{ "status": "accepted" }`
+### `POST /api/registered-agent/acceptance` — `{ "token": "..." }`
+
+Read-only. What the website's `/registered-agent/accept` page shows the agent.
+
+```json
+{ "status": "open", "llc_name": "...", "registered_agent_name": "...", "registered_agent_florida_address": "...", "expires_at": "2026-11-11T15:00:00.000Z" }
+```
+
+A link that has been used or has ended answers only `{ "status": "accepted" | "declined" | "expired" }`.
+A link for an agent the customer has since replaced reads as `expired`. An
+unknown token is a 404.
+
+### `POST /api/registered-agent/accept` — `{ "token": "...", "wording_version"?: "..." }` → `{ "status": "accepted" }`
+
+`wording_version` records the statement the agent agreed to on the website in
+`acceptance_version`, in place of the version stored when the link was emailed.
+
 ### `POST /api/registered-agent/decline` — `{ "token": "..." }` → `{ "status": "declined" }`
 ### `GET /api/registered-agent/status/:filingSessionId` → `{ "registered_agent_status": "accepted" | "pending" | ... | null }`
 
@@ -245,3 +335,158 @@ If the frontend needs a "is my document ready" signal, the closest
 available today is polling `GET /api/checkout/order/:orderId`'s
 `fulfillment_status` field — a document-download endpoint (signed,
 expiring URL per decision boundary #1) is not yet built.
+
+## `POST /api/orders/:orderId/proof-of-filing` (operator key)
+
+Body: `{ "document_number": "<Sunbiz document number, or the EIN for an
+EIN-only order>" }`. Records the proof, emails it to the customer, then
+collects the hold (or charges the saved card if the hold has lapsed).
+**Collection happens only after the email provider accepts the proof
+email.** If it does not, the route answers 502, nothing is collected, an
+ops alert goes out, and `orders.proof_delivery_error` holds the reason.
+Calling the route again retries; a proof already delivered is not sent
+twice. An EIN-only order gets a completion notice, not the EIN itself.
+
+This email is the filing confirmation, and the only one: the order email
+queue does not send it. It is refused for a test-mode order at a real
+address, so that order collects nothing.
+
+If the saved card is declined, the route answers 502 with
+`status: "saved_card_declined"`, the customer is emailed once to arrange
+another way to pay, and ops is alerted. Calling the route again tries the
+card again under a new Stripe idempotency key. After an unknown outcome
+(network failure, Stripe 5xx) the key stays the same, so a retry cannot
+charge twice.
+
+Any other failure to collect (a capture Stripe refuses, a Stripe error, no
+saved card) also answers 502, records `capture_error`, alerts ops and emails
+the customer once, with `customer_emailed` in the response. If Stripe's answer
+was unclear and the charge later appears, the email worker sees a paid order
+and does not send.
+
+Refused with 409, before anything is recorded, for a cancelled order, for an
+order with no filing in it, and for a Sunbiz filing that is not ready to
+confirm:
+
+| `code` | Meaning |
+|---|---|
+| `filing_not_submitted` | No submission is recorded |
+| `filing_rejected` | Florida rejected it and no resubmission is recorded |
+| `registered_agent_not_accepted` | The customer's own agent has not accepted |
+| `articles_pdf_missing` | No Articles PDF is stored for this order. A pre-payment copy does not count |
+
+An EIN-only order has no Sunbiz filing, so these four do not apply to it.
+
+Needs `RESEND_API_KEY` and `RESEND_FROM_EMAIL`, and migrations 0021 to 0024
+on the database. With either setting missing, nothing is collected.
+
+## `POST /api/orders/:orderId/submitted-to-sunbiz` (operator key)
+
+Body: `{ "tracking_number": "<Sunbiz tracking number>" }`. Damian has reviewed
+the order, filed it and paid Florida. Stores the number and the time, and sets
+`fulfillment_status` to `transmitted`. From here `/cancel` is refused and the
+registered agent can't be changed. The Sunbiz PIN is not stored.
+
+The order must be in `requires_review`, with its Articles stored and any
+customer agent accepted. Refused with 409 and `code`: `order_cancelled`,
+`registered_agent_not_accepted`, `articles_pdf_missing`, `filing_not_ready`,
+`filing_rejected` (use the resubmission route), `filing_confirmed`, or
+`filing_submitted` under a different tracking number. A repeat with the same
+number answers `already_submitted` and changes nothing.
+
+## `POST /api/orders/:orderId/filing-rejected` (operator key)
+
+Body: `{ "reason": "<why Florida rejected it>" }`. Sets `fulfillment_status`
+to `rejected`, records the reason and emails it to the customer as written, so
+write it for them. The hold or saved card is left as it is. Needs a submitted
+filing (`filing_not_submitted` otherwise). A repeat answers `already_rejected`
+and sends nothing further.
+
+From here the order is resubmitted, or closed with `/cancel`.
+
+## `POST /api/orders/:orderId/resubmitted-to-sunbiz` (operator key)
+
+Body: `{ "tracking_number"?: string, "corrections"?: { ... } }`. Call it once
+the customer has approved any change they were asked for and the correction is
+back with Florida. Sets `fulfillment_status` to `transmitted` again, so
+`/cancel` is refused again. `sunbiz_submitted_at` keeps the first submission.
+`within_60_days` in the response says whether the correction came within 60
+days of the rejection.
+
+Sunbiz keeps the tracking number on a correction, so it is optional.
+
+`corrections` writes changed filing details back, because the session route
+refuses them once an order stands. It takes `llc_name`, `principal_address`,
+`mailing_address`, `authorized_persons`, `effective_date_option`,
+`effective_date`, `annual_report_due_date` and `other_provisions`, and ignores
+anything else. Corrected Articles are generated and stored first: if they can't
+be built (422 `filing_data_incomplete`) or generated (502), nothing changes.
+
+409 `filing_not_rejected` on a filing that isn't rejected.
+
+## `POST /api/orders/:orderId/payment-received` (operator key)
+
+Body: `{ "method": "wire", "amount_cents": 49900, "reference"?: string }`.
+Records money received outside Stripe for everything still owed, after a card
+could not be charged. The order becomes `paid`, any hold still in place is
+released, no service charge follows, the Deal closes, and the saved card comes
+off at the next card sweep.
+
+Refused with 409 and `code`: `order_cancelled`; `filing_not_confirmed`, because
+nothing is due before Florida confirms; `charge_in_progress`;
+`already_collected`, when Stripe shows the hold was captured; `nothing_due`;
+`amount_mismatch`, with `amount_due_cents`.
+
+## `POST /api/orders/:orderId/service-complete` (operator key)
+
+Body: `{ "service_ref": "<the EIN that was issued>" }`. Charges the part of
+a formation order that was deferred until the service is complete, to the
+saved card, once, and only after the formation part was collected. A decline
+is handled as above. `service_ref` is kept on the order and never reaches
+Stripe metadata or an ops alert.
+
+## `POST /api/orders/:orderId/cancel` (operator key)
+
+Body: `{ "reason"?: string }`. For a customer who cancels, or a filing that
+cannot go ahead. Marks the order cancelled first, stops filing, ends any live
+agent link, closes the Deal, releases any hold and emails the customer. A
+cancelled order is never filed and its saved card is never charged, and the
+card comes off at the next card sweep. Refused with 409 and
+`code: "filing_submitted"` once the filing is submitted or confirmed, and for a
+paid order, which is a refund. If the release fails the route answers 502, and
+calling it again retries the release alone.
+
+A rejected filing is the exception to the submitted rule. `/cancel` is how a
+customer who won't correct it closes the order and pays nothing. Don't use
+`release-hold` for this: it leaves the order open and its saved card chargeable,
+and emails nobody.
+
+## `POST /api/orders/:orderId/emails/:emailType/resend` (operator key)
+
+Puts a dead-lettered customer email back in the queue with fresh attempts.
+The worker decides again from the order as it stands, so a resend cannot
+carry stale wording. 409 if nothing of that type is dead-lettered. For the
+filing confirmation, call proof of filing again instead.
+
+## Customer's own registered agent
+
+An order that is held or paid, and waiting for the customer's own agent:
+
+- **Accepts:** filing starts, on a held, paid or released order. A released
+  hold raises an ops alert, because filing then starts with no hold behind
+  it. The saved card is charged after Florida confirms.
+- **Declines, or no answer in 7 days:** the customer is emailed, ops is
+  alerted and the order stays open. The second case comes from the card-hold
+  poller.
+- **Customer names another agent:** `POST /registered-agent/select` asks the
+  new agent at once and answers `acceptance_email_sent`.
+- **Customer switches to Damian:** answers 409 with `required_offer_code`
+  unless the 3-year agent service is on a held or paid order.
+- **Customer cancels:** see above.
+
+## Saved card
+
+The card-hold poller detaches the saved card once an order closes: paid with
+no service charge to come, refunded, or cancelled. Refunds on earlier charges
+still work. A failure is retried on the next pass, with one ops alert. The
+Stripe key needs write access to PaymentMethods.

@@ -52,9 +52,9 @@ describe("createCheckoutSession", () => {
     expect(body).toContain("line_items%5B1%5D%5Bprice%5D=price_2");
     expect(body).toContain("client_reference_id=fs_abc");
     expect(body).toContain("mode=payment");
-    // Never sending payment_method_types keeps international cards working
-    // by default (frozen rule) — assert it's absent, not just unset.
-    expect(body).not.toContain("payment_method_types");
+    // Card only: a hold cannot sit on a delayed or pay-later method. Cards
+    // from any country are type card, so international customers still work.
+    expect(new URLSearchParams(body).getAll("payment_method_types[0]")).toEqual(["card"]);
   });
 
   it("throws StripeApiError with the Stripe error message on a non-2xx response", async () => {

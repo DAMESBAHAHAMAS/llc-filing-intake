@@ -1058,3 +1058,323 @@ widget created in Damian's Cloudflare account and the frontend sending
 its token, released together; the secret alone would block every customer.
 
 **Supersedes:** —
+
+---
+
+## 2026-11-04 — CRM Deal lifecycle as built: the verified hold opens the Deal, a collected hold closes it
+
+**Rule, as the code behaves:** intake creates no Deal (`llc-worker.js`,
+since `c54f608`, 23 Oct). The signed Stripe webhook opens the Deal: on a
+verified card hold for a filing order (`held_deal`, stage SERVICE
+REQUESTED, Payment_Status "Hold Placed"), or on a verified payment for an
+order charged at checkout (`paid_deal`, Closed Won). A held Deal moves to
+Closed Won only after the hold is collected (`payment_intent.succeeded`).
+A released hold keeps SERVICE REQUESTED with Payment_Status "Hold
+Released". A full refund moves the Deal to Closed Lost.
+
+**Rationale:** ADR-244 found two statements that no longer matched the
+code. `c54f608`'s comments said a Deal is created "only after verified
+payment", but the 30 Sep rule opens it on the hold, before any money is
+collected. The 2026-09-17 entry (item 4) still described the Worker
+creating the Deal at intake. Neither change altered behaviour, so this
+corrects the record. No Closed Won can appear before collection.
+
+**Residual:** `POST /api/session/stage` still accepts a client-supplied
+`crm_deal_id`, and `routes/webhooksStripe.ts` still honours it, for
+sessions that already hold one. The trust gap logged on 2026-09-17 stands;
+nothing legitimate sends a new id now that the Worker returns `deal_id: null`.
+
+**Implemented by:** the comment and document corrections on branch
+`claude/checkout-consistency`, and `server/test/dealLifecycle.test.ts`.
+
+**Supersedes:** item 4 of "2026-09-17 — Ported the deferred-until-payment
+registered-agent email...", on who creates the Deal. That entry stays as
+written. Its `deal_stage_update` mechanism remains for sessions that
+already hold a Deal id.
+
+---
+
+## 2026-11-04 — A held payment is not collected until proof of filing has been delivered to the customer
+
+**Rule:** Damian's rule of 29 Sep is "funds are collected only after proof
+of filing is delivered". The code recorded the proof and captured in one
+request, and told the customer nothing. `POST
+/api/orders/:orderId/proof-of-filing` now emails the proof first and
+collects only once the email provider accepts the message. If delivery
+fails, nothing is collected, the route answers 502, an ops alert goes out,
+and the reason is stored in `orders.proof_delivery_error`. This covers both
+collection paths: capturing the hold and charging the saved card.
+
+**Proof means:** the Sunbiz document number of the filed Articles, as the
+2026-09-30 entry defines it. An EIN-only order gets a completion notice
+without the EIN.
+
+**Rationale:** ADR-244 found that `db5a162` left the customer with nothing
+before capture, while its comment described a post-payment customer link
+that does not exist. The comment also assumed payment comes before the
+document, which is the Gate 2 order the 2026-09-30 entry superseded.
+
+**Limits:** "delivered" means Resend accepted the message, not that it
+reached the inbox. An order with no customer email cannot be collected
+through this route. The customer still has no way to get a copy of the
+Articles PDF: its storage and serving target is the open boundary 1
+(2026-09-09), so this entry does not build that link.
+
+**Deploy order:** migration 0021 must reach the live database before this
+code, and `RESEND_API_KEY` and `RESEND_FROM_EMAIL` must be set. If either
+is missing, the failure is safe: nothing is collected.
+
+**Implemented by:** `server/src/proofDelivery/deliverProof.ts`,
+`server/src/routes/orders.ts`, migration 0021, on branch
+`claude/checkout-consistency`.
+
+**Supersedes:** nothing in the 2026-09-30 rule, which this enforces. It
+replaces the sequence in `db5a162`'s comment in
+`server/src/routes/filingDocument.ts`.
+## 2026-11-04 — Customer order emails run through crm_sync_queue, sent by their own worker
+
+**What exists now (branch `claude/customer-order-emails`):** four
+transactional emails in `server/src/orderEmails/`. Welcome, order
+confirmation and intake summary are queued by the Stripe webhook when
+checkout completes. Before this, a paying customer received nothing from this service: the only
+Resend senders were the registered-agent acceptance email, ops alerts and
+the Scorecard.
+
+**Rationale:** the frozen rule keeps email out of the webhook handler, and
+the rule for the queue is that a job commits with the state it follows.
+`crm_sync_queue` already has backoff and dead letters, so no migration was
+needed. Jobs use `sync_type` `customer_email_<type>`; `sync/worker.ts` skips
+them, so a mail failure never changes `crm_sync_status`. One email per order
+is enforced by `NOT EXISTS` under the order's row lock, plus a Resend
+idempotency key for a retry after a lost response. Queueing sits behind a
+savepoint, so it cannot abort the payment transaction.
+
+**Wording:** payment lines follow the published Terms
+(`PaymentCancellationRefunds` in florida-business-launchpad). Disclaimer as
+approved under R #231. An EIN-only order records the EIN as its proof; that
+number is not emailed. The filing confirmation is no longer queued: see the
+"Payment release candidate" entry below.
+
+**Supersedes:** —
+## 2026-10-02 — Services after the LLC filing are charged when complete; hold line at checkout
+
+**Decision (Damian, in chat, 2 Oct 2026 14:45 ET, "yes ... to all three"):**
+the three wording decisions in the Scorecard Launch Drafts doc. Decision 3
+changes the card-hold build: "Services such as EIN filing are charged when
+that service is complete, using the card you checked out with."
+
+**Build:** at checkout the hold still covers the whole order. A formation
+order with an EIN records `orders.deferred_cents` (migration 0022). At proof
+of filing, `POST /api/orders/:id/proof-of-filing` collects only
+`total - deferred` (Stripe partial capture releases the rest of the hold; the
+saved-card fallback charges the same reduced amount). When the EIN is issued,
+`POST /api/orders/:id/service-complete {service_ref}` charges the deferred
+amount to the saved card, once (idempotency key per order), and only after
+the formation part was collected. Its PaymentIntent carries
+`metadata.kind = deferred_service`; the webhook records it on the order
+(`deferred_charged_at`) and never changes the order's own payment state, and a
+refund of that charge alone is left to Stripe. An EIN-only order is
+unchanged: its whole total is collected when the EIN is issued.
+
+Held formation orders also show the approved line above Stripe's pay button
+(`custom_text.submit.message`): "Your card is held, not charged. We charge it
+only after your Florida LLC is filed. If filing takes more than 7 days, we
+charge this card once it's filed."
+
+**Verified:** 102 tests pass against a fresh Postgres 16 with migrations
+0001–0019 (numbered 0022 since, because 0019 is the Scorecard migration on main), including partial capture, the reduced saved-card fallback, the
+service charge (once, never before filing), and the webhook handling.
+**Not yet verified:** a partial capture and a deferred charge against Stripe
+test mode.
+
+## 2026-11-04 — Payment release candidate: one filing confirmation, holds that survive their outcomes, and migration numbers
+
+**Damian's rule, stated for this work:** he pays Sunbiz first, and the
+customer's card is charged only after Florida confirms the filing with a
+document number. Wording target: the "No Payment Until Confirmation" draft of
+4 Nov 2026.
+
+**Branch:** `claude/payment-release-candidate` brings PR #7, PR #8 and
+`claude/charge-ein-when-issued` together with regular merges. Draft, not
+merged, not deployed.
+
+**Migration numbers.** `LIVE-PAYMENTS-CHECKLIST.md` (website repo) reserves
+0020 for `0020_offer_master_live_prices.sql`, so the reservation stands and the
+drafts moved: PR #8's proof delivery is 0021, the EIN migration is 0022 (it was
+0019, which main already uses for the Scorecard tables), and this work is 0023.
+The runner applies any unapplied file in filename order, so a later 0020 still
+runs. These numbers apply only to migrations that had not reached main.
+
+**One filing confirmation.** There is one, it goes through the gate in
+`proofDelivery/deliverProof.ts`, and collection happens only after the provider
+accepts it. PR #7's queued `filing_confirmation` is gone, and its template is
+now the only one, so the wording and the redaction are shared. This replaces
+the part of the 2026-11-04 customer-emails entry that queued it, which has been
+edited because that entry had not reached main.
+
+**Queued emails decide at send time.** A retry can run hours after it was
+queued, so the worker reads the order first. Released, refunded, failed and
+cancelled orders get no hold wording; the job is marked `skipped` with the
+reason. A hold since collected says charged. The stored `payment_mode` is no
+longer read for wording.
+
+**A held order and its registered agent.** Acceptance advances held orders,
+which is nearly all of them. A released hold advances too: the agent can take
+the full 7 days a hold lasts, and the customer authorized the saved card for
+that case. That needed `orders_fulfillment_requires_paid` widened (0023), and
+it raises an ops alert, because Damian then pays Sunbiz with no hold behind the
+order and the saved card can still decline. A decline, or 7 days of silence,
+emails the customer and alerts ops, and the order stays open.
+
+**Switching to Damian.** Advancing held orders would otherwise let a customer
+whose agent declined switch to Damian without the 3-year service. The select
+route now refuses that with 409 and `required_offer_code`, as checkout does.
+
+**Cancelling.** `POST /api/orders/:id/cancel` is an operator route, because
+customers cancel by email. It marks the order before calling Stripe, so nothing
+can file it or charge it meanwhile. This is what separates a cancelled order
+from a lapsed hold: only a cancelled order is barred from the saved card.
+`release-hold` alone still leaves the order open.
+
+**Saved-card retries.** Stripe stores declines under an idempotency key, so
+each decline moves to a new attempt number. An unknown outcome keeps the key,
+because a new key after a lost response could charge twice. For the same
+reason the saved card is now used only when Stripe says the hold really ended:
+`payment_intent_unexpected_state` also means already captured.
+
+**Recording the authorization.** Stripe records no acceptance for
+`custom_text`. The completed session does report the exact text shown, so the
+order keeps that with the moment checkout completed. A required tick box
+(`consent_collection.terms_of_service`) would record acceptance properly, but
+needs a Terms URL in the Stripe account and adds a step, so that is left for
+Damian.
+
+**Detaching.** The card comes off the Customer once the order closes, because
+the customer agreed "we use the saved card only for this order". The card-hold
+poller does it, since a webhook must not call out inside its transaction.
+The live restricted key needs PaymentMethods write, not read.
+
+**A test-mode event never emails a real address.** Only reserved domains pass.
+A `+test` tag does not, because that still reaches a real inbox.
+
+**Rationale:** each item above is a defect found reviewing PR #7 and PR #8, or
+a gap between the code and the customer promise. Tested in Stripe test mode on
+isolated PGlite; results are in the draft PR for this branch.
+
+**Not decided here, for Damian:** the wording questions listed in that PR.
+
+**Supersedes:** the filing confirmation part of the 2026-11-04 customer-emails
+entry. The 2026-10-02 hold line stays, and moves below the pay button.
+
+## 2026-11-04 — Filing roles, and recording what happens to a filing after checkout
+
+**Filing roles (Damian, 4 Nov, register #180).** Damian files the first 10
+orders online after reviewing and approving them. The registered agent is
+Damian only when the filer selects him; otherwise it is the client's own
+Florida agent, who must accept. Damian pays Florida first, and the card is
+charged after Florida confirms with a document number.
+
+**Submission is recorded on the order.** `POST
+/api/orders/:id/submitted-to-sunbiz` stores the tracking number and time and
+sets `fulfillment_status = 'transmitted'`, which nothing had ever written.
+`/cancel` was already refused in that state, so "you can cancel any time until
+we submit" now holds. The first submission time stays when a filing is
+corrected, because a correction in time keeps the original filing date. The
+Sunbiz PIN is not stored: it stays out of a table the application reads.
+
+**Rejection is a state, not an email.** `filing-rejected` sets `rejected` and
+tells the customer why. It leaves the hold or saved card alone, because a
+correction can still end in a charge. `/cancel` works from `rejected`, and is
+the only way to "release any hold and you pay nothing": `release-hold` leaves
+the order open and chargeable. A resubmission goes back to `transmitted`.
+
+**Proof of filing is gated.** It is refused unless the order is submitted, any
+customer agent has accepted, and Articles are stored under this order. A
+pre-payment PDF does not count, since it can predate a correction. The gates are
+the same when submission is recorded, so a filing that can't be proved can't be
+marked filed. EIN-only orders have no Sunbiz filing, so they skip them. Delivery
+before collection is unchanged.
+
+**One filing order per session.** A session is one LLC. A second filing is
+refused while an earlier one stands, with `order_already_open`. An order with
+no filing in it stays allowed, because buying the 3-year agent service alone is
+how a customer whose own agent fell through switches to Damian. An EIN-only hold
+waits until the filing closes. An unfinished checkout is expired at Stripe and
+replaced, so two open tabs cannot make two holds and a customer who backed out
+of Stripe can still check out. Stripe refusing the expiry is how we learn the
+customer paid in the other tab before its webhook arrived.
+
+**The filing details lock once an order stands (MIR-321).** `POST
+/api/session/stage` refuses a filing_data change with `filing_data_locked` on a
+held, paid or lapsed filing order. A repeat of what is stored is allowed and
+writes nothing, since the browser never sends the keys the agent routes add. A
+cancelled order unlocks. Two paths stay open on purpose: naming a new agent,
+until the filing is with Florida, and the operator's `corrections` on a
+resubmission, which also regenerates the Articles. Without that, a corrected
+name could not be recorded and the filing confirmation would name the one
+Florida rejected.
+
+**No card is held for Articles that can't be built.** Checkout runs the same
+validator as the PDF, except for agent acceptance, which can't exist yet.
+`filing_data_incomplete` lists the fields. The validator also refuses a P.O. Box
+for the agent, so a saved one stops here even though `/registered-agent/select`
+only reports it. Every order reaching `requires_review` now alerts ops.
+
+**Every failed charge emails the customer.** The promise doesn't depend on why
+the card failed. After an unclear Stripe answer the charge may yet appear; the
+worker then finds a paid order and skips the email. `payment-received` records
+money received another way, for everything still owed, and is refused if Stripe
+shows the money was taken.
+
+**Rationale:** each item is a sentence in the customer promise that the code did
+not yet make true, found in the release candidate review of 4 Nov.
+
+**Not decided here, for Damian:** the wording and pricing questions in that
+review, including the EIN charged separately from the LLC and the FastTrack $98
+conflict. Neither is changed by this entry.
+
+**Supersedes:** nothing is reversed. This adds to the 2026-11-04 payment release
+candidate entry.
+
+## 2026-11-04 — Finding: Stripe test runs write to the deployed database
+
+The Stripe test account has an enabled webhook endpoint at
+`https://llc-data-spine.onrender.com/api/webhooks/stripe`. Every test event for
+the subscribed types reaches it, including events from runs that use a local
+database. The handler inserts into `stripe_webhook_events` before it looks up
+the order, so a signed event leaves a row there with the full event payload,
+even when the result is `order_not_found`. The earlier note that these events
+"end as `order_not_found`" left that out.
+
+Seen on 4 Nov: Stripe reported the events delivered. The row itself was inferred
+from the 2xx and the code, not read from the database.
+
+**Decision:** none yet. A local "isolated" run is not isolated while that
+endpoint is enabled. Whether to accept these rows, turn the endpoint off for a
+run, or use a separate Stripe sandbox is Damian's call. Until then, a Stripe test
+run on this account breaks the "no writes to a deployed database" rule.
+
+**Rationale:** recorded so the next run does not repeat this by accident.
+
+**Supersedes:** nothing.
+
+## 2026-11-04 — The agent's acceptance page reads its details by token and records the wording
+
+The website's `/registered-agent/accept` page has to show the agent what they
+are accepting, and no route gave it that. `POST /api/registered-agent/acceptance`
+now answers with the LLC name, agent name, address and expiry for a live token,
+and only a status for a used, expired or replaced one. It writes nothing, and it
+is a POST so the token stays out of request logs. The details match what the
+email already sends to the same address.
+
+`POST /api/registered-agent/accept` takes an optional `wording_version`, stored
+in `acceptance_version`. Florida's online form has the agent's acceptance typed
+as a name, and Damian does the typing, so the record has to show the agent agreed
+to that as well as to the appointment. The accept and decline behaviour is
+otherwise unchanged. The route in `acceptanceEmail.ts`,
+`/registered-agent/accept?token=`, matches the page, so the email did not change.
+
+**Rationale:** `s. 605.0113` needs the agent's acceptance, and the Division treats
+typing a name without permission as forgery (`SUNBIZ-FILING-PLAN.md`).
+
+**Supersedes:** nothing.

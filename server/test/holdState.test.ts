@@ -98,3 +98,15 @@ describe("requiresPayAfterFiling / holdsEnabled", () => {
     else process.env.PAYMENT_CAPTURE_MODE = prev;
   });
 });
+
+describe("classifyCheckoutCompletion and how the order asked to be paid", () => {
+  it("treats unpaid as a hold only when the order did not ask for immediate payment", () => {
+    expect(classifyCheckoutCompletion("unpaid", "pi_1", "pending", "hold")).toBe("authorized");
+    expect(classifyCheckoutCompletion("unpaid", "pi_1", "pending", null)).toBe("authorized");
+    expect(classifyCheckoutCompletion("unpaid", "pi_1", "pending", "immediate")).toBe("ignore");
+  });
+
+  it("records a settled delayed payment as paid", () => {
+    expect(classifyCheckoutCompletion("paid", "pi_1", "pending", "immediate")).toBe("paid");
+  });
+});

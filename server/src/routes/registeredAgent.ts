@@ -1,8 +1,10 @@
 import { Router } from "express";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
-import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
+import { notifyAgentProblem, openFilingOrders } from "../registeredAgent/customerNotice.js";
+import { sendOpsAlert } from "../ops/alerts.js";
+import { looksLikePoBox } from "../registeredAgent/poBox.js";
 
 export const registeredAgentRouter = Router();
 
@@ -42,32 +44,49 @@ async function mergeIntoFilingData(filingSessionId: string, patch: Record<string
   }
 }
 
-/**
- * Re-evaluates a single already-paid order's fulfillment_status after
- * registered_agent_status changes to 'accepted' — the other half of the
- * gate routes/webhooksStripe.ts applies at payment time (see that
- * file's own registered-agent-gate comment). A no-op for an unpaid order
- * (nothing to unblock yet) or one that doesn't actually need Sunbiz
- * filing at all.
- */
-async function reevaluateFulfillmentAfterAcceptance(filingSessionId: string): Promise<void> {
-  const { rows } = await pool.query<{
-    order_id: string;
-    payment_status: string;
-    fulfillment_status: string;
-    line_items: Array<{ offer_code?: string }>;
-  }>(
-    `SELECT order_id, payment_status, fulfillment_status, line_items
-     FROM orders WHERE filing_session_id = $1`,
+/** The agent is on the Articles Florida already holds. A rejected filing is
+ *  the exception, because it comes back to be corrected. */
+async function filingAtFlorida(filingSessionId: string): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `SELECT 1 FROM orders
+     WHERE filing_session_id = $1 AND cancelled_at IS NULL AND sunbiz_submitted_at IS NOT NULL AND fulfillment_status <> 'rejected'
+     LIMIT 1`,
     [filingSessionId]
   );
-  for (const order of rows) {
-    if (order.payment_status !== "paid" || order.fulfillment_status !== "not_ready") continue;
-    if (!needsSunbizFiling(order.line_items ?? [])) continue;
-    await pool.query(
-      `UPDATE orders SET fulfillment_status = 'ready', fulfillment_ready_at = now() WHERE order_id = $1`,
+  return (rowCount ?? 0) > 0;
+}
+
+const FILING_AT_FLORIDA = {
+  error: "this filing has been submitted to Florida, so its registered agent can no longer be changed here",
+  code: "filing_submitted",
+};
+
+/**
+ * Starts filing on any order that was waiting for its registered agent,
+ * after registered_agent_status changes to 'accepted' — the other half of
+ * the gate routes/webhooksStripe.ts applies at payment time (see that
+ * file's own registered-agent-gate comment). Most orders are held, not
+ * paid, by this point: the card is charged only after Florida confirms.
+ *
+ * A released hold still files. The agent can take the full 7 days a hold
+ * lasts, and the customer authorized the saved card for exactly that case;
+ * it is charged after Florida confirms (routes/orders.ts). Ops hears about
+ * it, because Damian is paying Sunbiz with no hold behind the order. A
+ * cancelled order never files.
+ */
+async function reevaluateFulfillmentAfterAcceptance(filingSessionId: string): Promise<void> {
+  for (const order of await openFilingOrders(pool, filingSessionId)) {
+    const started = await pool.query(
+      `UPDATE orders SET fulfillment_status = 'ready', fulfillment_ready_at = now()
+       WHERE order_id = $1 AND fulfillment_status = 'not_ready' AND cancelled_at IS NULL`,
       [order.order_id]
     );
+    if (started.rowCount && order.payment_status === "released") {
+      await sendOpsAlert(
+        "Filing started with no hold in place",
+        `Order ${order.order_id}: the registered agent accepted after the card hold ended. Filing is starting. The saved card is charged after Florida confirms, and it can still decline.`
+      );
+    }
   }
 }
 
@@ -96,7 +115,30 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
   }
 
   try {
+    if (await filingAtFlorida(filingSessionId)) {
+      res.status(409).json(FILING_AT_FLORIDA);
+      return;
+    }
+
     if (agentChoice === "damian") {
+      // A customer whose own agent fell through can switch to Damian, but
+      // the 3-year service then has to be on an order, same as at checkout.
+      if ((await openFilingOrders(pool, filingSessionId)).length) {
+        const agentService = await pool.query(
+          `SELECT 1 FROM orders
+            WHERE filing_session_id = $1 AND payment_status IN ('paid', 'authorized')
+              AND line_items @> '[{"offer_code":"REGISTERED_AGENT_3YR"}]'::jsonb
+            LIMIT 1`,
+          [filingSessionId]
+        );
+        if (!agentService.rowCount) {
+          res.status(409).json({
+            error: "registered agent service is required when Damian Knowles is the registered agent",
+            required_offer_code: "REGISTERED_AGENT_3YR",
+          });
+          return;
+        }
+      }
       // Path A (house RA): pdf/context.ts always stamps
       // HOUSE_REGISTERED_AGENT server-side regardless of filing_data, so
       // there's nothing to validate — this just records the choice and
@@ -136,7 +178,7 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
     if (!email) errors.push("registered agent email is required");
     else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.push("registered agent email is invalid");
     if (!street) errors.push("registered agent street address is required");
-    else if (/p\.?o\.?\s*box/i.test(street)) errors.push("P.O. Boxes are not allowed for the registered agent address");
+    else if (looksLikePoBox(street) || looksLikePoBox(unit)) errors.push("P.O. Boxes are not allowed for the registered agent address");
     if (!city) errors.push("registered agent city is required");
     if (!state) errors.push("registered agent state is required");
     if (!zip) errors.push("registered agent ZIP is required");
@@ -161,6 +203,15 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
     );
     if (!llcNameRow.rows[0]?.filing_data?.llc_name?.trim()) {
       errors.push("llc_name must be set before selecting a registered agent");
+    }
+
+    // The normal send happens when payment is confirmed. On an order that
+    // is already held or paid no such event is coming, so a replacement
+    // agent is asked here.
+    if (!errors.length && (await openFilingOrders(pool, filingSessionId)).length) {
+      const sent = await dispatchAcceptanceEmail(pool, filingSessionId);
+      res.status(200).json({ status: sent.ok ? "acceptance_requested" : "pending", acceptance_email_sent: sent.ok });
+      return;
     }
 
     res.status(200).json({ status: "pending", validationErrors: errors.length ? errors : undefined });
@@ -202,6 +253,10 @@ registeredAgentRouter.post("/api/registered-agent/request-acceptance", async (re
       res.status(404).json({ error: "unknown filing_session_id" });
       return;
     }
+    if (await filingAtFlorida(filingSessionId)) {
+      res.status(409).json(FILING_AT_FLORIDA);
+      return;
+    }
 
     // registered_agent_florida_address may already be set (e.g. this
     // session already went through POST /registered-agent/select) — do
@@ -216,6 +271,10 @@ registeredAgentRouter.post("/api/registered-agent/request-acceptance", async (re
       typeof body.registered_agent_florida_address === "string" && body.registered_agent_florida_address.trim()
         ? body.registered_agent_florida_address.trim()
         : existingAddress;
+    if (looksLikePoBox(address)) {
+      res.status(400).json({ error: "P.O. Boxes are not allowed for the registered agent address" });
+      return;
+    }
 
     await mergeIntoFilingData(filingSessionId, {
       registered_agent_path: "customer",
@@ -263,13 +322,83 @@ async function resolveActionableAcceptance(token: string) {
   return { found: true as const, actionable: true as const, row };
 }
 
-/** POST /api/registered-agent/accept — { token } */
+/**
+ * POST /api/registered-agent/acceptance — { token }
+ *
+ * What the website's accept page shows the agent before they answer: the same
+ * facts as the email, and nothing about the customer. Read-only, so opening
+ * the link (or a mail scanner following it) changes nothing. POST keeps the
+ * token out of request logs. An asked agent who has been replaced has nothing
+ * to accept, so that link reads as expired.
+ */
+registeredAgentRouter.post("/api/registered-agent/acceptance", async (req, res) => {
+  const token = typeof (req.body as Record<string, unknown>)?.token === "string" ? (req.body as Record<string, unknown>).token as string : "";
+  if (!token) {
+    res.status(400).json({ error: "token is required" });
+    return;
+  }
+
+  try {
+    const { rows } = await pool.query<{
+      status: string;
+      requested_at: Date | string | null;
+      registered_agent_name: string;
+      filing_data: Record<string, unknown> | null;
+    }>(
+      `SELECT a.status, a.requested_at, a.registered_agent_name, s.filing_data
+       FROM registered_agent_acceptances a JOIN filing_sessions s ON s.filing_session_id = a.filing_session_id
+       WHERE a.acceptance_token_id = $1`,
+      [token]
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "unknown or invalid token" });
+      return;
+    }
+
+    const row = rows[0];
+    if (row.status === "accepted" || row.status === "declined") {
+      res.status(200).json({ status: row.status });
+      return;
+    }
+    const filingData = row.filing_data ?? {};
+    const expiresAt = row.requested_at ? new Date(new Date(row.requested_at).getTime() + ACCEPTANCE_TOKEN_TTL_MS) : null;
+    const stillAsked =
+      row.status === "acceptance_requested" &&
+      (!expiresAt || expiresAt.getTime() > Date.now()) &&
+      filingData.registered_agent_path === "customer" &&
+      filingData.registered_agent_name === row.registered_agent_name;
+    if (!stillAsked) {
+      res.status(200).json({ status: "expired" });
+      return;
+    }
+    res.status(200).json({
+      status: "open",
+      llc_name: filingData.llc_name,
+      registered_agent_name: row.registered_agent_name,
+      registered_agent_florida_address: filingData.registered_agent_florida_address,
+      expires_at: expiresAt,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "acceptance lookup failed", detail: describeError(err) });
+  }
+});
+
+/**
+ * POST /api/registered-agent/accept — { token, wording_version? }
+ *
+ * wording_version names the statement the agent agreed to on the website,
+ * including permission to enter their name on the filing. It replaces the
+ * version stored when the link was emailed, so the row records the words
+ * actually accepted.
+ */
 registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
   const token = typeof (req.body as Record<string, unknown>)?.token === "string" ? (req.body as Record<string, unknown>).token as string : "";
   if (!token) {
     res.status(400).json({ error: "token is required" });
     return;
   }
+  const wordingVersion = (req.body as Record<string, unknown>).wording_version;
+  const acceptedWording = typeof wordingVersion === "string" && /^[a-z0-9-]{1,64}$/.test(wordingVersion) ? wordingVersion : null;
 
   try {
     const resolved = await resolveActionableAcceptance(token);
@@ -284,8 +413,10 @@ registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
 
     const clientIp = req.ip ?? req.socket.remoteAddress ?? null;
     await pool.query(
-      `UPDATE registered_agent_acceptances SET status = 'accepted', accepted_at = now(), accepted_ip = $2 WHERE id = $1`,
-      [resolved.row.id, clientIp]
+      `UPDATE registered_agent_acceptances
+       SET status = 'accepted', accepted_at = now(), accepted_ip = $2, acceptance_version = COALESCE($3, acceptance_version)
+       WHERE id = $1`,
+      [resolved.row.id, clientIp, acceptedWording]
     );
     await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'accepted' WHERE filing_session_id = $1`, [
       resolved.row.filing_session_id,
@@ -293,8 +424,8 @@ registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
 
     // Best-effort, post-commit-equivalent: the acceptance itself is
     // already durable regardless of what happens here. A failure just
-    // means an already-paid order stays not_ready a little longer than
-    // it should — nothing is lost.
+    // means an order stays not_ready a little longer than it should —
+    // nothing is lost.
     try {
       await reevaluateFulfillmentAfterAcceptance(resolved.row.filing_session_id);
     } catch (err) {
@@ -330,6 +461,16 @@ registeredAgentRouter.post("/api/registered-agent/decline", async (req, res) => 
     await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'declined' WHERE filing_session_id = $1`, [
       resolved.row.filing_session_id,
     ]);
+
+    // Best-effort, as above: the decline is already durable, and the agent
+    // sweep repeats this if it fails.
+    try {
+      for (const order of await openFilingOrders(pool, resolved.row.filing_session_id)) {
+        await notifyAgentProblem(pool, order, String(resolved.row.id), "declined");
+      }
+    } catch (err) {
+      console.error(`Decline notice failed for filing_session_id=${resolved.row.filing_session_id}:`, describeError(err));
+    }
 
     res.status(200).json({ status: "declined" });
   } catch (err) {
