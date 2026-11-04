@@ -95,7 +95,7 @@ beforeEach(async () => {
   );
 });
 
-async function deliver(event: { id: string; type: string; data: { object: Record<string, unknown> } }) {
+async function deliver(event: { id: string; type: string; livemode?: boolean; data: { object: Record<string, unknown> } }) {
   const body = JSON.stringify(event);
   const t = Math.floor(Date.now() / 1000);
   const v1 = createHmac("sha256", WEBHOOK_SECRET).update(`${t}.${body}`, "utf8").digest("hex");
@@ -155,11 +155,10 @@ describe("when the card hold is placed", () => {
       expect(message.from).toBe("Orders <orders@example.com>");
     }
     expect(resend.send.mock.calls[1][0].text).toContain("A hold is not a charge");
-    expect(resend.send.mock.calls.map(([, options]) => options.idempotencyKey)).toEqual([
-      `order-email/${orderId}/welcome`,
-      `order-email/${orderId}/order_confirmation`,
-      `order-email/${orderId}/intake_summary`,
-    ]);
+    const keys = resend.send.mock.calls.map(([, options]) => options.idempotencyKey as string);
+    expect(keys[0]).toMatch(new RegExp(`^order-email/${orderId}/welcome/[0-9a-f]{16}$`));
+    expect(keys[1]).toMatch(new RegExp(`^order-email/${orderId}/order_confirmation/[0-9a-f]{16}$`));
+    expect(keys[2]).toMatch(new RegExp(`^order-email/${orderId}/intake_summary/[0-9a-f]{16}$`));
     expect((await emailJobs()).map((j) => j.status)).toEqual(["synced", "synced", "synced"]);
   });
 
@@ -173,7 +172,7 @@ describe("when the card hold is placed", () => {
   it("describes a charge when the card was charged at checkout", async () => {
     await deliver(paidEvent());
     await runOnce(state.db, realOrderEmailSender);
-    expect(resend.send.mock.calls[1][0].text).toContain("We charged $249.00 to your card at checkout.");
+    expect(resend.send.mock.calls[1][0].text).toContain("We charged $249.00 at checkout.");
   });
 
   it("does not resend on a duplicate webhook", async () => {
@@ -225,11 +224,12 @@ describe("when a send fails", () => {
 
     // Backing off: nothing due yet, then the retry goes through with the same key.
     expect(await runOnce(state.db, realOrderEmailSender)).toBe(0);
+    const firstKey = resend.send.mock.calls[0][1].idempotencyKey;
     resend.send.mockReset();
     resend.send.mockImplementation(async () => ({ data: { id: "re_ok" }, error: null }));
     await makeDue();
     await runOnce(state.db, realOrderEmailSender);
-    expect(resend.send.mock.calls[0][1].idempotencyKey).toBe(`order-email/${orderId}/welcome`);
+    expect(resend.send.mock.calls[0][1].idempotencyKey).toBe(firstKey);
     expect((await operatorEmails()).json.emails[0]).toMatchObject({ status: "sent", provider_message_id: "re_ok", last_error: null });
   });
 
@@ -321,54 +321,243 @@ describe("when proof of filing is recorded", () => {
     resend.send.mockClear();
   });
 
-  it("requests collection and sends the filing confirmation with the Sunbiz document number", async () => {
+  it("sends the one filing confirmation before it collects, not from the queue", async () => {
+    const order: string[] = [];
+    resend.send.mockImplementation(async () => {
+      order.push("email accepted");
+      return { data: { id: "re_filing" }, error: null };
+    });
+    stripe.capture.mockImplementation(async () => {
+      order.push("captured");
+      return { id: "pi_hold", status: "succeeded" };
+    });
+
     const r = await proof();
     expect(r.json.status).toBe("collection_requested");
-    expect(stripe.capture).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(["email accepted", "captured"]);
 
-    await runOnce(state.db, realOrderEmailSender);
     const [message, options] = resend.send.mock.calls[0];
     expect(message.subject).toBe("Your LLC is filed: Sol Ventures LLC");
     expect(message.text).toContain("Sunbiz document number: L26000123456");
     expect(message.text).toContain("We are now collecting payment");
-    expect(options.idempotencyKey).toBe(`order-email/${orderId}/filing_confirmation`);
+    expect(options.idempotencyKey).toBe(`proof-of-filing/${orderId}`);
+
+    expect(await runOnce(state.db, realOrderEmailSender)).toBe(0);
+    expect(resend.send).toHaveBeenCalledTimes(1);
+    expect((await emailJobs()).map((j) => j.sync_type)).not.toContain("customer_email_filing_confirmation");
   });
 
   it("does not send a second confirmation on a repeat call", async () => {
     await proof();
-    await runOnce(state.db, realOrderEmailSender);
     await proof("L26000999999");
-    expect(await runOnce(state.db, realOrderEmailSender)).toBe(0);
     expect(resend.send).toHaveBeenCalledTimes(1);
+    expect(await runOnce(state.db, realOrderEmailSender)).toBe(0);
   });
 
-  it("still tells the customer the LLC is filed when collection fails", async () => {
-    stripe.capture.mockRejectedValue(new Error("stripe unavailable"));
-    expect((await proof()).status).toBe(502);
-    await runOnce(state.db, realOrderEmailSender);
-    expect(sentSubjects()).toEqual(["Your LLC is filed: Sol Ventures LLC"]);
-  });
-
-  it("never lets a failed send block collection", async () => {
+  it("collects nothing while the provider refuses the confirmation", async () => {
     resend.send.mockImplementation(async () => ({ data: null, error: { message: "down" } }));
-    const r = await proof();
-    expect(r.json.status).toBe("collection_requested");
-    await runOnce(state.db, realOrderEmailSender);
-    expect(stripe.capture).toHaveBeenCalledTimes(1);
-    expect((await operatorEmails()).json.emails.at(-1)).toMatchObject({ email_type: "filing_confirmation", status: "pending", attempts: 1 });
+    expect((await proof()).status).toBe(502);
+    expect(stripe.capture).not.toHaveBeenCalled();
+    expect((await operatorEmails()).json.emails.at(-1)).toMatchObject({ email_type: "filing_confirmation", status: "failed", last_error: "Resend send failed: down" });
+  });
+
+  it("shows the delivered confirmation to the operator", async () => {
+    await proof();
+    expect((await operatorEmails()).json.emails.at(-1)).toMatchObject({ email_type: "filing_confirmation", status: "sent" });
   });
 
   it("confirms an order paid at checkout, without talking about collection", async () => {
-    await state.db.query(`UPDATE orders SET payment_status = 'paid'`);
+    await state.db.query(`UPDATE orders SET payment_status = 'paid', authorized_at = NULL`);
     expect((await proof()).json.status).toBe("already_paid");
-    await runOnce(state.db, realOrderEmailSender);
     expect(resend.send.mock.calls[0][0].text).toContain("You paid for this order at checkout.");
   });
 
   it("sends nothing for an order with nothing paid or held", async () => {
     await state.db.query(`UPDATE orders SET payment_status = 'failed', fulfillment_status = 'not_ready'`);
     expect((await proof()).status).toBe(409);
-    expect(await runOnce(state.db, realOrderEmailSender)).toBe(0);
+    expect(resend.send).not.toHaveBeenCalled();
+  });
+
+  it("refuses an order with no filing in it, and records no proof", async () => {
+    await state.db.query(`UPDATE orders SET line_items = $1`, [JSON.stringify([{ offer_code: "REGISTERED_AGENT_3YR" }])]);
+    expect((await proof()).status).toBe(409);
+    expect(resend.send).not.toHaveBeenCalled();
+    expect((await state.db.query(`SELECT proof_of_filing_at FROM orders`)).rows[0].proof_of_filing_at).toBeNull();
+  });
+});
+
+describe("the order as it stands at send time", () => {
+  beforeEach(() => deliver(holdEvent()));
+
+  it.each(["released", "refunded", "failed"])("sends no hold wording for a %s order", async (status) => {
+    await state.db.query(`UPDATE orders SET payment_status = $1, fulfillment_status = 'not_ready'`, [status]);
+    expect(await runOnce(state.db, realOrderEmailSender)).toBe(3);
+    expect(resend.send).not.toHaveBeenCalled();
+    const jobs = await emailJobs();
+    expect(jobs.map((j) => j.status)).toEqual(["skipped", "skipped", "skipped"]);
+    expect(jobs[0].last_error).toBe(`order is ${status}`);
+    expect(alerts.send).not.toHaveBeenCalled();
+    expect((await operatorEmails()).json.emails[0]).toMatchObject({ status: "skipped", last_error: `order is ${status}` });
+  });
+
+  it("describes a charge, not a hold, once the hold has been collected", async () => {
+    await state.db.query(`UPDATE orders SET payment_status = 'paid'`);
+    await runOnce(state.db, realOrderEmailSender);
+    const text = resend.send.mock.calls[1][0].text as string;
+    expect(text).toContain("We charged your card for this order.");
+    expect(text).not.toMatch(/hold/i);
+  });
+
+  it("sends nothing on a cancelled order", async () => {
+    await state.db.query(`UPDATE orders SET cancelled_at = now()`);
+    await runOnce(state.db, realOrderEmailSender);
+    expect(resend.send).not.toHaveBeenCalled();
+    expect((await emailJobs())[0].last_error).toBe("order is cancelled");
+  });
+});
+
+describe("the saved-card authorization", () => {
+  const text = "By completing checkout, you authorize us to keep your card on file with Stripe.";
+
+  it("is recorded on the order from what the completed session showed", async () => {
+    const event = holdEvent();
+    (event.data.object as Record<string, unknown>).custom_text = { submit: { message: text } };
+    await deliver({ ...event, livemode: false } as never);
+    const { rows } = await state.db.query(`SELECT saved_card_authorized_at, saved_card_authorization_text, stripe_livemode FROM orders`);
+    expect(rows[0].saved_card_authorization_text).toBe(text);
+    expect(rows[0].saved_card_authorized_at).toBeTruthy();
+    expect(rows[0].stripe_livemode).toBe(false);
+  });
+
+  it("is not recorded when the session showed none", async () => {
+    await deliver(holdEvent());
+    const { rows } = await state.db.query(`SELECT saved_card_authorized_at FROM orders`);
+    expect(rows[0].saved_card_authorized_at).toBeNull();
+  });
+});
+
+describe("delayed payment methods", () => {
+  const delayedOrder = () => state.db.query(`UPDATE orders SET capture_mode = 'immediate'`);
+
+  it("treats unpaid on a no-hold order as not secured: no hold, no email", async () => {
+    await delayedOrder();
+    await deliver(holdEvent());
+    expect(await orderRow()).toMatchObject({ payment_status: "pending" });
+    expect(await emailJobs()).toHaveLength(0);
+  });
+
+  it("emails charge wording, never hold wording, when the payment settles", async () => {
+    await delayedOrder();
+    await deliver(holdEvent());
+    await deliver(paidEvent("evt_settled", "checkout.session.async_payment_succeeded"));
+    await runOnce(state.db, realOrderEmailSender);
+    const text = resend.send.mock.calls[1][0].text as string;
+    expect(text).toContain("We charged $249.00 at checkout.");
+    expect(text).not.toMatch(/hold/i);
+  });
+});
+
+describe("test-mode Stripe events", () => {
+  it("never email a real address", async () => {
+    await state.db.query(`UPDATE filing_sessions SET email = 'real.person@gmail.com'`);
+    await deliver({ ...holdEvent(), livemode: false } as never);
+    await runOnce(state.db, realOrderEmailSender);
+    expect(resend.send).not.toHaveBeenCalled();
+    expect((await emailJobs()).map((j) => j.status)).toEqual(["skipped", "skipped", "skipped"]);
+    expect((await emailJobs())[0].last_error).toMatch(/test-mode order/);
+  });
+
+  it("collect nothing at a real address, because the confirmation cannot go", async () => {
+    await state.db.query(`UPDATE filing_sessions SET email = 'real.person@gmail.com'`);
+    await deliver({ ...holdEvent(), livemode: false } as never);
+    expect((await proof()).status).toBe(502);
+    expect(resend.send).not.toHaveBeenCalled();
+    expect(stripe.capture).not.toHaveBeenCalled();
+  });
+
+  it("do email a reserved test address", async () => {
+    await deliver({ ...holdEvent(), livemode: false } as never);
+    await runOnce(state.db, realOrderEmailSender);
+    expect(resend.send).toHaveBeenCalledTimes(3);
+  });
+
+  it("a live event emails any address", async () => {
+    await state.db.query(`UPDATE filing_sessions SET email = 'real.person@gmail.com'`);
+    await deliver({ ...holdEvent(), livemode: true } as never);
+    await runOnce(state.db, realOrderEmailSender);
+    expect(resend.send).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("a retry whose content changed", () => {
+  it("is a new send, not a provider refusal that ends in a false give-up alert", async () => {
+    // Resend refuses a known key with different content, and replays it with the same content.
+    const seen = new Map<string, string>();
+    resend.send.mockImplementation(async (message: { text: string }, options: { idempotencyKey: string }) => {
+      const earlier = seen.get(options.idempotencyKey);
+      if (earlier && earlier !== message.text) return { data: null, error: { message: "invalid_idempotent_request" } };
+      seen.set(options.idempotencyKey, message.text);
+      return { data: { id: "re_ok" }, error: null };
+    });
+    await deliver(holdEvent());
+    const first = await runOnce(state.db, realOrderEmailSender);
+    expect(first).toBe(3);
+
+    // The first attempt reached Resend, but its answer was lost.
+    await state.db.query(`UPDATE crm_sync_queue SET status = 'pending', run_after = now() WHERE sync_type = 'customer_email_order_confirmation'`);
+    await state.db.query(`UPDATE orders SET payment_status = 'paid'`);
+    await runOnce(state.db, realOrderEmailSender);
+
+    expect((await emailJobs())[1]).toMatchObject({ status: "synced", last_error: null });
+    expect(alerts.send).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/orders/:orderId/emails/:emailType/resend", () => {
+  const resend_ = async (type: string, key: string | null = OPERATOR_KEY) => {
+    const res = await fetch(`${base}/api/orders/${orderId}/emails/${type}/resend`, { method: "POST", headers: key ? { "x-operator-key": key } : {} });
+    return { status: res.status, json: (await res.json()) as Record<string, unknown> };
+  };
+  const giveUp = async () => {
+    resend.send.mockImplementation(async () => ({ data: null, error: { message: "still failing" } }));
+    await deliver(holdEvent());
+    for (let i = 0; i < 6; i++) {
+      await runOnce(state.db, realOrderEmailSender);
+      await makeDue();
+    }
+    resend.send.mockReset();
+    resend.send.mockImplementation(async () => ({ data: { id: "re_second" }, error: null }));
+  };
+
+  it("needs the operator key", async () => {
+    expect((await resend_("welcome", null)).status).toBe(401);
+  });
+
+  it("sends a dead-lettered email again, under its own key", async () => {
+    await giveUp();
+    const r = await resend_("order_confirmation");
+    expect(r.json).toMatchObject({ status: "queued", requeued: 1 });
+    await runOnce(state.db, realOrderEmailSender);
+    expect(sentSubjects()).toEqual(["Order confirmation for Sol Ventures LLC"]);
+    expect(resend.send.mock.calls[0][1].idempotencyKey).toMatch(/\/resend-1\//);
+    expect((await operatorEmails()).json.emails[1]).toMatchObject({ status: "sent", attempts: 0, last_error: null });
+  });
+
+  it("still checks the order, so a resend cannot carry stale hold wording", async () => {
+    await giveUp();
+    await state.db.query(`UPDATE orders SET payment_status = 'released', fulfillment_status = 'not_ready'`);
+    await resend_("order_confirmation");
+    await runOnce(state.db, realOrderEmailSender);
+    expect(resend.send).not.toHaveBeenCalled();
+    expect((await operatorEmails()).json.emails[1]).toMatchObject({ status: "skipped" });
+  });
+
+  it("refuses an email that is not dead-lettered, and the filing confirmation", async () => {
+    await deliver(holdEvent());
+    await runOnce(state.db, realOrderEmailSender);
+    expect((await resend_("welcome")).status).toBe(409);
+    expect((await resend_("filing_confirmation")).status).toBe(409);
+    expect((await resend_("nonsense")).status).toBe(400);
   });
 });
 

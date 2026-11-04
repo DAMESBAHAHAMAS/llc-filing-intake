@@ -1,23 +1,27 @@
 import { describe, expect, it, vi } from "vitest";
-import {
-  deliverProofToCustomer,
-  DISCLAIMER,
-  realProofEmailSender,
-  renderProofEmail,
-  type ProofEmail,
-  type ProofEmailSender,
-  type ProofOrderRow,
-} from "../src/proofDelivery/deliverProof.js";
+import { deliverProofToCustomer, renderProofEmail, type ProofOrderRow } from "../src/proofDelivery/deliverProof.js";
+import { realOrderEmailSender, type OrderEmailMessage, type OrderEmailSender } from "../src/orderEmails/sender.js";
+import { DISCLAIMER } from "../src/orderEmails/templates.js";
 
 const row: ProofOrderRow = {
   order_id: "ord-1",
   line_items: [{ offer_code: "FASTTRACK" }],
+  total_cents: 19900,
   proof_of_filing_ref: "L26000123456",
   proof_delivered_at: null,
   email: "founder@example.com",
   full_name: "Ana Maria Silva",
+  phone: null,
+  country: null,
   entity_name_primary: "Fallback Name LLC",
+  entity_name_backup: null,
   filing_data: { llc_name: "Sol Ventures LLC" },
+  registered_agent_status: "accepted",
+  payment_status: "authorized",
+  authorized_at: new Date(),
+  cancelled_at: null,
+  deferred_charged_at: null,
+  stripe_livemode: true,
 };
 
 function fakePool(found: ProofOrderRow | null) {
@@ -31,8 +35,8 @@ function fakePool(found: ProofOrderRow | null) {
 }
 
 function recordingSender(result: { ok: boolean; providerMessageId?: string; error?: string } = { ok: true, providerMessageId: "msg_1" }) {
-  const sent: ProofEmail[] = [];
-  const sender: ProofEmailSender = {
+  const sent: OrderEmailMessage[] = [];
+  const sender: OrderEmailSender = {
     send: vi.fn(async (message) => {
       sent.push(message);
       return result;
@@ -112,7 +116,7 @@ describe("renderProofEmail", () => {
     for (const body of [e.text, e.html]) {
       expect(body).toContain("L26000123456");
       expect(body).toContain("Sol Ventures LLC");
-      expect(body).toContain("Hello Ana,");
+      expect(body).toContain("Hi Ana,");
       expect(body).toContain(DISCLAIMER);
     }
   });
@@ -134,12 +138,12 @@ describe("renderProofEmail", () => {
   });
 });
 
-describe("realProofEmailSender", () => {
+describe("realOrderEmailSender", () => {
   it("fails clearly when Resend is not configured", async () => {
     const saved = { key: process.env.RESEND_API_KEY, from: process.env.RESEND_FROM_EMAIL };
     delete process.env.RESEND_API_KEY;
     delete process.env.RESEND_FROM_EMAIL;
-    const r = await realProofEmailSender.send({ to: "a@example.com", subject: "s", text: "t", html: "h", idempotencyKey: "k" });
+    const r = await realOrderEmailSender.send({ to: "a@example.com", subject: "s", text: "t", html: "h", idempotencyKey: "k" });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/not configured/);
     if (saved.key !== undefined) process.env.RESEND_API_KEY = saved.key;

@@ -28,7 +28,7 @@ const row = (over: Partial<OrderEmailRow> = {}): OrderEmailRow => ({
   ...over,
 });
 
-const ALL: OrderEmailType[] = ["welcome", "order_confirmation", "intake_summary", "filing_confirmation"];
+const ALL: OrderEmailType[] = ["welcome", "order_confirmation", "intake_summary", "filing_confirmation", "payment_problem", "agent_action_needed", "order_cancelled"];
 
 describe("every order email", () => {
   it.each(ALL)("%s carries the approved disclaimer in text and html, and has no selling content", (type) => {
@@ -92,9 +92,10 @@ describe("order confirmation", () => {
   it("says a hold is not a charge and repeats the published payment terms", () => {
     const { subject, text } = buildOrderEmail("order_confirmation", row(), "hold");
     expect(subject).toBe("Order confirmation for Sol Ventures LLC");
-    expect(text).toContain("We placed a hold of $249.00 on your card. A hold is not a charge: no money leaves your account.");
-    expect(text).toContain("after the Florida Division of Corporations has filed your Articles of Organization");
-    expect(text).toContain("A card hold lasts about 7 days.");
+    expect(text).toContain("We placed a hold of $249.00 on your card. A hold is not a charge: the amount is reserved, not collected.");
+    expect(text).toContain("only after the Florida Division of Corporations confirms that your LLC has been filed");
+    expect(text).toContain("Holds last about 7 days. If your hold ends before Florida confirms your filing, we charge the card you authorized at checkout once, for the order total, after Florida confirms it.");
+    expect(text).toContain("You can cancel any time until we submit your filing. We release any hold still in place and you pay nothing.");
     expect(text).toContain("To cancel, reply to this email.");
     expect(text).toContain("FastTrack LLC Filing: $199.00");
     expect(text).toContain("Total: $249.00");
@@ -102,8 +103,14 @@ describe("order confirmation", () => {
 
   it("states a charge, not a hold, when the card was charged at checkout", () => {
     const { text } = buildOrderEmail("order_confirmation", row(), "paid");
-    expect(text).toContain("We charged $249.00 to your card at checkout.");
+    expect(text).toContain("We charged $249.00 at checkout.");
     expect(text).not.toMatch(/hold/i);
+  });
+
+  it("says when a later service is charged", () => {
+    const { text } = buildOrderEmail("order_confirmation", row({ deferred_cents: 7500 }), "hold");
+    expect(text).toContain("Services such as EIN filing are charged when that service is complete, using the card you checked out with.");
+    expect(buildOrderEmail("order_confirmation", row(), "hold").text).not.toContain("EIN");
   });
 
   it("does not promise a state filing on an EIN-only hold", () => {
@@ -158,6 +165,24 @@ describe("intake summary", () => {
   });
 });
 
+describe("an order with no filing in it", () => {
+  const noFiling = row({
+    line_items: [{ offer_code: "REGISTERED_AGENT_3YR", display_name: "Registered Agent, 3 years", unit_amount_cents: 9800, quantity: 1 }],
+    total_cents: 9800,
+    filing_data: { registered_agent_path: "house" },
+  });
+
+  it.each(["welcome", "order_confirmation", "intake_summary"] as OrderEmailType[])("%s has no filing wording", (type) => {
+    const { subject, text } = buildOrderEmail(type, noFiling, "paid");
+    expect(`${subject} ${text}`).not.toMatch(/\bfil(e|ing|ed)\b|Sunbiz|Articles/i);
+  });
+
+  it("an EIN-only order keeps its filing wording", () => {
+    const ein = row({ line_items: [{ offer_code: "EIN_FILING", display_name: "EIN Filing", unit_amount_cents: 7500, quantity: 1 }], total_cents: 7500 });
+    expect(buildOrderEmail("intake_summary", ein, "hold").text).toContain("before we file");
+  });
+});
+
 describe("filing confirmation", () => {
   it("gives the Sunbiz document number and says payment is now being collected", () => {
     const { subject, text, html } = buildOrderEmail("filing_confirmation", row(), "hold");
@@ -173,6 +198,10 @@ describe("filing confirmation", () => {
     expect(text).not.toContain("now collecting");
   });
 
+  it("says the EIN comes later when one is deferred", () => {
+    expect(buildOrderEmail("filing_confirmation", row({ deferred_cents: 7500 }), "hold").text).toContain("Services such as EIN filing are charged when that service is complete");
+  });
+
   it("keeps an EIN out of the email on an EIN-only order", () => {
     const { text, subject } = buildOrderEmail(
       "filing_confirmation",
@@ -182,5 +211,49 @@ describe("filing confirmation", () => {
     expect(subject).toBe("Your filing is complete");
     expect(text).not.toContain("3456789");
     expect(text).not.toContain("Sunbiz");
+  });
+});
+
+describe("saved card failure", () => {
+  it("asks the customer to arrange another way to pay, and says the amount", () => {
+    const { subject, text } = buildOrderEmail("payment_problem", row(), "hold", { amountCents: 24900 });
+    expect(subject).toBe("We could not charge your card");
+    expect(text).toContain("for $249.00");
+    expect(text).toContain("arrange another way to pay");
+    expect(text).toContain("does not affect the filing for Sol Ventures LLC");
+  });
+});
+
+describe("registered agent problems", () => {
+  const own = {
+    filing_data: { llc_name: "Sol Ventures LLC", registered_agent_path: "customer", registered_agent_name: "Rae Agent" },
+    registered_agent_status: "declined",
+  };
+
+  it("says the agent declined, and offers another agent or cancelling", () => {
+    const { subject, text } = buildOrderEmail("agent_action_needed", row(own), "hold", { agentProblem: "declined" });
+    expect(subject).toBe("Your registered agent declined: Sol Ventures LLC");
+    expect(text).toContain("Rae Agent declined");
+    expect(text).toContain("name another agent, or to cancel");
+    expect(text).toContain("If you cancel, you pay nothing.");
+    expect(text).toContain("no P.O. Box");
+  });
+
+  it("says the agent has not accepted within 7 days", () => {
+    const { subject, text } = buildOrderEmail("agent_action_needed", row(own), "hold", { agentProblem: "not_accepted" });
+    expect(subject).toBe("Your registered agent has not accepted: Sol Ventures LLC");
+    expect(text).toContain("within 7 days");
+  });
+
+  it("does not promise nothing to pay on an order already paid", () => {
+    expect(buildOrderEmail("agent_action_needed", row(own), "paid", { agentProblem: "declined" }).text).not.toContain("you pay nothing");
+  });
+});
+
+describe("cancelled order", () => {
+  it("says any hold is released and nothing is owed", () => {
+    const { subject, text } = buildOrderEmail("order_cancelled", row(), "hold");
+    expect(subject).toBe("Your order is cancelled: Sol Ventures LLC");
+    expect(text).toContain("We released any hold still in place and you pay nothing.");
   });
 });

@@ -4,8 +4,8 @@ import type { Pool } from "pg";
 /**
  * In-memory stand-in for the tables the order emails touch, using the
  * columns as the migrations leave them. pg-mem cannot run the migrations
- * themselves (plpgsql triggers) and has no SAVEPOINT or SKIP LOCKED, so
- * those two are removed here; real lock behaviour is covered by
+ * themselves (plpgsql triggers) and has no SAVEPOINT, SKIP LOCKED or IS
+ * DISTINCT FROM, so those are adapted here; real lock behaviour is covered by
  * syncWorker.integration.test.ts, which shares the claim pattern. pg-mem
  * also returns the row from ON CONFLICT DO NOTHING RETURNING when it
  * skipped the insert, so the webhook's event-id check is answered here.
@@ -31,11 +31,34 @@ const SCHEMA = `
     stripe_payment_intent_id text,
     payment_status text NOT NULL DEFAULT 'pending',
     fulfillment_status text NOT NULL DEFAULT 'not_ready',
-    fulfillment_ready_at timestamptz,
+    fulfillment_ready_at timestamptz, fulfillment_started_at timestamptz, fulfillment_run_after timestamptz,
+    fulfillment_attempts integer NOT NULL DEFAULT 0, fulfillment_last_error text,
     paid_at timestamptz, authorized_at timestamptz,
     crm_deal_id text,
     proof_of_filing_ref text, proof_of_filing_at timestamptz,
-    capture_error text
+    proof_delivered_at timestamptz, proof_delivery_message_id text, proof_delivery_error text,
+    capture_error text, capture_mode text, stripe_livemode boolean,
+    saved_card_authorized_at timestamptz, saved_card_authorization_text text,
+    saved_card_attempts integer NOT NULL DEFAULT 0, saved_card_payment_intent_id text,
+    deferred_cents integer NOT NULL DEFAULT 0, deferred_service_ref text, deferred_payment_intent_id text,
+    deferred_requested_at timestamptz, deferred_charged_at timestamptz, deferred_charge_error text,
+    deferred_attempts integer NOT NULL DEFAULT 0,
+    cancelled_at timestamptz, cancellation_reason text,
+    saved_card_detached_at timestamptz, saved_card_detach_error text,
+    created_at timestamptz NOT NULL DEFAULT now()
+  );
+  CREATE TABLE registered_agent_acceptances (
+    id bigserial PRIMARY KEY,
+    filing_session_id uuid NOT NULL,
+    status text NOT NULL,
+    requested_at timestamptz,
+    registered_agent_name text,
+    registered_agent_email text,
+    acceptance_token_id text,
+    acceptance_version text,
+    accepted_at timestamptz,
+    accepted_ip text,
+    created_at timestamptz NOT NULL DEFAULT now()
   );
   CREATE TABLE crm_sync_queue (
     id bigserial PRIMARY KEY,
@@ -63,7 +86,7 @@ const SCHEMA = `
 
 function adapt(sql: string): string {
   if (/^\s*(SAVEPOINT|RELEASE SAVEPOINT|ROLLBACK TO SAVEPOINT)\b/i.test(sql)) return "SELECT 1";
-  return sql.replace(/FOR UPDATE SKIP LOCKED/g, "FOR UPDATE");
+  return sql.replace(/FOR UPDATE SKIP LOCKED/g, "FOR UPDATE").replace(/IS DISTINCT FROM 'accepted'/g, "<> 'accepted'");
 }
 
 type Runner = { query: (sql: string, params?: never) => Promise<{ rows: unknown[]; rowCount: number | null }> };

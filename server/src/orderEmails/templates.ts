@@ -1,6 +1,8 @@
+import { LATER_SERVICES_LINE, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { HOUSE_REGISTERED_AGENT } from "../pdf/types.js";
 import { escapeHtml } from "../registeredAgent/emailSender.js";
+import { addressText, customerText, phoneText } from "./redact.js";
 
 /**
  * The customer's order emails. Transactional only: no offers, no links to
@@ -10,12 +12,30 @@ import { escapeHtml } from "../registeredAgent/emailSender.js";
  *
  * Every email goes through render(), which always adds DISCLAIMER and
  * produces text and html from the same content, as the registered-agent
- * template does.
+ * template does. The filing confirmation is sent only by
+ * proofDelivery/deliverProof.ts, never from the queue, so there is one.
  */
-export type OrderEmailType = "welcome" | "order_confirmation" | "intake_summary" | "filing_confirmation";
+export type OrderEmailType =
+  | "welcome"
+  | "order_confirmation"
+  | "intake_summary"
+  | "filing_confirmation"
+  | "payment_problem"
+  | "agent_action_needed"
+  | "order_cancelled";
 
-/** "hold": a card hold, collected after filing. "paid": collected at checkout. */
-export type PaymentMode = "hold" | "paid";
+/** "hold": a card hold, collected after filing. "paid": collected at
+ *  checkout. "collected": a hold or saved card that has since been charged. */
+export type PaymentMode = "hold" | "paid" | "collected";
+
+/** Why the customer is being asked to name another registered agent. */
+export type AgentProblem = "declined" | "not_accepted";
+
+export interface OrderEmailExtras {
+  /** What a saved-card charge tried to collect (payment_problem). */
+  amountCents?: number;
+  agentProblem?: AgentProblem;
+}
 
 export const DISCLAIMER = "Damian Knowles is a Business Developer, not a law firm or attorney, and does not provide legal advice.";
 const REPLY_LINE = "Questions? Reply to this email.";
@@ -25,6 +45,7 @@ export interface OrderEmailRow {
   order_id: string;
   line_items: Array<{ offer_code?: string; display_name?: string; unit_amount_cents?: number; quantity?: number }> | null;
   total_cents: number;
+  deferred_cents?: number | null;
   proof_of_filing_ref: string | null;
   email: string | null;
   full_name: string | null;
@@ -46,6 +67,10 @@ interface OrderEmailContext {
   orderId: string;
   paymentMode: PaymentMode;
   sunbizFiling: boolean;
+  /** Any filing at all, state or federal. Registered Agent or Credentials Kit orders have none. */
+  anyFiling: boolean;
+  /** An EIN on a formation order, charged when it is complete. */
+  laterService: boolean;
   items: Array<{ name: string; quantity: number; cents: number }>;
   totalCents: number;
   documentNumber: string;
@@ -71,16 +96,7 @@ export interface RenderedEmail {
   html: string;
 }
 
-const SSN_OR_ITIN = /\b\d{3}-\d{2}-\d{4}\b|\b\d{3} \d{2} \d{4}\b|\b\d{9}\b/g;
-const CARD_NUMBER = /\b\d(?:[ -]?\d){12,18}\b/g;
 const ARTICLE_IV_TITLES: Record<string, string> = { AMBR: "Member", MGR: "Manager" };
-
-/** Customer-typed text is echoed back, so a tax ID or card number typed
- *  into a free-text box must not travel by email. */
-function customerText(value: unknown): string {
-  if (typeof value !== "string") return "";
-  return value.replace(CARD_NUMBER, "[removed]").replace(SSN_OR_ITIN, "[removed]").trim();
-}
 
 function money(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`;
@@ -101,6 +117,8 @@ function buildContext(row: OrderEmailRow, paymentMode: PaymentMode): OrderEmailC
     orderId: row.order_id,
     paymentMode,
     sunbizFiling: needsSunbizFiling(lineItems),
+    anyFiling: requiresPayAfterFiling(lineItems),
+    laterService: Number(row.deferred_cents ?? 0) > 0,
     items: lineItems.map((li) => ({
       name: customerText(li.display_name) || "Item",
       quantity: li.quantity ?? 1,
@@ -110,24 +128,24 @@ function buildContext(row: OrderEmailRow, paymentMode: PaymentMode): OrderEmailC
     documentNumber: row.proof_of_filing_ref ?? "",
     customerName: customerText(row.full_name),
     email: row.email ?? "",
-    phone: customerText(row.phone),
+    phone: phoneText(row.phone),
     country: customerText(row.country),
     llcName: customerText(data.llc_name) || customerText(row.entity_name_primary),
     backupName: customerText(row.entity_name_backup),
-    principalAddress: customerText(data.principal_address),
-    mailingAddress: customerText(data.mailing_address),
+    principalAddress: addressText(data.principal_address),
+    mailingAddress: addressText(data.mailing_address),
     effectiveDate: effectiveOption === "Immediate" ? "When filed" : [effectiveOption, effectiveDate].filter(Boolean).join(": "),
     otherProvisions: customerText(data.other_provisions),
     people: people.map((p) => ({
       name: customerText(p.name),
       title: ARTICLE_IV_TITLES[customerText(p.article_iv_title)] ?? customerText(p.article_iv_title),
-      address: customerText(p.address),
+      address: addressText(p.address),
     })),
     agentName: house ? HOUSE_REGISTERED_AGENT.name : customerAgent ? customerText(data.registered_agent_name) : "",
     agentAddress: house
       ? HOUSE_REGISTERED_AGENT.florida_address
       : customerAgent
-        ? customerText(data.registered_agent_florida_address)
+        ? addressText(data.registered_agent_florida_address)
         : "",
     agentAcceptancePending: customerAgent && row.registered_agent_status !== "accepted",
   };
@@ -194,7 +212,9 @@ function welcome(ctx: OrderEmailContext): RenderedEmail {
         "We file your Articles of Organization with the State of Florida through Sunbiz.",
         "We email your filing confirmation with your Sunbiz document number.",
       ]
-    : ["We review what you submitted.", "We start work on your order and email you when it is complete."];
+    : ctx.anyFiling
+      ? ["We review what you submitted.", "We start work on your order and email you when it is complete."]
+      : ["We review your order.", "We email you if we need anything from you."];
 
   return render(ctx.sunbizFiling ? `Welcome. We have your order for ${company}` : "Welcome. We have your order", [
     greeting(ctx),
@@ -208,20 +228,21 @@ function welcome(ctx: OrderEmailContext): RenderedEmail {
 
 function paymentTerms(ctx: OrderEmailContext): Block[] {
   const total = money(ctx.totalCents);
-  if (ctx.paymentMode === "paid") {
-    return [p(`We charged ${total} to your card at checkout.`), p(REPLY_LINE)];
-  }
+  const later = ctx.laterService ? [p(LATER_SERVICES_LINE)] : [];
+  if (ctx.paymentMode === "paid") return [p(`We charged ${total} at checkout.`), p(REPLY_LINE)];
+  if (ctx.paymentMode === "collected") return [p(`We charged your card for this order.`), ...later, p(REPLY_LINE)];
   const charged = ctx.sunbizFiling
-    ? "We charge your card only after the Florida Division of Corporations has filed your Articles of Organization. We email your filing confirmation when we do."
+    ? "We charge the order total only after the Florida Division of Corporations confirms that your LLC has been filed, and we send you your filing confirmation."
     : "We charge your card only after your filing is complete. We email you when it is.";
   const lapse = ctx.sunbizFiling
-    ? "A card hold lasts about 7 days. If your filing is not complete by then, the hold drops off and we charge the same card once your LLC is filed."
-    : "A card hold lasts about 7 days. If your filing is not complete by then, the hold drops off and we charge the same card once it is complete.";
+    ? "Holds last about 7 days. If your hold ends before Florida confirms your filing, we charge the card you authorized at checkout once, for the order total, after Florida confirms it."
+    : "Holds last about 7 days. If your hold ends before your filing is complete, we charge the card you authorized at checkout once, for the order total, after it is complete.";
   return [
-    p(`We placed a hold of ${total} on your card. A hold is not a charge: no money leaves your account.`),
+    p(`We placed a hold of ${total} on your card. A hold is not a charge: the amount is reserved, not collected.`),
     p(charged),
     p(lapse),
-    p("You can cancel any time before we submit your filing. We release the hold and you are not charged. To cancel, reply to this email."),
+    ...later,
+    p("You can cancel any time until we submit your filing. We release any hold still in place and you pay nothing. To cancel, reply to this email."),
   ];
 }
 
@@ -260,7 +281,7 @@ function intakeSummary(ctx: OrderEmailContext): RenderedEmail {
 
   return render(ctx.sunbizFiling ? `Please check what you submitted for ${company}` : "Please check what you submitted", [
     greeting(ctx),
-    p("This is what you gave us. Please check it now. If anything is wrong, reply to this email before we file."),
+    p(`This is what you gave us. Please check it now. If anything is wrong, reply to this email${ctx.anyFiling ? " before we file" : ""}.`),
     ...(ctx.sunbizFiling ? [p("Florida does not allow a submitted filing to be withdrawn.")] : []),
     heading("Your details"),
     rows([
@@ -285,12 +306,15 @@ function filingConfirmation(ctx: OrderEmailContext): RenderedEmail {
   const payment =
     ctx.paymentMode === "paid"
       ? "You paid for this order at checkout."
-      : "We are now collecting payment for this order from the card you used at checkout, as your order confirmation explained.";
+      : ctx.paymentMode === "collected"
+        ? "We have collected payment for this order."
+        : "We are now collecting payment for this order from the card you used at checkout, as your order confirmation explained.";
+  const later = ctx.laterService ? [p(LATER_SERVICES_LINE)] : [];
 
   // An EIN-only order records the EIN as its proof (routes/orders.ts). That
   // number stays out of email, and it is not a Sunbiz document number.
   if (!ctx.sunbizFiling) {
-    return render("Your filing is complete", [greeting(ctx), p("Your filing for this order is complete."), p(payment), p(REPLY_LINE)]);
+    return render("Your filing is complete", [greeting(ctx), p("Your filing for this order is complete."), rows([["Order number", ctx.orderId]]), p(payment), p(REPLY_LINE)]);
   }
 
   const company = companyLabel(ctx);
@@ -303,11 +327,51 @@ function filingConfirmation(ctx: OrderEmailContext): RenderedEmail {
     ]),
     p("You can look up your company on sunbiz.org with this number."),
     p(payment),
+    ...later,
     p(REPLY_LINE),
   ]);
 }
 
-export function buildOrderEmail(type: OrderEmailType, row: OrderEmailRow, paymentMode: PaymentMode): RenderedEmail {
+/** After filing, the saved card failed. Wording follows the customer
+ *  promise: "If your card can't be charged, we'll email you to arrange
+ *  another way to pay." */
+function paymentProblem(ctx: OrderEmailContext, extras: OrderEmailExtras): RenderedEmail {
+  const amount = money(extras.amountCents ?? ctx.totalCents);
+  return render("We could not charge your card", [
+    greeting(ctx),
+    p(`We tried to charge the card you authorized at checkout for ${amount}, and the charge did not go through.`),
+    ...(ctx.sunbizFiling ? [p(`This does not affect the filing for ${companyLabel(ctx)}.`)] : []),
+    p("Please reply to this email so we can arrange another way to pay."),
+    rows([["Order number", ctx.orderId]]),
+  ]);
+}
+
+/** The customer's own agent declined, or has not accepted within 7 days. */
+function agentActionNeeded(ctx: OrderEmailContext, extras: OrderEmailExtras): RenderedEmail {
+  const company = companyLabel(ctx);
+  const agent = ctx.agentName || "Your registered agent";
+  const declined = extras.agentProblem === "declined";
+  return render(declined ? `Your registered agent declined: ${company}` : `Your registered agent has not accepted: ${company}`, [
+    greeting(ctx),
+    p(declined ? `${agent} declined to be the registered agent for ${company}.` : `${agent} has not accepted the registered agent role for ${company} within 7 days.`),
+    p("We cannot file until a registered agent accepts. Your order stays open."),
+    p("Please reply to this email to name another agent, or to cancel."),
+    p("The agent must be a Florida resident, or a business authorized in Florida, with a physical Florida street address (no P.O. Box), and must accept before we can file."),
+    ...(ctx.paymentMode === "hold" ? [p("If you cancel, you pay nothing.")] : []),
+    rows([["Order number", ctx.orderId]]),
+  ]);
+}
+
+function orderCancelled(ctx: OrderEmailContext): RenderedEmail {
+  return render(ctx.sunbizFiling ? `Your order is cancelled: ${companyLabel(ctx)}` : "Your order is cancelled", [
+    greeting(ctx),
+    p("We have cancelled your order. We released any hold still in place and you pay nothing."),
+    rows([["Order number", ctx.orderId]]),
+    p(REPLY_LINE),
+  ]);
+}
+
+export function buildOrderEmail(type: OrderEmailType, row: OrderEmailRow, paymentMode: PaymentMode, extras: OrderEmailExtras = {}): RenderedEmail {
   const ctx = buildContext(row, paymentMode);
   switch (type) {
     case "welcome":
@@ -318,5 +382,11 @@ export function buildOrderEmail(type: OrderEmailType, row: OrderEmailRow, paymen
       return intakeSummary(ctx);
     case "filing_confirmation":
       return filingConfirmation(ctx);
+    case "payment_problem":
+      return paymentProblem(ctx, extras);
+    case "agent_action_needed":
+      return agentActionNeeded(ctx, extras);
+    case "order_cancelled":
+      return orderCancelled(ctx);
   }
 }
