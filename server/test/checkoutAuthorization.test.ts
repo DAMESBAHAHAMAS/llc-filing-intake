@@ -4,19 +4,18 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 
 /** POST /api/checkout/create: the filing authorization gate and what a held session asks Stripe for. */
 const db = vi.hoisted(() => ({ filingData: null as unknown, inserted: [] as unknown[][], queries: [] as string[] }));
-vi.mock("../src/db/pool.js", () => ({
-  pool: {
-    query: vi.fn(async (sql: string, params?: unknown[]) => {
-      db.queries.push(sql);
-      if (/FROM filing_sessions/.test(sql)) return { rows: [{ email: "ana@example.com", crm_deal_id: null, filing_data: db.filingData }], rowCount: 1 };
-      if (/INSERT INTO orders/.test(sql)) {
-        db.inserted.push(params ?? []);
-        return { rows: [{ order_id: "ord-1" }], rowCount: 1 };
-      }
-      return { rows: [], rowCount: 0 };
-    }),
-  },
-}));
+vi.mock("../src/db/pool.js", () => {
+  const query = vi.fn(async (sql: string, params?: unknown[]) => {
+    db.queries.push(sql);
+    if (/FROM filing_sessions/.test(sql)) return { rows: [{ email: "ana@example.com", crm_deal_id: null, filing_data: db.filingData }], rowCount: 1 };
+    if (/INSERT INTO orders/.test(sql)) {
+      db.inserted.push(params ?? []);
+      return { rows: [{ order_id: "ord-1" }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 0 };
+  });
+  return { pool: { query, connect: vi.fn(async () => ({ query, release: () => undefined })) } };
+});
 vi.mock("../src/offers/catalog.js", () => ({
   resolveActiveOffers: vi.fn(async (_pool: unknown, codes: string[]) =>
     codes.map((offer_code) => ({
@@ -50,7 +49,17 @@ afterAll(async () => {
   await new Promise<void>((r) => server.close(() => r()));
 });
 beforeEach(() => {
-  db.filingData = { filing_authorization: { accepted: true, signer_name: "Ana Sol" } };
+  db.filingData = {
+    llc_name: "Sol Ventures LLC",
+    principal_address: "100 Main St, Miami, FL 33101",
+    mailing_address: "100 Main St, Miami, FL 33101",
+    effective_date_option: "Immediate",
+    registered_agent_path: "customer",
+    registered_agent_name: "Sam Agent",
+    registered_agent_florida_address: "9 Bay Rd, Tampa, Florida 33601",
+    authorized_persons: [{ name: "Ana Sol", article_iv_title: "AMBR", address: "100 Main St, Miami, FL 33101" }],
+    filing_authorization: { accepted: true, signer_name: "Ana Sol" },
+  };
   db.inserted = [];
   stripe.create.mockReset();
   stripe.create.mockResolvedValue({ id: "cs_1", url: "https://checkout.example/cs_1" });

@@ -40,7 +40,7 @@ interface EnqueueInput {
    *  for example). Without it, each type is sent once per order. */
   dedupeKey?: string;
   /** Extra fields the template needs, kept on the job. */
-  details?: { amount_cents?: number; agent_problem?: AgentProblem; charge_kind?: "fallback" | "deferred" };
+  details?: { amount_cents?: number; agent_problem?: AgentProblem; charge_kind?: "fallback" | "deferred"; rejection_reason?: string };
 }
 
 type QueryClient = { query: (text: string, params?: unknown[]) => Promise<unknown> };
@@ -125,6 +125,7 @@ export interface ClaimedEmailJob {
     amount_cents?: number;
     agent_problem?: AgentProblem;
     charge_kind?: "fallback" | "deferred";
+    rejection_reason?: string;
   } & Record<string, unknown>;
   attempts: number;
   max_attempts: number;
@@ -175,10 +176,11 @@ export interface OrderEmailState extends OrderEmailRow {
   cancelled_at: Date | string | null;
   deferred_charged_at: Date | string | null;
   stripe_livemode: boolean | null;
+  fulfillment_status?: string | null;
 }
 
 export const ORDER_EMAIL_COLUMNS = `o.order_id, o.line_items, o.total_cents, o.deferred_cents, o.proof_of_filing_ref,
-            o.payment_status, o.authorized_at, o.cancelled_at, o.deferred_charged_at, o.stripe_livemode,
+            o.payment_status, o.authorized_at, o.cancelled_at, o.deferred_charged_at, o.stripe_livemode, o.fulfillment_status,
             fs.email, fs.full_name, fs.phone, fs.country, fs.entity_name_primary, fs.entity_name_backup,
             fs.filing_data, fs.registered_agent_status`;
 
@@ -232,6 +234,12 @@ export function decideSend(type: OrderEmailType, row: OrderEmailState, job: Pick
     return mode ? { send: true, mode } : skip(orderIs);
   }
 
+  if (type === "filing_rejected") {
+    if (row.fulfillment_status !== "rejected") return skip("the filing is no longer rejected");
+    if (row.payment_status === "released") return { send: true, mode: "hold" };
+    return mode ? { send: true, mode } : skip(orderIs);
+  }
+
   return mode ? { send: true, mode } : skip(orderIs);
 }
 
@@ -272,6 +280,7 @@ async function sendJob(pool: Pool, sender: OrderEmailSender, job: ClaimedEmailJo
   const email = buildOrderEmail(type, row, decision.mode, {
     amountCents: job.payload_snapshot.amount_cents,
     agentProblem: job.payload_snapshot.agent_problem,
+    rejectionReason: job.payload_snapshot.rejection_reason,
   });
   const result = await sender.send({ to: row.email, ...email, idempotencyKey: idempotencyKeyFor(job, type, row.email, email) });
   return { ok: result.ok, error: result.error, providerMessageId: result.providerMessageId };
@@ -400,7 +409,7 @@ export async function listOrderEmails(pool: Pool, orderId: string): Promise<Orde
   return emails;
 }
 
-const RESENDABLE_TYPES: OrderEmailType[] = ["welcome", "order_confirmation", "intake_summary", "payment_problem", "agent_action_needed", "order_cancelled"];
+const RESENDABLE_TYPES: OrderEmailType[] = ["welcome", "order_confirmation", "intake_summary", "payment_problem", "agent_action_needed", "filing_rejected", "order_cancelled"];
 
 export function isResendableEmailType(type: string): type is OrderEmailType {
   return (RESENDABLE_TYPES as string[]).includes(type);

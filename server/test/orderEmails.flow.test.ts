@@ -3,7 +3,7 @@ import http from "node:http";
 import express from "express";
 import type { Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { createOrderEmailDb } from "./helpers/orderEmailDb.js";
+import { createOrderEmailDb, markSubmitted } from "./helpers/orderEmailDb.js";
 
 /**
  * Hold to filing, through the real webhook route, proof-of-filing route
@@ -119,6 +119,8 @@ const paidEvent = (id = "evt_paid", type = "checkout.session.completed") => ({
 });
 
 async function proof(documentNumber = "L26000123456") {
+  const current = (await state.db.query(`SELECT fulfillment_status FROM orders WHERE order_id = $1`, [orderId])).rows[0];
+  if (current.fulfillment_status !== "transmitted") await markSubmitted(state.db, orderId);
   const res = await fetch(`${base}/api/orders/${orderId}/proof-of-filing`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-operator-key": OPERATOR_KEY },

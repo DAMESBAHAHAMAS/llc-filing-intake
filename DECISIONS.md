@@ -1265,3 +1265,96 @@ isolated PGlite; results are in the draft PR for this branch.
 
 **Supersedes:** the filing confirmation part of the 2026-11-04 customer-emails
 entry. The 2026-10-02 hold line stays, and moves below the pay button.
+
+## 2026-11-04 — Filing roles, and recording what happens to a filing after checkout
+
+**Filing roles (Damian, 4 Nov, register #180).** Damian files the first 10
+orders online after reviewing and approving them. The registered agent is
+Damian only when the filer selects him; otherwise it is the client's own
+Florida agent, who must accept. Damian pays Florida first, and the card is
+charged after Florida confirms with a document number.
+
+**Submission is recorded on the order.** `POST
+/api/orders/:id/submitted-to-sunbiz` stores the tracking number and time and
+sets `fulfillment_status = 'transmitted'`, which nothing had ever written.
+`/cancel` was already refused in that state, so "you can cancel any time until
+we submit" now holds. The first submission time stays when a filing is
+corrected, because a correction in time keeps the original filing date. The
+Sunbiz PIN is not stored: it stays out of a table the application reads.
+
+**Rejection is a state, not an email.** `filing-rejected` sets `rejected` and
+tells the customer why. It leaves the hold or saved card alone, because a
+correction can still end in a charge. `/cancel` works from `rejected`, and is
+the only way to "release any hold and you pay nothing": `release-hold` leaves
+the order open and chargeable. A resubmission goes back to `transmitted`.
+
+**Proof of filing is gated.** It is refused unless the order is submitted, any
+customer agent has accepted, and Articles are stored under this order. A
+pre-payment PDF does not count, since it can predate a correction. The gates are
+the same when submission is recorded, so a filing that can't be proved can't be
+marked filed. EIN-only orders have no Sunbiz filing, so they skip them. Delivery
+before collection is unchanged.
+
+**One filing order per session.** A session is one LLC. A second filing is
+refused while an earlier one stands, with `order_already_open`. An order with
+no filing in it stays allowed, because buying the 3-year agent service alone is
+how a customer whose own agent fell through switches to Damian. An EIN-only hold
+waits until the filing closes. An unfinished checkout is expired at Stripe and
+replaced, so two open tabs cannot make two holds and a customer who backed out
+of Stripe can still check out. Stripe refusing the expiry is how we learn the
+customer paid in the other tab before its webhook arrived.
+
+**The filing details lock once an order stands (MIR-321).** `POST
+/api/session/stage` refuses a filing_data change with `filing_data_locked` on a
+held, paid or lapsed filing order. A repeat of what is stored is allowed and
+writes nothing, since the browser never sends the keys the agent routes add. A
+cancelled order unlocks. Two paths stay open on purpose: naming a new agent,
+until the filing is with Florida, and the operator's `corrections` on a
+resubmission, which also regenerates the Articles. Without that, a corrected
+name could not be recorded and the filing confirmation would name the one
+Florida rejected.
+
+**No card is held for Articles that can't be built.** Checkout runs the same
+validator as the PDF, except for agent acceptance, which can't exist yet.
+`filing_data_incomplete` lists the fields. The validator also refuses a P.O. Box
+for the agent, so a saved one stops here even though `/registered-agent/select`
+only reports it. Every order reaching `requires_review` now alerts ops.
+
+**Every failed charge emails the customer.** The promise doesn't depend on why
+the card failed. After an unclear Stripe answer the charge may yet appear; the
+worker then finds a paid order and skips the email. `payment-received` records
+money received another way, for everything still owed, and is refused if Stripe
+shows the money was taken.
+
+**Rationale:** each item is a sentence in the customer promise that the code did
+not yet make true, found in the release candidate review of 4 Nov.
+
+**Not decided here, for Damian:** the wording and pricing questions in that
+review, including the EIN charged separately from the LLC and the FastTrack $98
+conflict. Neither is changed by this entry.
+
+**Supersedes:** nothing is reversed. This adds to the 2026-11-04 payment release
+candidate entry.
+
+## 2026-11-04 — Finding: Stripe test runs write to the deployed database
+
+The Stripe test account has an enabled webhook endpoint at
+`https://llc-data-spine.onrender.com/api/webhooks/stripe`. Every test event for
+the subscribed types reaches it, including events from runs that use a local
+database. The handler inserts into `stripe_webhook_events` before it looks up
+the order, so a signed event leaves a row there with the full event payload,
+even when the result is `order_not_found`. The earlier note that these events
+"end as `order_not_found`" left that out.
+
+Seen on 4 Nov: Stripe reported the events delivered. The row itself was inferred
+from the 2xx and the code, not read from the database.
+
+**Decision:** none yet. A local "isolated" run is not isolated while that
+endpoint is enabled. Whether to accept these rows, turn the endpoint off for a
+run, or use a separate Stripe sandbox is Damian's call. Until then, a Stripe test
+run on this account breaks the "no writes to a deployed database" rule.
+
+**Rationale:** recorded so the next run does not repeat this by accident.
+
+**Supersedes:** nothing.
+

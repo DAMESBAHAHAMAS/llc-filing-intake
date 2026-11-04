@@ -190,6 +190,12 @@ export async function retrieveCheckoutSession(sessionId: string): Promise<Stripe
   return stripeRequest<StripeCheckoutSession>("GET", `/checkout/sessions/${encodeURIComponent(sessionId)}`);
 }
 
+/** Closes an open Checkout Session so it can no longer be paid. Stripe
+ *  refuses this once the session is complete or already expired. */
+export async function expireCheckoutSession(sessionId: string): Promise<StripeCheckoutSession> {
+  return stripeRequest<StripeCheckoutSession>("POST", `/checkout/sessions/${encodeURIComponent(sessionId)}/expire`, {});
+}
+
 export interface StripePrice {
   id: string;
   active: boolean;

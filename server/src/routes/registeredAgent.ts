@@ -4,6 +4,7 @@ import { describeError } from "../db/describeError.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
 import { notifyAgentProblem, openFilingOrders } from "../registeredAgent/customerNotice.js";
 import { sendOpsAlert } from "../ops/alerts.js";
+import { looksLikePoBox } from "../registeredAgent/poBox.js";
 
 export const registeredAgentRouter = Router();
 
@@ -42,6 +43,23 @@ async function mergeIntoFilingData(filingSessionId: string, patch: Record<string
     client.release();
   }
 }
+
+/** The agent is on the Articles Florida already holds. A rejected filing is
+ *  the exception, because it comes back to be corrected. */
+async function filingAtFlorida(filingSessionId: string): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `SELECT 1 FROM orders
+     WHERE filing_session_id = $1 AND cancelled_at IS NULL AND sunbiz_submitted_at IS NOT NULL AND fulfillment_status <> 'rejected'
+     LIMIT 1`,
+    [filingSessionId]
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+const FILING_AT_FLORIDA = {
+  error: "this filing has been submitted to Florida, so its registered agent can no longer be changed here",
+  code: "filing_submitted",
+};
 
 /**
  * Starts filing on any order that was waiting for its registered agent,
@@ -97,6 +115,11 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
   }
 
   try {
+    if (await filingAtFlorida(filingSessionId)) {
+      res.status(409).json(FILING_AT_FLORIDA);
+      return;
+    }
+
     if (agentChoice === "damian") {
       // A customer whose own agent fell through can switch to Damian, but
       // the 3-year service then has to be on an order, same as at checkout.
@@ -155,7 +178,7 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
     if (!email) errors.push("registered agent email is required");
     else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.push("registered agent email is invalid");
     if (!street) errors.push("registered agent street address is required");
-    else if (/p\.?o\.?\s*box/i.test(street)) errors.push("P.O. Boxes are not allowed for the registered agent address");
+    else if (looksLikePoBox(street) || looksLikePoBox(unit)) errors.push("P.O. Boxes are not allowed for the registered agent address");
     if (!city) errors.push("registered agent city is required");
     if (!state) errors.push("registered agent state is required");
     if (!zip) errors.push("registered agent ZIP is required");
@@ -230,6 +253,10 @@ registeredAgentRouter.post("/api/registered-agent/request-acceptance", async (re
       res.status(404).json({ error: "unknown filing_session_id" });
       return;
     }
+    if (await filingAtFlorida(filingSessionId)) {
+      res.status(409).json(FILING_AT_FLORIDA);
+      return;
+    }
 
     // registered_agent_florida_address may already be set (e.g. this
     // session already went through POST /registered-agent/select) — do
@@ -244,6 +271,10 @@ registeredAgentRouter.post("/api/registered-agent/request-acceptance", async (re
       typeof body.registered_agent_florida_address === "string" && body.registered_agent_florida_address.trim()
         ? body.registered_agent_florida_address.trim()
         : existingAddress;
+    if (looksLikePoBox(address)) {
+      res.status(400).json({ error: "P.O. Boxes are not allowed for the registered agent address" });
+      return;
+    }
 
     await mergeIntoFilingData(filingSessionId, {
       registered_agent_path: "customer",

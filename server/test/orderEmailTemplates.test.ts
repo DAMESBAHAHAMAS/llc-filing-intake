@@ -28,7 +28,7 @@ const row = (over: Partial<OrderEmailRow> = {}): OrderEmailRow => ({
   ...over,
 });
 
-const ALL: OrderEmailType[] = ["welcome", "order_confirmation", "intake_summary", "filing_confirmation", "payment_problem", "agent_action_needed", "order_cancelled"];
+const ALL: OrderEmailType[] = ["welcome", "order_confirmation", "intake_summary", "filing_confirmation", "payment_problem", "agent_action_needed", "filing_rejected", "order_cancelled"];
 
 describe("every order email", () => {
   it.each(ALL)("%s carries the approved disclaimer in text and html, and has no selling content", (type) => {
@@ -257,5 +257,30 @@ describe("cancelled order", () => {
     const { subject, text } = buildOrderEmail("order_cancelled", row(), "hold");
     expect(subject).toBe("Your order is cancelled: Sol Ventures LLC");
     expect(text).toContain("We released any hold still in place and you pay nothing.");
+  });
+});
+
+describe("filing rejected", () => {
+  const extras = { rejectionReason: "The name is not distinguishable from an existing company." };
+
+  it("tells the customer why, and follows the promise on a held order", () => {
+    const email = buildOrderEmail("filing_rejected", row(), "hold", extras);
+    expect(email.subject).toBe("Florida rejected your filing: Sol Ventures LLC");
+    expect(email.text).toContain("The name is not distinguishable from an existing company.");
+    expect(email.text).toContain("Once you've approved any change we need from you, we correct and resubmit it at no extra service charge. Reply within 60 days to keep your original filing date.");
+    expect(email.text).toContain("Your card still isn't charged until Florida accepts it.");
+    expect(email.text).toContain("We release any hold still in place and you pay nothing.");
+  });
+
+  it("makes no card promise on an order already paid", () => {
+    const email = buildOrderEmail("filing_rejected", row(), "paid", extras);
+    expect(email.text).not.toMatch(/card|hold|pay nothing/i);
+    expect(email.text).toContain("Reply within 60 days");
+  });
+
+  it("escapes and redacts the reason", () => {
+    const email = buildOrderEmail("filing_rejected", row(), "hold", { rejectionReason: "<b>Name</b> SSN 123-45-6789" });
+    expect(email.html).toContain("&lt;b&gt;Name&lt;/b&gt;");
+    expect(`${email.text}${email.html}`).not.toContain("123-45-6789");
   });
 });

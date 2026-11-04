@@ -3,6 +3,7 @@ import { backoffForAttempt, isDeadLetter } from "../sync/backoff.js";
 import { buildPdfContext } from "../pdf/context.js";
 import type { FilingSessionRecord } from "../pdf/types.js";
 import { generateArticlesOfOrganizationPdf } from "../pdf/serviceClient.js";
+import { sendOpsAlert } from "../ops/alerts.js";
 
 const MAX_FULFILLMENT_ATTEMPTS = 6;
 
@@ -91,6 +92,7 @@ export async function processClaimedOrder(pool: Pool, order: ClaimedOrder): Prom
        WHERE order_id = $1`,
       [order.order_id, `Filing data incomplete: ${contextResult.missingFields.join(", ")}`]
     );
+    await sendOpsAlert("Filing needs review: details missing", `Order ${order.order_id} cannot be filed. Missing: ${contextResult.missingFields.join(", ")}.`);
     return;
   }
 
@@ -103,6 +105,7 @@ export async function processClaimedOrder(pool: Pool, order: ClaimedOrder): Prom
         `UPDATE orders SET fulfillment_status = 'failed', fulfillment_attempts = $2, fulfillment_last_error = $3 WHERE order_id = $1`,
         [order.order_id, newAttempts, pdfResult.error]
       );
+      await sendOpsAlert("Articles could not be generated", `Order ${order.order_id}: PDF generation gave up after ${newAttempts} attempts. ${pdfResult.error}`);
     } else {
       const waitMs = backoffForAttempt(newAttempts);
       await pool.query(
@@ -139,6 +142,7 @@ export async function processClaimedOrder(pool: Pool, order: ClaimedOrder): Prom
   } finally {
     client.release();
   }
+  await sendOpsAlert("Filing ready for review", `Order ${order.order_id}: the Articles are generated. Review them, file at Sunbiz, then record the submission.`);
 }
 
 export async function processOne(pool: Pool, lockedBy: string): Promise<boolean> {

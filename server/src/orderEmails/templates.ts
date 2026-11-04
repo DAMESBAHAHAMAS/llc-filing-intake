@@ -22,6 +22,7 @@ export type OrderEmailType =
   | "filing_confirmation"
   | "payment_problem"
   | "agent_action_needed"
+  | "filing_rejected"
   | "order_cancelled";
 
 /** "hold": a card hold, collected after filing. "paid": collected at
@@ -35,6 +36,8 @@ export interface OrderEmailExtras {
   /** What a saved-card charge tried to collect (payment_problem). */
   amountCents?: number;
   agentProblem?: AgentProblem;
+  /** Why Florida rejected the filing (filing_rejected). */
+  rejectionReason?: string;
 }
 
 export const DISCLAIMER = "Damian Knowles is a Business Developer, not a law firm or attorney, and does not provide legal advice.";
@@ -364,6 +367,29 @@ function agentActionNeeded(ctx: OrderEmailContext, extras: OrderEmailExtras): Re
   ]);
 }
 
+/** Wording follows the customer promise: "If Florida rejects your filing,
+ *  we tell you why." */
+function filingRejected(ctx: OrderEmailContext, extras: OrderEmailExtras): RenderedEmail {
+  const company = companyLabel(ctx);
+  const reason = customerText(extras.rejectionReason);
+  const held = ctx.paymentMode === "hold";
+  return render(`Florida rejected your filing: ${company}`, [
+    greeting(ctx),
+    p(`The Florida Division of Corporations rejected the filing for ${company}.`),
+    ...(reason ? [heading("Why"), p(reason)] : []),
+    heading("What happens next"),
+    p("Once you've approved any change we need from you, we correct and resubmit it at no extra service charge. Reply within 60 days to keep your original filing date."),
+    ...(held
+      ? [
+          p("Your card still isn't charged until Florida accepts it."),
+          p("If you choose not to correct it, reply to tell us. We release any hold still in place and you pay nothing."),
+        ]
+      : []),
+    rows([["Order number", ctx.orderId]]),
+    p(REPLY_LINE),
+  ]);
+}
+
 function orderCancelled(ctx: OrderEmailContext): RenderedEmail {
   return render(ctx.sunbizFiling ? `Your order is cancelled: ${companyLabel(ctx)}` : "Your order is cancelled", [
     greeting(ctx),
@@ -388,6 +414,8 @@ export function buildOrderEmail(type: OrderEmailType, row: OrderEmailRow, paymen
       return paymentProblem(ctx, extras);
     case "agent_action_needed":
       return agentActionNeeded(ctx, extras);
+    case "filing_rejected":
+      return filingRejected(ctx, extras);
     case "order_cancelled":
       return orderCancelled(ctx);
   }

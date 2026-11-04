@@ -3,11 +3,14 @@ import { closedCodesIn } from "../offers/closedOffers.js";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { resolveActiveOffers } from "../offers/catalog.js";
-import { createCheckoutSession, StripeApiError } from "../stripe/restClient.js";
+import { createCheckoutSession, expireCheckoutSession, retrieveCheckoutSession, StripeApiError } from "../stripe/restClient.js";
 import { getEinExpressAvailability } from "../ein/capacity.js";
 import { houseAgentLineMissing } from "../offers/houseAgentRule.js";
 import { deferredServiceCents, holdCheckoutText, holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
+import { articlesBlockers } from "../pdf/context.js";
+import type { FilingSessionRecord } from "../pdf/types.js";
+import { findOrderConflict, isUnfinishedCheckout, listSessionOrders, type SessionOrder } from "../payments/openOrders.js";
 
 export const checkoutRouter = Router();
 
@@ -33,6 +36,38 @@ function parseLineItems(body: Record<string, unknown>): RequestedLineItem[] | nu
   return items;
 }
 
+/** A crashed request can leave a pending order with no Stripe session behind it. */
+const STALE_UNFINISHED_CHECKOUT_MS = 2 * 60 * 1000;
+
+const ORDER_ALREADY_OPEN = (orderId: string) => ({
+  error: "this filing already has an order",
+  code: "order_already_open",
+  order_id: orderId,
+});
+
+/**
+ * Closes an earlier checkout that was started and never finished, so two open
+ * Stripe tabs cannot become two holds. The newest checkout is the one the
+ * customer is looking at. Stripe's refusal is what tells us the customer paid
+ * in the other tab before its webhook arrived. Returns the state that stops
+ * this checkout, if any.
+ */
+async function closeUnfinishedCheckout(order: SessionOrder): Promise<"closed" | "paid" | "in_progress"> {
+  if (order.stripe_checkout_session_id) {
+    try {
+      await expireCheckoutSession(order.stripe_checkout_session_id);
+    } catch (err) {
+      const session = await retrieveCheckoutSession(order.stripe_checkout_session_id);
+      if (session.status === "complete") return "paid";
+      if (session.status !== "expired") throw err;
+    }
+  } else if (Date.now() - new Date(order.created_at).getTime() < STALE_UNFINISHED_CHECKOUT_MS) {
+    return "in_progress";
+  }
+  await pool.query(`UPDATE orders SET payment_status = 'failed', failure_reason = 'replaced_by_new_checkout' WHERE order_id = $1 AND payment_status = 'pending'`, [order.order_id]);
+  return "closed";
+}
+
 /**
  * POST /api/checkout/create
  *
@@ -50,6 +85,11 @@ function parseLineItems(body: Record<string, unknown>): RequestedLineItem[] | nu
  * call to Stripe. If Stripe's API call then fails, the order row is
  * updated to checkout_status='checkout_failed' with failure_reason set —
  * it is never deleted, and the failure is visible for retry/support.
+ *
+ * One order per filing: a session whose filing already has an order gets
+ * 409 order_already_open, and an unfinished earlier checkout is closed first
+ * (payments/openOrders.ts). A filing whose Articles could not be built gets
+ * 422 filing_data_incomplete, so no card is held for it.
  */
 checkoutRouter.post("/api/checkout/create", async (req, res) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
@@ -84,7 +124,7 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
     const session = await pool.query<{
       email: string | null;
       crm_deal_id: string | null;
-      filing_data: { registered_agent_path?: string; filing_authorization?: { accepted?: unknown } | null } | null;
+      filing_data: (Partial<FilingSessionRecord> & { filing_authorization?: { accepted?: unknown } | null }) | null;
     }>(
       "SELECT email, crm_deal_id, filing_data FROM filing_sessions WHERE filing_session_id = $1",
       [filingSessionId]
@@ -105,6 +145,20 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         code: "filing_authorization_required",
       });
       return;
+    }
+
+    // The Articles have to be buildable from what was saved. Finding out
+    // after the card is held helps nobody.
+    if (needsSunbizFiling(requestedItems)) {
+      const missingFields = articlesBlockers(session.rows[0].filing_data);
+      if (missingFields.length) {
+        res.status(422).json({
+          error: "the Articles of Organization cannot be built from this filing's details",
+          code: "filing_data_incomplete",
+          missing_fields: missingFields,
+        });
+        return;
+      }
     }
 
     // Registered-agent billing rule: choosing Damian as agent means the
@@ -148,6 +202,24 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
       }
     }
 
+    const sessionOrders = await listSessionOrders(pool, filingSessionId);
+    const conflict = findOrderConflict(requestedItems, sessionOrders);
+    if (conflict) {
+      res.status(409).json(ORDER_ALREADY_OPEN(conflict.order_id));
+      return;
+    }
+    for (const order of sessionOrders.filter(isUnfinishedCheckout)) {
+      const outcome = await closeUnfinishedCheckout(order);
+      if (outcome === "paid") {
+        res.status(409).json(ORDER_ALREADY_OPEN(order.order_id));
+        return;
+      }
+      if (outcome === "in_progress") {
+        res.status(409).json({ error: "a checkout for this filing is already starting", code: "checkout_in_progress" });
+        return;
+      }
+    }
+
     const lineItemSnapshots = requestedItems.map((item) => {
       const offer = resolvedByCode.get(item.offer_code)!;
       return {
@@ -170,13 +242,36 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
     // not at proof of filing. Only meaningful on a held order.
     const deferredCents = captureMode === "hold" ? deferredServiceCents(lineItemSnapshots) : 0;
 
-    const orderInsert = await pool.query<{ order_id: string }>(
-      `INSERT INTO orders (filing_session_id, crm_intent, product, line_items, total_cents, currency, checkout_status, deferred_cents, capture_mode)
-       VALUES ($1, $2, $3, $4, $5, 'usd', 'pending', $6, $7)
-       RETURNING order_id`,
-      [filingSessionId, primaryOffer.crm_intent, primaryOffer.offer_code, JSON.stringify(lineItemSnapshots), totalCents, deferredCents, captureMode]
-    );
-    const orderId = orderInsert.rows[0].order_id;
+    // The session row's lock makes the last check and the insert one step, so
+    // two requests at the same moment cannot both pass. It is released before
+    // Stripe is called.
+    const dbClient = await pool.connect();
+    let orderId: string;
+    try {
+      await dbClient.query("BEGIN");
+      await dbClient.query("SELECT filing_session_id FROM filing_sessions WHERE filing_session_id = $1 FOR UPDATE", [filingSessionId]);
+      const latest = await listSessionOrders(dbClient, filingSessionId);
+      const nowConflicting = findOrderConflict(requestedItems, latest);
+      if (nowConflicting || latest.some(isUnfinishedCheckout)) {
+        await dbClient.query("ROLLBACK");
+        if (nowConflicting) res.status(409).json(ORDER_ALREADY_OPEN(nowConflicting.order_id));
+        else res.status(409).json({ error: "a checkout for this filing is already starting", code: "checkout_in_progress" });
+        return;
+      }
+      const orderInsert = await dbClient.query<{ order_id: string }>(
+        `INSERT INTO orders (filing_session_id, crm_intent, product, line_items, total_cents, currency, checkout_status, deferred_cents, capture_mode)
+         VALUES ($1, $2, $3, $4, $5, 'usd', 'pending', $6, $7)
+         RETURNING order_id`,
+        [filingSessionId, primaryOffer.crm_intent, primaryOffer.offer_code, JSON.stringify(lineItemSnapshots), totalCents, deferredCents, captureMode]
+      );
+      orderId = orderInsert.rows[0].order_id;
+      await dbClient.query("COMMIT");
+    } catch (err) {
+      await dbClient.query("ROLLBACK");
+      throw err;
+    } finally {
+      dbClient.release();
+    }
     const heldText = captureMode === "hold" ? holdCheckoutText(lineItemSnapshots) : undefined;
 
     try {
@@ -234,12 +329,18 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
  * redirect never establishes payment truth by itself; the frontend polls
  * this (or checks it once on landing at the success URL) to read the
  * server's own verified state instead.
+ *
+ * A released hold is not the end of an order: unless it was cancelled, the
+ * saved card is still charged after Florida confirms. `cancelled` is what
+ * tells those apart. The reason for a cancellation or a rejection stays out
+ * of this response, because anyone with the order id can read it.
  */
 checkoutRouter.get("/api/checkout/order/:orderId", async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT order_id, filing_session_id, checkout_status, payment_status, failure_reason,
-              fulfillment_status, total_cents, currency, proof_of_filing_at, captured_at
+              fulfillment_status, total_cents, currency, proof_of_filing_at, captured_at,
+              cancelled_at, sunbiz_submitted_at, sunbiz_rejected_at
        FROM orders WHERE order_id = $1`,
       [req.params.orderId]
     );
@@ -247,7 +348,7 @@ checkoutRouter.get("/api/checkout/order/:orderId", async (req, res) => {
       res.status(404).json({ error: "order not found" });
       return;
     }
-    res.status(200).json(rows[0]);
+    res.status(200).json({ ...rows[0], cancelled: rows[0].cancelled_at != null });
   } catch (err) {
     res.status(500).json({ error: "order lookup failed", detail: describeError(err) });
   }

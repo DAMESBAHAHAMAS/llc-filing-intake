@@ -76,6 +76,7 @@ beforeEach(() => {
     total_cents: 49900,
     currency: "usd",
     line_items: [{ offer_code: "FASTTRACK" }],
+    fulfillment_status: "transmitted",
   };
   Object.values(stripe).forEach((f) => f.mockReset());
   delivery.alert.mockReset();
@@ -342,7 +343,8 @@ describe("a saved card that fails after filing", () => {
     stripe.charge.mockRejectedValue(new Error("socket hang up"));
     expect((await fileProof()).status).toBe(502);
     expect(db.queries.some((q) => /saved_card_attempts \+ 1/.test(q))).toBe(false);
-    expect(db.queries.some((q) => /INSERT INTO crm_sync_queue/.test(q))).toBe(false);
+    // The promise holds whatever Stripe answered, so the customer still hears.
+    expect(db.queries.some((q) => /INSERT INTO crm_sync_queue/.test(q))).toBe(true);
     expect(delivery.alert).toHaveBeenCalledWith("Payment could not be collected", expect.any(String));
     await fileProof();
     expect(stripe.charge.mock.calls.map(([params]) => params.idempotencyKey)).toEqual(["fallback-ord-1-1", "fallback-ord-1-1"]);
@@ -363,6 +365,10 @@ describe("a saved card that fails after filing", () => {
 });
 
 describe("POST /api/orders/:orderId/cancel", () => {
+  beforeEach(() => {
+    db.order = { ...db.order, fulfillment_status: "requires_review" };
+  });
+
   const cancel = (body: unknown = { reason: "customer changed their mind" }, key: string | null = "op-test-key") => post("/api/orders/ord-1/cancel", body, key);
 
   it("needs the operator key", async () => {

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Router } from "express";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
+import { filingDataIsLocked, filingDataUnchanged, listSessionOrders } from "../payments/openOrders.js";
 
 export const sessionRouter = Router();
 
@@ -121,6 +122,20 @@ sessionRouter.post("/api/session/stage", async (req, res) => {
 
     if (!sessionId || !sessionExists) {
       sessionId = sessionId ?? randomUUID();
+    }
+
+    // MIR-321: this route replaces filing_data whole, so once a card is held
+    // or paid a stale tab could rewrite what was reviewed and filed. A
+    // corrected filing goes through the operator's resubmission route, and
+    // a new registered agent through /registered-agent/select.
+    if (sessionExists && patch.filing_data !== undefined && filingDataIsLocked(await listSessionOrders(client, sessionId))) {
+      const stored = await client.query<{ filing_data: unknown }>("SELECT filing_data FROM filing_sessions WHERE filing_session_id = $1", [sessionId]);
+      if (!filingDataUnchanged(stored.rows[0]?.filing_data, patch.filing_data)) {
+        await client.query("ROLLBACK");
+        res.status(409).json({ error: "this filing has an order, so its filing details can no longer be changed here", code: "filing_data_locked" });
+        return;
+      }
+      delete patch.filing_data;
     }
 
     // Build a dynamic but safe SET list — only columns in SESSION_FIELDS,
