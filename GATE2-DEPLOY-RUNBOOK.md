@@ -375,6 +375,11 @@ State these plainly rather than discovering them mid-test:
   no confirmation email, no RA acceptance email, but also no crash and
   no silent pretense of success. Blocked on provisioning the Resend
   account/domain — an infrastructure decision, not a coding task.
+- **Superseded, 2026-11-04:** the next item describes the Worker-created
+  Deal, which ended on 2026-10-23. The webhook now opens the Deal on a
+  verified hold or payment; see DECISIONS.md 2026-11-04. Kept for the
+  record, and it still applies to a session that already has a
+  `crm_deal_id`.
 - **Deal-stage update not yet enqueued (new, 2026-09-17).**
   `crm_deal_id` capture (Cloudflare Worker → `filing_sessions.crm_deal_id`
   → Stripe metadata → `orders.crm_deal_id`) works once the frontend's

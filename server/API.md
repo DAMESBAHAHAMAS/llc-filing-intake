@@ -162,10 +162,16 @@ Stripe-only (not called by the frontend). Verified via
 `Stripe-Signature`; idempotent on `stripe_webhook_events.id`. Handles
 `checkout.session.completed`, `checkout.session.async_payment_succeeded`,
 `checkout.session.async_payment_failed`, `checkout.session.expired`. On
-a paid order that includes an actual Sunbiz filing (`FASTTRACK`,
+a held or paid order that includes an actual Sunbiz filing (`FASTTRACK`,
 `PREMIUM`, or `DIY_STATE_FEE`), sets `orders.fulfillment_status='ready'`
-so the fulfillment worker picks it up; always enqueues exactly one
-`order_deal` (paid) or `abandoned_cart` (failed) CRM job.
+so the fulfillment worker picks it up; enqueues one `order_deal` job
+(`held_deal` opens the Deal at SERVICE REQUESTED on a verified hold,
+`paid_deal` opens it at Closed Won on a checkout payment) or one
+`abandoned_cart` job (failed). A session that already holds a
+`crm_deal_id` gets a `deal_stage_update` job instead of a second Deal.
+Also handles `payment_intent.succeeded` (order paid, held Deal moves to
+Closed Won), `payment_intent.canceled` and `charge.refunded`. See
+`DECISIONS.md`, 2026-11-04.
 
 **Configure in the Stripe Dashboard:** endpoint URL
 `https://llc-data-spine.onrender.com/api/webhooks/stripe`, events listed
@@ -245,3 +251,17 @@ If the frontend needs a "is my document ready" signal, the closest
 available today is polling `GET /api/checkout/order/:orderId`'s
 `fulfillment_status` field — a document-download endpoint (signed,
 expiring URL per decision boundary #1) is not yet built.
+
+## `POST /api/orders/:orderId/proof-of-filing` (operator key)
+
+Body: `{ "document_number": "<Sunbiz document number, or the EIN for an
+EIN-only order>" }`. Records the proof, emails it to the customer, then
+collects the hold (or charges the saved card if the hold has lapsed).
+**Collection happens only after the email provider accepts the proof
+email.** If it does not, the route answers 502, nothing is collected, an
+ops alert goes out, and `orders.proof_delivery_error` holds the reason.
+Calling the route again retries; a proof already delivered is not sent
+twice. An EIN-only order gets a completion notice, not the EIN itself.
+
+Needs `RESEND_API_KEY` and `RESEND_FROM_EMAIL`, and migration 0020 on the
+database. With either missing, nothing is collected.

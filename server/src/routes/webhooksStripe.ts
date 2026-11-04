@@ -162,16 +162,16 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
             [order.filing_session_id]
           );
 
-          // Zoho Deal lifecycle: when the Cloudflare Worker already
-          // created a Deal at intake (filing_sessions.crm_deal_id, known
-          // here via Stripe metadata — routes/checkout.ts sets it,
-          // read back from this already-signature-verified event body,
-          // no extra Stripe round-trip needed), update that EXISTING
-          // Deal's stage instead of creating a second one. Only when
-          // it's unknown does this fall back to the original "create a
-          // Deal at payment time" path (order_deal/paid_deal) —
-          // unchanged, so an order never ends up with zero Deal linkage
-          // just because the Worker->session capture didn't happen yet.
+          // Zoho Deal lifecycle (DECISIONS.md, 2026-11-04): intake creates
+          // no Deal, so the normal path is the else branch below, which
+          // opens the Deal here: held_deal at SERVICE REQUESTED on a
+          // verified hold, paid_deal at Closed Won on a checkout payment.
+          // A held Deal moves to Closed Won in
+          // handlePaymentLifecycleEvent, after the hold is collected.
+          // The first branch serves a session that already holds a
+          // crm_deal_id (known here via Stripe metadata — routes/checkout.ts
+          // sets it, read back from this already-signature-verified event
+          // body), updating that Deal instead of creating a second one.
           const crmDealId = session.metadata?.crm_deal_id;
           const targetStage = held
             ? process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED"
