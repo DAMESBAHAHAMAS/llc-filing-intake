@@ -1058,3 +1058,76 @@ widget created in Damian's Cloudflare account and the frontend sending
 its token, released together; the secret alone would block every customer.
 
 **Supersedes:** —
+
+---
+
+## 2026-11-04 — CRM Deal lifecycle as built: the verified hold opens the Deal, a collected hold closes it
+
+**Rule, as the code behaves:** intake creates no Deal (`llc-worker.js`,
+since `c54f608`, 23 Oct). The signed Stripe webhook opens the Deal: on a
+verified card hold for a filing order (`held_deal`, stage SERVICE
+REQUESTED, Payment_Status "Hold Placed"), or on a verified payment for an
+order charged at checkout (`paid_deal`, Closed Won). A held Deal moves to
+Closed Won only after the hold is collected (`payment_intent.succeeded`).
+A released hold keeps SERVICE REQUESTED with Payment_Status "Hold
+Released". A full refund moves the Deal to Closed Lost.
+
+**Rationale:** ADR-244 found two statements that no longer matched the
+code. `c54f608`'s comments said a Deal is created "only after verified
+payment", but the 30 Sep rule opens it on the hold, before any money is
+collected. The 2026-09-17 entry (item 4) still described the Worker
+creating the Deal at intake. Neither change altered behaviour, so this
+corrects the record. No Closed Won can appear before collection.
+
+**Residual:** `POST /api/session/stage` still accepts a client-supplied
+`crm_deal_id`, and `routes/webhooksStripe.ts` still honours it, for
+sessions that already hold one. The trust gap logged on 2026-09-17 stands;
+nothing legitimate sends a new id now that the Worker returns `deal_id: null`.
+
+**Implemented by:** the comment and document corrections on branch
+`claude/checkout-consistency`, and `server/test/dealLifecycle.test.ts`.
+
+**Supersedes:** item 4 of "2026-09-17 — Ported the deferred-until-payment
+registered-agent email...", on who creates the Deal. That entry stays as
+written. Its `deal_stage_update` mechanism remains for sessions that
+already hold a Deal id.
+
+---
+
+## 2026-11-04 — A held payment is not collected until proof of filing has been delivered to the customer
+
+**Rule:** Damian's rule of 29 Sep is "funds are collected only after proof
+of filing is delivered". The code recorded the proof and captured in one
+request, and told the customer nothing. `POST
+/api/orders/:orderId/proof-of-filing` now emails the proof first and
+collects only once the email provider accepts the message. If delivery
+fails, nothing is collected, the route answers 502, an ops alert goes out,
+and the reason is stored in `orders.proof_delivery_error`. This covers both
+collection paths: capturing the hold and charging the saved card.
+
+**Proof means:** the Sunbiz document number of the filed Articles, as the
+2026-09-30 entry defines it. An EIN-only order gets a completion notice
+without the EIN.
+
+**Rationale:** ADR-244 found that `db5a162` left the customer with nothing
+before capture, while its comment described a post-payment customer link
+that does not exist. The comment also assumed payment comes before the
+document, which is the Gate 2 order the 2026-09-30 entry superseded.
+
+**Limits:** "delivered" means Resend accepted the message, not that it
+reached the inbox. An order with no customer email cannot be collected
+through this route. The customer still has no way to get a copy of the
+Articles PDF: its storage and serving target is the open boundary 1
+(2026-09-09), so this entry does not build that link.
+
+**Deploy order:** migration 0020 must reach the live database before this
+code, and `RESEND_API_KEY` and `RESEND_FROM_EMAIL` must be set. If either
+is missing, the failure is safe: nothing is collected.
+
+**Implemented by:** `server/src/proofDelivery/deliverProof.ts`,
+`server/src/routes/orders.ts`, migration 0020, on branch
+`claude/checkout-consistency`.
+
+**Supersedes:** nothing in the 2026-09-30 rule, which this enforces. It
+replaces the sequence in `db5a162`'s comment in
+`server/src/routes/filingDocument.ts`.

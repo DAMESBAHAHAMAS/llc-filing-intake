@@ -8,7 +8,9 @@
  * - handleIntake() now branches on lead_type so partial
  *   captures and urgent name-review requests no longer
  *   create duplicate Contacts/Deals in Zoho CRM. Only
- *   "intake_complete" creates the real Contact + Deal.
+ *   "intake_complete" creates the real Contact.
+ *   (Superseded 2026-10-23: no route in this Worker creates
+ *   a Deal; the data spine opens it on a verified card hold.)
  * - Added notifyCliq() — fires a real-time Cliq message on
  *   urgent_name_review. Safe no-op until CLIQ_WEBHOOK_URL
  *   is set as an environment variable in the Cloudflare
@@ -29,7 +31,7 @@
  * POST /lead            → Name check lead capture → Zoho CRM
  * POST /contact         → Contact page form → Zoho CRM Lead
  * POST /guide-lead      → Formation Guide lead → Zoho CRM
- * POST /intake          → LLC intake form → Zoho CRM Contact (Deal is created only after verified payment)
+ * POST /intake          → LLC intake form → Zoho CRM Contact (no Deal; the data spine opens it on a verified card hold or payment)
  *
  * CRON
  * Every 10 minutes       → keepRenderWarm() — Render keep-alive
@@ -419,15 +421,19 @@ async function handleGuideLead(request, env) {
    ROUTE: POST /intake
    LLC Intake Form → Zoho CRM Contact (no Deal — see below)
 
-   UPDATED 2026-10-23: intake no longer creates a Deal. Deals are
-   created only after verified Stripe payment (data spine webhook).
+   UPDATED 2026-10-23: intake no longer creates a Deal. The data
+   spine's signed Stripe webhook opens the Deal: on a verified card
+   hold for a filing order (stage SERVICE REQUESTED, Payment_Status
+   "Hold Placed"), or on a verified payment for an order charged at
+   checkout (Closed Won). A held Deal moves to Closed Won only after
+   the hold is collected. See DECISIONS.md, 2026-11-04.
 
    UPDATED 2026-07-01:
    - Branches on body.lead_type so partial captures and
      urgent name-review requests stop creating duplicate
      Contacts/Deals. Only "intake_complete" (or a missing
      lead_type, for backward compatibility) creates the
-     real Contact + Deal, exactly as before.
+     real Contact (and, until 2026-10-23, a Deal).
    - "urgent_name_review" now fires a real-time Cliq
      notification instead of writing to CRM at all.
    - "intake_partial" still upserts a lightweight Contact
@@ -576,8 +582,9 @@ async function handleIntake(request, env) {
     const contactId = contactData.data?.[0]?.details?.id || null;
 
     /* ── No Deal here (frozen architecture rule) ──
-       A Zoho CRM Deal is created only after a verified Stripe payment
-       (webhook -> data spine order_deal sync job), one per paid session.
+       A Zoho CRM Deal is opened only by a verified Stripe webhook
+       (data spine order_deal sync job): on the card hold for a filing
+       order, or on payment for an order charged at checkout.
        Intake completion only creates/updates the Contact. */
     const pkg = body.package || "standard";
 

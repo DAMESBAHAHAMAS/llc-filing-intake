@@ -43,16 +43,16 @@ export interface ZohoClient {
    */
   syncOrderEvent(payload: OrderSyncPayload): Promise<ZohoSyncResult>;
   /**
-   * sync_type='deal_stage_update' — the OTHER Deal lifecycle this
-   * codebase now supports, alongside syncOrderEvent's "create the Deal
-   * at payment time": the Cloudflare Worker (llc-worker.js) creates the
-   * Deal at intake and hands its id back to the customer's session
-   * (filing_sessions.crm_deal_id); once payment is confirmed,
-   * routes/webhooksStripe.ts enqueues this job to update that EXISTING
-   * Deal's stage rather than create a second one. Only reachable when a
-   * crm_deal_id was already known at payment time — see that file's own
-   * comment for what happens when it isn't (falls back to the existing
-   * paid_deal creation path, unchanged).
+   * sync_type='deal_stage_update' moves an existing Deal. The usual
+   * case is a Deal this data spine opened itself: the verified webhook
+   * opens it when the card hold is placed (syncOrderEvent, kind
+   * 'held_deal'), and this job closes it after capture. See DECISIONS.md,
+   * 2026-11-04 ("CRM Deal lifecycle as built").
+   *
+   * The other case is a filing session that already holds a crm_deal_id.
+   * The Cloudflare Worker stopped creating Deals on 2026-10-23, so no new
+   * session gets one from intake; the path remains for sessions that have
+   * one, and keeps the ownership check below.
    */
   updateDealStage(payload: DealStageUpdatePayload): Promise<ZohoSyncResult>;
 }

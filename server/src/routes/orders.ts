@@ -11,6 +11,7 @@ import {
 } from "../stripe/restClient.js";
 import { holdNoLongerCapturable } from "../payments/holdState.js";
 import { sendOpsAlert } from "../ops/alerts.js";
+import { deliverProofToCustomer } from "../proofDelivery/deliverProof.js";
 
 export const ordersRouter = Router();
 
@@ -33,9 +34,12 @@ function operatorAuthorized(req: Request): boolean {
  * Body: { document_number: string }
  *
  * Records proof of filing (the Sunbiz document number of the filed
- * Articles) and then collects the held payment. This is the only path
- * that collects money on a held order — Damian's rule: the card is not
- * charged until proof of filing is delivered.
+ * Articles), delivers it to the customer, and then collects the held
+ * payment. This is the only path that collects money on a held order —
+ * Damian's rule: the card is not charged until proof of filing is
+ * delivered. If delivery fails nothing is collected and the order stays
+ * as it was; calling this route again retries from there, and sends the
+ * customer nothing further once delivery has succeeded.
  *
  * If the hold can no longer be collected (it expired or was released),
  * the card saved at checkout is charged instead. Either way the order
@@ -80,11 +84,21 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
   }
 
   if (order.payment_status === "paid") {
-    res.status(200).json({ order_id: order.order_id, status: "already_paid" });
+    // Already collected, so nothing depends on this send; the customer still gets their proof.
+    const delivery = await deliverProofToCustomer(pool, order.order_id);
+    if (!delivery.ok) await alertProofNotDelivered(order.order_id, delivery.error);
+    res.status(200).json({ order_id: order.order_id, status: "already_paid", proof_delivered: delivery.ok });
     return;
   }
   if (!["authorized", "released"].includes(order.payment_status) || !order.stripe_payment_intent_id) {
     res.status(409).json({ error: `order payment_status is ${order.payment_status}; nothing held to collect`, order_id: order.order_id });
+    return;
+  }
+
+  const delivery = await deliverProofToCustomer(pool, order.order_id);
+  if (!delivery.ok) {
+    await alertProofNotDelivered(order.order_id, delivery.error);
+    res.status(502).json({ error: "proof of filing was not delivered to the customer; nothing was collected", detail: delivery.error, order_id: order.order_id });
     return;
   }
 
@@ -149,6 +163,11 @@ ordersRouter.post("/api/orders/:orderId/release-hold", async (req, res) => {
     res.status(502).json({ error: "release failed", detail: describeError(err) });
   }
 });
+
+async function alertProofNotDelivered(orderId: string, reason: string): Promise<void> {
+  console.error(`[payments] proof of filing not delivered for order ${orderId}: ${reason}`);
+  await sendOpsAlert("Proof of filing not delivered", `Order ${orderId}: ${reason}. Proof of filing is recorded. A held payment stays uncollected until delivery succeeds; call the proof-of-filing endpoint again to retry.`);
+}
 
 async function recordCaptureError(orderId: string, err: unknown): Promise<void> {
   try {

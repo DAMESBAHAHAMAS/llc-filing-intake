@@ -41,6 +41,10 @@ vi.mock("../src/stripe/restClient.js", async (orig) => {
   };
 });
 
+const delivery = vi.hoisted(() => ({ deliver: vi.fn(), alert: vi.fn() }));
+vi.mock("../src/proofDelivery/deliverProof.js", () => ({ deliverProofToCustomer: delivery.deliver }));
+vi.mock("../src/ops/alerts.js", () => ({ sendOpsAlert: delivery.alert }));
+
 const { ordersRouter } = await import("../src/routes/orders.js");
 const { StripeApiError } = await import("../src/stripe/restClient.js");
 
@@ -70,6 +74,9 @@ beforeEach(() => {
     currency: "usd",
   };
   Object.values(stripe).forEach((f) => f.mockReset());
+  delivery.alert.mockReset();
+  delivery.deliver.mockReset();
+  delivery.deliver.mockResolvedValue({ ok: true, alreadyDelivered: false });
 });
 
 async function post(path: string, body: unknown, key: string | null = "op-test-key") {
@@ -103,6 +110,72 @@ describe("POST /api/orders/:orderId/proof-of-filing", () => {
     expect(db.queries[0]).toMatch(/proof_of_filing_ref/);
     // The route never marks the order paid itself — the webhook does.
     expect(db.queries.join("\n")).not.toMatch(/payment_status = 'paid'/);
+  });
+
+  it("delivers proof to the customer before any money moves", async () => {
+    const order: string[] = [];
+    delivery.deliver.mockImplementation(async () => {
+      order.push("delivered");
+      return { ok: true, alreadyDelivered: false };
+    });
+    stripe.capture.mockImplementation(async () => {
+      order.push("captured");
+      return { id: "pi_hold", status: "succeeded" };
+    });
+    await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
+    expect(order).toEqual(["delivered", "captured"]);
+  });
+
+  it("collects nothing when proof cannot be delivered, and says why", async () => {
+    delivery.deliver.mockResolvedValue({ ok: false, error: "Resend not configured" });
+    const r = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
+    expect(r.status).toBe(502);
+    expect(r.json).toMatchObject({ detail: "Resend not configured", order_id: "ord-1" });
+    expect(String(r.json.error)).toMatch(/nothing was collected/);
+    expect(stripe.capture).not.toHaveBeenCalled();
+    expect(stripe.charge).not.toHaveBeenCalled();
+    expect(stripe.retrieve).not.toHaveBeenCalled();
+    expect(delivery.alert).toHaveBeenCalledTimes(1);
+    // The proof itself stays recorded, so the retry below can pick it up.
+    expect(db.queries[0]).toMatch(/proof_of_filing_ref/);
+  });
+
+  it("does not charge the saved card either when an expired hold's proof cannot be delivered", async () => {
+    db.order = { ...db.order, payment_status: "released" };
+    delivery.deliver.mockResolvedValue({ ok: false, error: "no customer email" });
+    const r = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
+    expect(r.status).toBe(502);
+    expect(stripe.charge).not.toHaveBeenCalled();
+  });
+
+  it("collects on the retry once delivery succeeds", async () => {
+    delivery.deliver.mockResolvedValueOnce({ ok: false, error: "provider down" });
+    stripe.capture.mockResolvedValue({ id: "pi_hold", status: "succeeded" });
+    expect((await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" })).status).toBe(502);
+    const retry = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
+    expect(retry.status).toBe(200);
+    expect(retry.json.status).toBe("collection_requested");
+    expect(stripe.capture).toHaveBeenCalledTimes(1);
+  });
+
+  it("still gives an already-paid customer their proof, and a failed send changes nothing", async () => {
+    db.order = { ...db.order, payment_status: "paid" };
+    expect((await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" })).json).toMatchObject({
+      status: "already_paid",
+      proof_delivered: true,
+    });
+    delivery.deliver.mockResolvedValue({ ok: false, error: "provider down" });
+    const r = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
+    expect(r.status).toBe(200);
+    expect(r.json).toMatchObject({ status: "already_paid", proof_delivered: false });
+    expect(delivery.alert).toHaveBeenCalledTimes(1);
+    expect(stripe.capture).not.toHaveBeenCalled();
+  });
+
+  it("emails nothing for an order with nothing held", async () => {
+    db.order = { ...db.order, payment_status: "pending" };
+    expect((await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" })).status).toBe(409);
+    expect(delivery.deliver).not.toHaveBeenCalled();
   });
 
   it("charges the saved card when the hold has expired", async () => {

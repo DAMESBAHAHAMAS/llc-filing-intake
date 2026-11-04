@@ -170,11 +170,12 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         // Stripe Checkout would have landed on the 404 page.
         cancelUrl: `${frontendBaseUrl}/checkout/cancel?filing_session_id=${encodeURIComponent(filingSessionId)}&order_id=${encodeURIComponent(orderId)}`,
         customerEmail: session.rows[0].email ?? undefined,
-        // Carries the Cloudflare Worker's intake-time Deal id (when
-        // known — filing_sessions.crm_deal_id, see routes/session.ts's
-        // POST /api/session/stage) through to the webhook, so it can
-        // update that existing Deal's stage instead of creating a
-        // second one. See zoho/client.ts's updateDealStage comment.
+        // Carries a session's existing Deal id, if it has one
+        // (filing_sessions.crm_deal_id, see routes/session.ts's
+        // POST /api/session/stage), through to the webhook, so it can
+        // update that Deal instead of creating a second one. Intake no
+        // longer creates Deals (2026-10-23), so a new session has none
+        // and the webhook opens the Deal on the verified hold or payment.
         metadata: session.rows[0].crm_deal_id ? { crm_deal_id: session.rows[0].crm_deal_id } : undefined,
         captureMode,
         paymentIntentMetadata: { order_id: orderId, filing_session_id: filingSessionId },
