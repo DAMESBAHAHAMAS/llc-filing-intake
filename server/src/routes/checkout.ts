@@ -6,7 +6,7 @@ import { resolveActiveOffers } from "../offers/catalog.js";
 import { createCheckoutSession, StripeApiError } from "../stripe/restClient.js";
 import { getEinExpressAvailability } from "../ein/capacity.js";
 import { houseAgentLineMissing } from "../offers/houseAgentRule.js";
-import { deferredServiceCents, holdsEnabled, HOLD_CHECKOUT_MESSAGE, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
+import { deferredServiceCents, holdCheckoutText, holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 
 export const checkoutRouter = Router();
@@ -81,7 +81,11 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
   }
 
   try {
-    const session = await pool.query<{ email: string | null; crm_deal_id: string | null; filing_data: { registered_agent_path?: string } | null }>(
+    const session = await pool.query<{
+      email: string | null;
+      crm_deal_id: string | null;
+      filing_data: { registered_agent_path?: string; filing_authorization?: { accepted?: unknown } | null } | null;
+    }>(
       "SELECT email, crm_deal_id, filing_data FROM filing_sessions WHERE filing_session_id = $1",
       [filingSessionId]
     );
@@ -91,6 +95,17 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
     }
 
     const uniqueCodes = [...new Set(requestedItems.map((i) => i.offer_code))];
+
+    // An LLC filing order needs the customer's authorization to file and
+    // sign for them (filing_data.filing_authorization, written at intake
+    // by the website) before the card is touched.
+    if (needsSunbizFiling(requestedItems) && session.rows[0].filing_data?.filing_authorization?.accepted !== true) {
+      res.status(422).json({
+        error: "filing authorization is required before checkout for an LLC filing",
+        code: "filing_authorization_required",
+      });
+      return;
+    }
 
     // Registered-agent billing rule: choosing Damian as agent means the
     // 3-year agent service must be on the order (routes/../houseAgentRule.ts).
@@ -156,12 +171,13 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
     const deferredCents = captureMode === "hold" ? deferredServiceCents(lineItemSnapshots) : 0;
 
     const orderInsert = await pool.query<{ order_id: string }>(
-      `INSERT INTO orders (filing_session_id, crm_intent, product, line_items, total_cents, currency, checkout_status, deferred_cents)
-       VALUES ($1, $2, $3, $4, $5, 'usd', 'pending', $6)
+      `INSERT INTO orders (filing_session_id, crm_intent, product, line_items, total_cents, currency, checkout_status, deferred_cents, capture_mode)
+       VALUES ($1, $2, $3, $4, $5, 'usd', 'pending', $6, $7)
        RETURNING order_id`,
-      [filingSessionId, primaryOffer.crm_intent, primaryOffer.offer_code, JSON.stringify(lineItemSnapshots), totalCents, deferredCents]
+      [filingSessionId, primaryOffer.crm_intent, primaryOffer.offer_code, JSON.stringify(lineItemSnapshots), totalCents, deferredCents, captureMode]
     );
     const orderId = orderInsert.rows[0].order_id;
+    const heldText = captureMode === "hold" ? holdCheckoutText(lineItemSnapshots) : undefined;
 
     try {
       const stripeSession = await createCheckoutSession({
@@ -183,7 +199,8 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         metadata: session.rows[0].crm_deal_id ? { crm_deal_id: session.rows[0].crm_deal_id } : undefined,
         captureMode,
         paymentIntentMetadata: { order_id: orderId, filing_session_id: filingSessionId },
-        submitMessage: captureMode === "hold" && needsSunbizFiling(lineItemSnapshots) ? HOLD_CHECKOUT_MESSAGE : undefined,
+        submitMessage: heldText?.submit,
+        afterSubmitMessage: heldText?.afterSubmit,
       });
 
       await pool.query(

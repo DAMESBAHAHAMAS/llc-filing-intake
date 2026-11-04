@@ -40,7 +40,7 @@ describe("card-hold Checkout Session", () => {
     expect(body).toContain("payment_intent_data[setup_future_usage]=off_session");
     expect(body).toContain("payment_intent_data[metadata][order_id]=ord_1");
     expect(body).toContain("customer_creation=always");
-    expect(body).not.toContain("payment_method_types");
+    expect(new URLSearchParams(body).get("payment_method_types[0]")).toBe("card");
     // Stripe refuses extended holds on this account unless approved — never sent by default.
     expect(body).not.toContain("request_extended_authorization");
   });

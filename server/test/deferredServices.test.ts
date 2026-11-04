@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { deferredServiceCents, HOLD_CHECKOUT_MESSAGE } from "../src/offers/payAfterFiling.js";
+import {
+  deferredServiceCents,
+  holdCheckoutText,
+  HOLD_CHECKOUT_MESSAGE,
+  LATER_SERVICES_LINE,
+  SAVED_CARD_AUTHORIZATION,
+  SAVED_CARD_AUTHORIZATION_EIN_ONLY,
+} from "../src/offers/payAfterFiling.js";
 import { capturePaymentIntent, createCheckoutSession } from "../src/stripe/restClient.js";
 
 /**
@@ -45,19 +52,53 @@ describe("Stripe requests", () => {
     return calls;
   }
 
-  it("puts the approved hold line above the pay button", async () => {
+  it("shows the saved-card authorization above the pay button and the hold line below it", async () => {
     const calls = captureFetch();
+    const text = holdCheckoutText([{ offer_code: "FASTTRACK", unit_amount_cents: 49900, quantity: 1 }]);
     await createCheckoutSession({
       filingSessionId: "fs",
       lineItems: [{ price: "price_1", quantity: 1 }],
       successUrl: "https://e/s",
       cancelUrl: "https://e/c",
       captureMode: "hold",
-      submitMessage: HOLD_CHECKOUT_MESSAGE,
+      submitMessage: text.submit,
+      afterSubmitMessage: text.afterSubmit,
     });
     const body = new URLSearchParams(calls[0].body);
-    expect(body.get("custom_text[submit][message]")).toBe(HOLD_CHECKOUT_MESSAGE);
-    expect(HOLD_CHECKOUT_MESSAGE.length).toBeLessThanOrEqual(1200);
+    expect(body.get("custom_text[submit][message]")).toBe(SAVED_CARD_AUTHORIZATION);
+    expect(body.get("custom_text[after_submit][message]")).toBe(HOLD_CHECKOUT_MESSAGE);
+    expect(SAVED_CARD_AUTHORIZATION).toBe(
+      "By completing checkout, you authorize us to keep your card on file with Stripe. If your hold ends before Florida confirms your filing, you authorize us to charge that card once, without contacting you first, for the order total shown at checkout, after Florida confirms it. We use the saved card only for this order."
+    );
+    expect(SAVED_CARD_AUTHORIZATION.length).toBeLessThanOrEqual(1200);
+  });
+
+  it("takes cards only, for every session", async () => {
+    const calls = captureFetch();
+    for (const captureMode of ["hold", "immediate"] as const) {
+      await createCheckoutSession({ filingSessionId: "fs", lineItems: [{ price: "p", quantity: 1 }], successUrl: "https://e/s", cancelUrl: "https://e/c", captureMode });
+    }
+    for (const call of calls) {
+      const body = new URLSearchParams(call.body);
+      expect(body.getAll("payment_method_types[0]")).toEqual(["card"]);
+      expect(body.has("payment_method_types[1]")).toBe(false);
+    }
+  });
+
+  it("adds the approved later-services line when an EIN is deferred", () => {
+    const text = holdCheckoutText([
+      { offer_code: "FASTTRACK", unit_amount_cents: 49900, quantity: 1 },
+      { offer_code: "EIN_FILING", unit_amount_cents: 7500, quantity: 1 },
+    ]);
+    expect(text.afterSubmit).toBe(`${HOLD_CHECKOUT_MESSAGE} ${LATER_SERVICES_LINE}`);
+    expect(text.afterSubmit!.length).toBeLessThanOrEqual(1200);
+  });
+
+  it("does not tell an EIN-only customer that Florida will confirm anything", () => {
+    const text = holdCheckoutText([{ offer_code: "EIN_FILING", unit_amount_cents: 7500, quantity: 1 }]);
+    expect(text.submit).toBe(SAVED_CARD_AUTHORIZATION_EIN_ONLY);
+    expect(text.submit).not.toContain("Florida");
+    expect(text.afterSubmit).toBeUndefined();
   });
 
   it("captures part of a hold with amount_to_capture", async () => {

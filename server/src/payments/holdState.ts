@@ -9,15 +9,21 @@ export type OrderPaymentStatus = "pending" | "authorized" | "paid" | "failed" | 
  * What a completed Checkout Session means for an order.
  *  - "paid": money collected at checkout (no hold).
  *  - "authorized": a hold was placed; money is collected later, on proof of filing.
- *  - "ignore": nothing to do (already recorded, or no payment happened).
+ *  - "ignore": nothing to do (already recorded, no payment happened, or a
+ *    delayed payment method has not settled).
  */
 export function classifyCheckoutCompletion(
   sessionPaymentStatus: string | undefined,
   paymentIntentId: string | null | undefined,
-  orderPaymentStatus: string
+  orderPaymentStatus: string,
+  captureMode?: string | null
 ): "paid" | "authorized" | "ignore" {
   if (sessionPaymentStatus === "paid" && orderPaymentStatus !== "paid") return "paid";
-  if (sessionPaymentStatus === "unpaid" && paymentIntentId && orderPaymentStatus === "pending") return "authorized";
+  if (sessionPaymentStatus === "unpaid" && paymentIntentId && orderPaymentStatus === "pending") {
+    // Unpaid on an order that asked for no hold is a delayed payment method.
+    // Nothing is secured yet; async_payment_succeeded reports the result.
+    return captureMode === "immediate" ? "ignore" : "authorized";
+  }
   return "ignore";
 }
 
