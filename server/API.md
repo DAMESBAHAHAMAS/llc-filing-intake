@@ -22,6 +22,10 @@ Mints/updates the durable `filing_sessions` row. See
 `crm_sync_status`, `crm_last_synced_at`, `pdf_generated_at`, and
 `pdf_storage_ref` are **no longer accepted** from the client (they were
 previously in the whitelist — a P0 security gap, see `DECISIONS.md`).
+
+Once a filing order stands, `filing_data`, `email`, `entity_name_primary` and
+`entity_name_backup` are locked: a retry with the same values changes nothing,
+and any change answers 409 `filing_data_locked`.
 Sending them is silently ignored (not an error) — same as any other
 unrecognized field. If the frontend was relying on setting any of these
 directly, it needs to stop; they are now exclusively server/worker-owned.
@@ -417,9 +421,10 @@ was not paid. 409 `no_open_approval` if there is none. The name stays claimed.
 
 ## `POST /api/orders/:orderId/retry-articles` (operator key)
 
-Puts an order whose Articles gave up back in the queue, with fresh attempts. 409
-`articles_not_failed` otherwise. An order whose worker died goes back by itself
-on the next card-hold pass.
+Puts an order whose Articles gave up, or an order in review with no Articles and
+no approval, back in the queue, with fresh attempts. 409 `articles_not_failed`
+otherwise, and for a Stripe test-mode order. An order whose worker died goes back
+by itself on the next card-hold pass.
 
 ## `POST /api/orders/:orderId/correct-filing-name` (operator key)
 
@@ -432,24 +437,30 @@ emailed. 409 `filing_not_submitted` unless the order is `transmitted` with no pr
 ## `POST /api/orders/:orderId/replace-authorization` (operator key)
 
 Body: `{ "customer_agreed"?: string }`. Renews a $139 order's hold. The new hold
-is placed first, the order moves to it, and the old one is then cancelled. Before
-placing a hold it looks in Stripe for one already placed for this order and uses
-that. The Stripe key stays the same until a definite answer, so repeating a call
-can't place a second hold.
+is placed first, read back from Stripe, the order moves to it, and the old one is
+then cancelled. Before placing a hold it looks in Stripe for one already placed
+for this order and uses that. The Stripe key stays the same until a definite
+answer, or until the question of an unanswered request closes, so repeating a
+call can't place a second hold.
+
+A standing hold more than 48 hours from its end, or with no deadline from Stripe,
+needs `customer_agreed`: the customer's consent covers a hold about to end. So do
+further tries once 3 are used.
 
 A hold that has ended needs `customer_agreed`, saying how the customer agreed,
 which is written to `filing_events`. It is allowed on a released hold when the
 order is not cancelled, has no proof, and was never submitted or is rejected.
 
 402 when no new hold was placed, with `code` `replacement_declined`,
-`replacement_refused`, `replacement_not_capturable`, `hold_not_replaceable` or
-`replacement_lookup_failed`. 502 with `replacement_result_unknown` when Stripe
+`replacement_refused`, `replacement_not_capturable`, `hold_not_replaceable`,
+`replacement_lookup_failed` or `replacement_key_spent`, when the key returned a
+hold that is gone: the next attempt uses a new key. 502 with `replacement_result_unknown` when Stripe
 gave no answer, so a hold may exist. The order keeps `replacement_unknown_at`
 until that is settled: every card-hold pass looks, whatever the attempts, and
 moves the order to the hold or cancels it, and `/cancel`, `/release-hold`,
 proof, `payment-received` and `filing-rejected` cancel it too. 409 with
 `no_hold_to_replace`, `customer_agreement_required`, `no_replacement_consent`,
-`replacement_attempts_used`, `stray_capture_unresolved`, `order_busy` or
+`hold_not_near_end`, `replacement_attempts_used`, `stray_capture_unresolved`, `order_busy` or
 `order_changed`.
 
 ## `POST /api/orders/:orderId/submitted-to-sunbiz` (operator key)
@@ -470,8 +481,8 @@ Other packages have no approval step, so they must be in `requires_review`, with
 their Articles stored and any customer agent accepted: `registered_agent_not_accepted`,
 `articles_pdf_missing`, `filing_not_ready`.
 
-Any order is refused with 409 and `code`: `order_cancelled`, `filing_confirmed`,
-`no_payment_on_order`, `filing_rejected` (use the resubmission route), or
+Any order is refused with 409 and `code`: `order_cancelled`, `test_mode_order`,
+`filing_confirmed`, `no_payment_on_order`, `filing_rejected` (use the resubmission route), or
 `filing_submitted` under a different tracking number. A live test has no Sunbiz
 filing and is refused. A repeat with the same number answers `already_submitted`
 and changes nothing.
@@ -522,9 +533,10 @@ Refused with 409 and `code`: `order_cancelled`; `filing_not_confirmed`, because
 nothing is due before Florida confirms; `charge_in_progress`;
 `collection_unknown`, while a charge has no clear answer: call proof of filing
 again first; `already_collected`, when Stripe shows the hold was captured or
-lists any other payment for this order; `nothing_due`; `amount_mismatch`, with
-`amount_due_cents`. It is read from Stripe first, so it answers 500 and records
-nothing if Stripe can't be reached.
+lists any other payment for this order that is not refunded in full;
+`nothing_due`; `amount_mismatch`, with `amount_due_cents`. It is read from Stripe
+first, so it answers 500 and records nothing if Stripe can't be reached, or won't
+say whether a payment was refunded.
 
 ## `POST /api/orders/:orderId/service-complete` (operator key)
 

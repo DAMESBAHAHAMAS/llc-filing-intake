@@ -10,8 +10,10 @@ export function isReservedTestAddress(email: string): boolean {
   return RESERVED.test(email.trim());
 }
 
-/** Only an explicit false is test mode: orders from before the column have
- *  null, and those were live. */
+/** Only an explicit false is test mode. Migration 0026 marks every earlier
+ *  order false, and the webhook sets the column on every order after the
+ *  deploy, so null lasts only as long as the runbook's window between the two.
+ *  The runbook closes that window straight after the deploy. */
 export function blockedByTestMode(stripeLivemode: boolean | null | undefined, email: string): boolean {
   return stripeLivemode === false && !isReservedTestAddress(email);
 }

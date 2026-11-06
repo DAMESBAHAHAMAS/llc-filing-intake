@@ -10,7 +10,7 @@ import { attemptSavedCardCharge, findCollectedPayment, SAVED_CARD_CHARGE_REASON,
 import { requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { findFilingBlocker } from "../fulfillment/filingGate.js";
-import { hasDiyPackage } from "../offers/diyPackage.js";
+import { diyBreakdownFor, hasDiyPackage } from "../offers/diyPackage.js";
 import { isLiveTestOrder } from "../offers/liveTest.js";
 import { orderIsLiveTest } from "../offers/liveTestSeal.js";
 import { APPROVAL_VALID_HOURS, approvalCurrent, clearanceFor, entityNameKey, sameEntityName } from "../payments/filingClearance.js";
@@ -56,6 +56,7 @@ interface ProofOrder {
   saved_card_attempts?: number | null;
   saved_card_payment_intent_id?: string | null;
   collection_unknown_at?: Date | null;
+  line_items?: Array<{ offer_code?: string }> | null;
 }
 
 /**
@@ -187,7 +188,9 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", oneStep, async (req, r
         const verifiedName = typeof req.body?.verified_entity_name === "string" ? req.body.verified_entity_name : "";
         const filed = named.rows[0];
         // The filed name, which is locked once an order stands. Florida may
-        // take the backup the customer gave instead.
+        // take the backup the customer gave instead. That is locked too, but it
+        // is still the customer's own text, unchecked, and it only proves a
+        // match with what they typed: the operator's read of Sunbiz is the check.
         if (!sameEntityName(verifiedName, filed?.filing_data?.llc_name || filed?.entity_name_primary) && !sameEntityName(verifiedName, filed?.entity_name_backup)) {
           res.status(400).json({ error: "verified_entity_name must be the name Sunbiz shows for this document number, and match this order", code: "entity_name_not_verified", order_id: orderId });
           return;
@@ -220,7 +223,7 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", oneStep, async (req, r
            fulfillment_completed_at = COALESCE(fulfillment_completed_at, now())
        WHERE order_id = $1
        RETURNING order_id, filing_session_id, payment_status, stripe_payment_intent_id, total_cents, currency,
-                 deferred_cents, saved_card_attempts, saved_card_payment_intent_id, collection_unknown_at`,
+                 deferred_cents, saved_card_attempts, saved_card_payment_intent_id, collection_unknown_at, line_items`,
       [orderId, documentNumber]
     );
     order = rows[0];
@@ -355,6 +358,7 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", oneStep, async (req, r
     amountCents: collectNowCents,
     currency: order.currency || "usd",
     metadata: { order_id: order.order_id, reason: SAVED_CARD_CHARGE_REASON },
+    description: diyBreakdownFor(order.line_items, collectNowCents),
   });
 
   if (attempt.kind === "charged") {
@@ -654,6 +658,7 @@ interface FilingStateOrder {
   filing_session_id: string;
   payment_status: string;
   fulfillment_status: string;
+  stripe_livemode: boolean | null;
   line_items: Array<{ offer_code?: string }> | null;
   cancelled_at: Date | null;
   proof_of_filing_at: Date | null;
@@ -666,7 +671,7 @@ interface FilingStateOrder {
   sunbiz_rejection_count: number;
 }
 
-const FILING_STATE_COLUMNS = `order_id, filing_session_id, payment_status, fulfillment_status, line_items, cancelled_at, proof_of_filing_at, filing_approved_at,
+const FILING_STATE_COLUMNS = `order_id, filing_session_id, payment_status, fulfillment_status, stripe_livemode, line_items, cancelled_at, proof_of_filing_at, filing_approved_at,
        sunbiz_tracking_number, sunbiz_submitted_at, sunbiz_resubmitted_at, sunbiz_rejected_at, sunbiz_rejection_reason, sunbiz_rejection_count`;
 
 /** Sunbiz tracking numbers are digits today. Any plain reference fits, so a format change at Sunbiz doesn't stop an order. */
@@ -685,6 +690,10 @@ type Refusal = { status: number; body: Record<string, unknown> };
 /** What not even a filing that really happened can be recorded on. */
 function cannotRecordFiling(order: FilingStateOrder): Refusal | null {
   if (order.cancelled_at) return { status: 409, body: { error: "order is cancelled; nothing is filed or collected", code: "order_cancelled", order_id: order.order_id } };
+  // No money stands behind a Stripe test-mode order, and it must never take an LLC name from a real one.
+  if (order.stripe_livemode === false && process.env.TEST_MODE_ORDERS_FILE !== "true") {
+    return { status: 409, body: { error: "this is a Stripe test-mode order, so it is never filed", code: "test_mode_order", order_id: order.order_id } };
+  }
   if (!needsSunbizFiling(order.line_items ?? [])) return { status: 409, body: { error: "order includes no Sunbiz filing", order_id: order.order_id } };
   if (order.proof_of_filing_at) return { status: 409, body: { error: "Florida has already confirmed this filing", code: "filing_confirmed", order_id: order.order_id } };
   // Never paid for, and orders_fulfillment_requires_paid won't store a filing on it.
@@ -912,7 +921,7 @@ ordersRouter.post("/api/orders/:orderId/approve-filing", oneStep, async (req, re
   }
   try {
     const { rows } = await pool.query<FilingStateOrder & { stripe_payment_intent_id: string | null; total_cents: number; approved_unrecorded_at: Date | null; stray_capture_pi: string | null; entity_name_primary: string | null; filing_data: { llc_name?: string } | null }>(
-      `SELECT o.order_id, o.filing_session_id, o.payment_status, o.fulfillment_status, o.line_items, o.cancelled_at, o.proof_of_filing_at, o.filing_approved_at,
+      `SELECT o.order_id, o.filing_session_id, o.payment_status, o.fulfillment_status, o.stripe_livemode, o.line_items, o.cancelled_at, o.proof_of_filing_at, o.filing_approved_at,
               o.sunbiz_tracking_number, o.sunbiz_submitted_at, o.sunbiz_resubmitted_at, o.sunbiz_rejected_at, o.sunbiz_rejection_reason, o.sunbiz_rejection_count,
               o.stripe_payment_intent_id, o.total_cents, o.approved_unrecorded_at, o.stray_capture_pi, fs.entity_name_primary, fs.filing_data
        FROM orders o JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id WHERE o.order_id = $1`,
@@ -1019,6 +1028,7 @@ ordersRouter.post("/api/orders/:orderId/approve-filing", oneStep, async (req, re
  * A hold that has already ended is renewed only here, not by the sweep, and
  * needs `customer_agreed`, saying how the customer agreed. That covers an
  * order not yet submitted, and a rejected filing the customer is correcting.
+ * So does a standing hold not near its end, or one past its 3 tries.
  */
 ordersRouter.post("/api/orders/:orderId/replace-authorization", async (req, res) => {
   if (!operatorAuthorized(req)) {
@@ -1078,8 +1088,10 @@ ordersRouter.post("/api/orders/:orderId/withdraw-approval", oneStep, async (req,
 /**
  * POST /api/orders/:orderId/retry-articles
  *
- * An order whose Articles gave up has no other way back to the queue. Use it
- * once the cause is fixed. The attempts start again.
+ * An order whose Articles gave up, or that reached review with none because
+ * its details were incomplete, has no other way back to the queue. Use it once
+ * the cause is fixed. The attempts start again. Never on an approved order, or
+ * a Stripe test-mode order: that one is never filed.
  */
 ordersRouter.post("/api/orders/:orderId/retry-articles", oneStep, async (req, res) => {
   if (!operatorAuthorized(req)) {
@@ -1087,13 +1099,15 @@ ordersRouter.post("/api/orders/:orderId/retry-articles", oneStep, async (req, re
     return;
   }
   try {
+    const articles = await pool.query(`SELECT 1 FROM filing_documents WHERE order_id = $1 LIMIT 1`, [req.params.orderId]);
     const { rowCount } = await pool.query(
       `UPDATE orders SET fulfillment_status = 'ready', fulfillment_ready_at = now(), fulfillment_attempts = 0, fulfillment_run_after = NULL, fulfillment_last_error = NULL
-        WHERE order_id = $1 AND fulfillment_status = 'failed' AND cancelled_at IS NULL`,
-      [req.params.orderId]
+        WHERE order_id = $1 AND cancelled_at IS NULL AND (stripe_livemode IS NULL OR stripe_livemode = true OR $3::boolean)
+          AND (fulfillment_status = 'failed' OR (fulfillment_status = 'requires_review' AND approved_unrecorded_at IS NULL AND $2::boolean))`,
+      [req.params.orderId, !articles.rowCount, process.env.TEST_MODE_ORDERS_FILE === "true"]
     );
     if (!rowCount) {
-      res.status(409).json({ error: "only an order whose Articles gave up can be retried", code: "articles_not_failed", order_id: req.params.orderId });
+      res.status(409).json({ error: "only an order whose Articles gave up or are missing can be retried", code: "articles_not_failed", order_id: req.params.orderId });
       return;
     }
     res.status(200).json({ order_id: req.params.orderId, status: "queued" });

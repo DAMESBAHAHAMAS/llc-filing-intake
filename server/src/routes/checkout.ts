@@ -140,8 +140,10 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
       return;
     }
 
-    // One filing is one LLC: the Stripe text says "Your $139".
-    if (needsSunbizFiling(requestedItems) && requestedItems.some((i) => i.quantity !== 1)) {
+    // One filing is one LLC: the Stripe text says "Your $139". A repeated line
+    // is a quantity of two by another name.
+    const filingCodes = requestedItems.filter((i) => needsSunbizFiling([i])).map((i) => i.offer_code);
+    if (needsSunbizFiling(requestedItems) && (requestedItems.some((i) => i.quantity !== 1) || new Set(filingCodes).size !== filingCodes.length)) {
       res.status(422).json({ error: "a filing offer is sold one at a time", code: "quantity_not_allowed" });
       return;
     }

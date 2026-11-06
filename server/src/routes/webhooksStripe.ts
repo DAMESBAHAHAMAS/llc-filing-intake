@@ -10,6 +10,7 @@ import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
 import { alertEmailsNotQueued, CHECKOUT_EMAIL_TYPES, enqueueCustomerEmails } from "../orderEmails/worker.js";
 import { enqueueDealUpdate, type TxClient } from "../payments/dealUpdates.js";
 import { SAVED_CARD_CHARGE_REASON } from "../payments/savedCard.js";
+import { dropStrays, recordStray } from "../payments/strayCapture.js";
 import {
   classifyCheckoutCompletion,
   fulfillmentAfterPaymentEnds,
@@ -439,7 +440,7 @@ export async function handlePaymentLifecycleEvent(
 
   const found = await client.query(
     `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at, stripe_payment_intent_id, superseded_payment_intent_ids, deferred_payment_intent_id, cancelled_at,
-            saved_card_payment_intent_id, other_payment_at, stray_capture_pi
+            saved_card_payment_intent_id, other_payment_at, stray_capture_pi, more_stray_capture_pis
      FROM orders
      WHERE ($1::uuid IS NOT NULL AND order_id = $1::uuid) OR ($2::text IS NOT NULL AND stripe_payment_intent_id = $2::text)
         OR ($2::text IS NOT NULL AND superseded_payment_intent_ids @> $3::jsonb)
@@ -461,6 +462,7 @@ export async function handlePaymentLifecycleEvent(
     saved_card_payment_intent_id?: string | null;
     other_payment_at?: Date | null;
     stray_capture_pi?: string | null;
+    more_stray_capture_pis?: string[] | null;
   };
 
   // Before the Basil API version, cancelling a hold also reports charge.refunded.
@@ -470,9 +472,14 @@ export async function handlePaymentLifecycleEvent(
   }
 
   // The refund that clears money landed on a hold the order does not use.
-  if (event.type === "charge.refunded" && obj.refunded && paymentIntentId && paymentIntentId === order.stray_capture_pi) {
-    await client.query(`UPDATE orders SET stray_capture_pi = NULL WHERE order_id = $1`, [order.order_id]);
-    await sendOpsAlert("The stray hold was refunded", `Order ${order.order_id}: ${paymentIntentId} was refunded, so the order can go on. Its own hold ${order.stripe_payment_intent_id} is unchanged.`);
+  if (event.type === "charge.refunded" && obj.refunded && paymentIntentId && [order.stray_capture_pi, ...(order.more_stray_capture_pis ?? [])].includes(paymentIntentId)) {
+    const left = await dropStrays(client, order.order_id, [paymentIntentId]);
+    await sendOpsAlert(
+      "The stray hold was refunded",
+      left.length
+        ? `Order ${order.order_id}: ${paymentIntentId} was refunded, but money still sits on ${left.join(", ")}. Refund that too. The order collects nothing more until then.`
+        : `Order ${order.order_id}: ${paymentIntentId} was refunded, so the order can go on. Its own hold ${order.stripe_payment_intent_id} is unchanged.`
+    );
     return { processingResult: "stray_capture_refunded", orderId: order.order_id };
   }
 
@@ -497,7 +504,7 @@ export async function handlePaymentLifecycleEvent(
   // Money on a replaced hold is an operator's mistake, not this order's payment.
   // The order remembers it, or the normal path would collect a second $139.
   if (event.type === "payment_intent.succeeded" && (order.superseded_payment_intent_ids ?? []).includes(obj.id)) {
-    await client.query(`UPDATE orders SET stray_capture_pi = $2 WHERE order_id = $1`, [order.order_id, obj.id]);
+    await recordStray(client, order.order_id, obj.id);
     await sendOpsAlert("A replaced card hold was captured", `Order ${order.order_id}: ${obj.id} was captured, and the current hold ${order.stripe_payment_intent_id} is still open. Refund ${obj.id}. Do not release the current hold: the order collects nothing more until that refund lands.`);
     return { processingResult: "superseded_hold_captured", orderId: order.order_id };
   }
@@ -516,20 +523,22 @@ export async function handlePaymentLifecycleEvent(
     }
     if (!shouldMarkPaidOnPaymentIntentSucceeded(order.payment_status)) {
       if (["paid", "refunded"].includes(order.payment_status) && (!expected || order.other_payment_at)) {
-        await sendOpsAlert("A second payment landed on this order", `Order ${order.order_id}: ${obj.id} was collected on an order already ${order.payment_status}${order.other_payment_at ? ", recorded as paid outside Stripe" : ""}. The customer has paid twice. Refund one.`);
+        await sendOpsAlert("A second payment landed on this order", `Order ${order.order_id}: ${obj.id} was collected on an order already ${order.payment_status}${order.other_payment_at ? ", recorded as paid outside Stripe" : ""}. The customer has paid twice. Refund ${obj.id}, and leave the payment that paid the order.`);
         return { processingResult: "second_payment_on_order", orderId: order.order_id };
       }
       return { processingResult: "ignored_not_awaiting_collection", orderId: order.order_id };
     }
     if (!expected) {
-      await client.query(`UPDATE orders SET stray_capture_pi = $2 WHERE order_id = $1`, [order.order_id, obj.id]);
+      await recordStray(client, order.order_id, obj.id);
       await sendOpsAlert("A hold this order does not use was captured", `Order ${order.order_id}: ${obj.id} was collected, and the order's own hold ${order.stripe_payment_intent_id} is still open. Refund ${obj.id}. The order collects nothing more until that refund lands.`);
       return { processingResult: "untracked_hold_captured", orderId: order.order_id };
     }
+    // A saved-card charge that lands after its answer was lost is on the order only from here.
     await client.query(
-      `UPDATE orders SET payment_status = 'paid', paid_at = COALESCE(paid_at, now()), captured_at = COALESCE(captured_at, now()), capture_error = NULL, collection_unknown_at = NULL
+      `UPDATE orders SET payment_status = 'paid', paid_at = COALESCE(paid_at, now()), captured_at = COALESCE(captured_at, now()), capture_error = NULL, collection_unknown_at = NULL,
+              saved_card_payment_intent_id = COALESCE(saved_card_payment_intent_id, $2::text)
        WHERE order_id = $1`,
-      [order.order_id]
+      [order.order_id, obj.id === order.stripe_payment_intent_id ? null : obj.id]
     );
     const enqueued = await enqueueDealUpdate(client, order, {
       target_stage: process.env.ZOHO_DEAL_STAGE_ON_CAPTURE || process.env.ZOHO_DEAL_STAGE_ON_PAYMENT || "Closed Won",
@@ -572,6 +581,13 @@ export async function handlePaymentLifecycleEvent(
   // charge.refunded
   if (!obj.refunded) return { processingResult: "partial_refund_recorded_in_stripe_only", orderId: order.order_id };
   if (order.payment_status !== "paid") return { processingResult: "ignored_not_paid", orderId: order.order_id };
+  // Only the payment that paid the order ends it. Refunding a second payment
+  // is what the alert asked for, and the first still stands.
+  const paidWith = order.saved_card_payment_intent_id ?? order.stripe_payment_intent_id;
+  if (order.other_payment_at || (paidWith && paymentIntentId !== paidWith)) {
+    await sendOpsAlert("A second payment was refunded", `Order ${order.order_id}: ${paymentIntentId} was refunded. ${order.other_payment_at ? "The payment recorded outside Stripe" : `${paidWith}, which paid the order,`} still stands, so the order stays paid.`);
+    return { processingResult: "second_payment_refunded", orderId: order.order_id };
+  }
   await client.query(`UPDATE orders SET payment_status = 'refunded', fulfillment_status = $2 WHERE order_id = $1`, [
     order.order_id,
     fulfillmentAfterPaymentEnds(order.fulfillment_status),

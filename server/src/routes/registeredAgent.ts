@@ -3,10 +3,9 @@ import { isLiveTestSession, LIVE_TEST_SESSION_REFUSED } from "../offers/liveTest
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
-import { notifyAgentProblem, openFilingOrders } from "../registeredAgent/customerNotice.js";
+import { articlesMustBeRedone, notifyAgentProblem, openFilingOrders, reevaluateFulfillmentAfterAcceptance } from "../registeredAgent/customerNotice.js";
 import { sendOpsAlert } from "../ops/alerts.js";
 import { looksLikePoBox } from "../registeredAgent/poBox.js";
-import { hasDiyPackage } from "../offers/diyPackage.js";
 
 export const registeredAgentRouter = Router();
 
@@ -64,44 +63,6 @@ const FILING_AT_FLORIDA = {
   error: "this filing has been approved or submitted to Florida, so its registered agent can no longer be changed here",
   code: "filing_submitted",
 };
-
-/**
- * Starts filing on any order that was waiting for its registered agent,
- * after registered_agent_status changes to 'accepted' — the other half of
- * the gate routes/webhooksStripe.ts applies at payment time (see that
- * file's own registered-agent-gate comment). Most orders are held, not
- * paid, by this point: the card is charged only after Florida confirms.
- *
- * A released hold still files on other packages. The agent can take the full
- * 7 days a hold lasts, and the customer authorized the saved card for exactly
- * that case; it is charged after Florida confirms (routes/orders.ts). Ops hears
- * about it, because Damian is paying Sunbiz with no hold behind the order. A
- * $139 order can't file on a released hold: approve-filing refuses it until a
- * new hold is placed. A cancelled order never files, and neither does a Stripe
- * test-mode order: the same rule the webhook applied when it was paid.
- */
-async function reevaluateFulfillmentAfterAcceptance(filingSessionId: string): Promise<void> {
-  for (const order of await openFilingOrders(pool, filingSessionId)) {
-    if (order.stripe_livemode === false && process.env.TEST_MODE_ORDERS_FILE !== "true") continue;
-    const started = await pool.query(
-      `UPDATE orders SET fulfillment_status = 'ready', fulfillment_ready_at = now()
-       WHERE order_id = $1 AND fulfillment_status = 'not_ready' AND cancelled_at IS NULL`,
-      [order.order_id]
-    );
-    if (!started.rowCount || order.payment_status !== "released") continue;
-    if (hasDiyPackage(order.line_items ?? [])) {
-      await sendOpsAlert(
-        "Agent accepted on an order with no hold",
-        `Order ${order.order_id}: the registered agent accepted after the card hold ended, so this order can't file yet. If the customer agrees to a new hold, use replace-authorization with customer_agreed. Otherwise use /cancel. Do not pay Florida until approve-filing succeeds.`
-      );
-    } else {
-      await sendOpsAlert(
-        "Filing started with no hold in place",
-        `Order ${order.order_id}: the registered agent accepted after the card hold ended. Filing is starting. The saved card is charged after Florida confirms, and it can still decline.`
-      );
-    }
-  }
-}
 
 /**
  * POST /registered-agent/select
@@ -172,11 +133,12 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
       await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'accepted' WHERE filing_session_id = $1`, [
         filingSessionId,
       ]);
+      await articlesMustBeRedone(pool, filingSessionId);
       // Covers switching an already-paid order from "own" to "damian"
       // (e.g. an outside agent declined and the customer switched) —
       // otherwise an order blocked on outside-agent acceptance would
       // stay not_ready forever even though the new choice needs none.
-      await reevaluateFulfillmentAfterAcceptance(filingSessionId);
+      await reevaluateFulfillmentAfterAcceptance(pool, filingSessionId);
       res.status(200).json({ status: "accepted" });
       return;
     }
@@ -219,6 +181,7 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
     await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'pending' WHERE filing_session_id = $1`, [
       filingSessionId,
     ]);
+    await articlesMustBeRedone(pool, filingSessionId);
 
     const llcNameRow = await pool.query<{ filing_data: { llc_name?: string } | null }>(
       `SELECT filing_data FROM filing_sessions WHERE filing_session_id = $1`,
@@ -309,6 +272,7 @@ registeredAgentRouter.post("/api/registered-agent/request-acceptance", async (re
       registered_agent_florida_address: address,
       registered_agent_email: registeredAgentEmail,
     });
+    await articlesMustBeRedone(pool, filingSessionId);
 
     const result = await dispatchAcceptanceEmail(pool, filingSessionId);
     if (!result.ok) {
@@ -451,10 +415,9 @@ registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
 
     // Best-effort, post-commit-equivalent: the acceptance itself is
     // already durable regardless of what happens here. A failure just
-    // means an order stays not_ready a little longer than it should —
-    // nothing is lost.
+    // means an order waits for the next agent sweep, which repeats this.
     try {
-      await reevaluateFulfillmentAfterAcceptance(resolved.row.filing_session_id);
+      await reevaluateFulfillmentAfterAcceptance(pool, resolved.row.filing_session_id);
     } catch (err) {
       console.error(`Fulfillment re-evaluation failed for filing_session_id=${resolved.row.filing_session_id}:`, err);
     }

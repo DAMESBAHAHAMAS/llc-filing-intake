@@ -48,7 +48,7 @@ const SCHEMA = `
     cancelled_at timestamptz, cancellation_reason text,
     saved_card_detached_at timestamptz, saved_card_detach_error text,
     fulfillment_completed_at timestamptz,
-    replacement_unknown_at timestamptz, replacement_key_seq integer NOT NULL DEFAULT 0, approved_unrecorded_at timestamptz, filing_approved_name text, collection_unknown_at timestamptz, stray_capture_pi text,
+    replacement_unknown_at timestamptz, replacement_key_seq integer NOT NULL DEFAULT 0, approved_unrecorded_at timestamptz, filing_approved_name text, collection_unknown_at timestamptz, stray_capture_pi text, more_stray_capture_pis jsonb NOT NULL DEFAULT '[]'::jsonb,
     filing_name_key text, hold_op_until timestamptz, hold_op_token text, hold_lapsed_flagged_at timestamptz, superseded_open boolean NOT NULL DEFAULT false, hold_unknown_flagged_at timestamptz, replacement_attempts integer NOT NULL DEFAULT 0, replacement_last_attempt_at timestamptz, replacement_last_error text, filing_approved_at timestamptz, hold_final_flagged_at timestamptz, capture_before timestamptz, extended_authorization boolean, hold_expiry_flagged_at timestamptz, superseded_payment_intent_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
     sunbiz_tracking_number text, sunbiz_submitted_at timestamptz, sunbiz_resubmitted_at timestamptz,
     sunbiz_rejected_at timestamptz, sunbiz_rejection_reason text, sunbiz_rejection_count integer NOT NULL DEFAULT 0,

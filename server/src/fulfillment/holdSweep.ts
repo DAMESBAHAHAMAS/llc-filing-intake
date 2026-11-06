@@ -1,11 +1,12 @@
 import type { Pool } from "pg";
 import { describeError } from "../db/describeError.js";
 import { cancelPaymentIntent } from "../stripe/restClient.js";
-import { holdDetails, retrievePaymentIntent, type StripePaymentIntent } from "../stripe/restClient.js";
+import { holdDetails, refundState, retrievePaymentIntent, type StripePaymentIntent } from "../stripe/restClient.js";
 import { ordersNeedingExpiryFlag, ordersNeedingFinalFlag, type HeldOrderRow } from "../payments/holdState.js";
 import { sendOpsAlert } from "../ops/alerts.js";
 import { APPROVAL_VALID_HOURS } from "../payments/filingClearance.js";
-import { HOURS_BETWEEN_ATTEMPTS, MAX_REPLACEMENT_ATTEMPTS, renewHoldFromSweep, RENEWAL_WINDOW_HOURS, settleUnknownReplacement, stuckOn, type RenewalFacts, type ReplaceOutcome } from "../payments/replaceHold.js";
+import { dropStrays, inTransaction, recordStray } from "../payments/strayCapture.js";
+import { HAS_ARTICLES, HOURS_BETWEEN_ATTEMPTS, JOIN_ARTICLES, MAX_REPLACEMENT_ATTEMPTS, renewHoldFromSweep, RENEWAL_WINDOW_HOURS, settleUnknownReplacement, stuckOn, type RenewalFacts, type ReplaceOutcome } from "../payments/replaceHold.js";
 import { reapStalledOrders } from "./fulfillmentWorker.js";
 
 /** With a live key, a test-mode hold can't be read and would only fail. */
@@ -97,8 +98,9 @@ export async function runHoldSweepOnce(pool: Pool, deps: HoldSweepDeps = default
         const pi = await deps.retrievePaymentIntent(id);
         if (pi.status === "requires_capture") await cancelPaymentIntent(id, `cancel-superseded-${id}`);
         // Captured before it could be cancelled, so it can't count as dealt with.
-        if (pi.status === "succeeded") {
-          await pool.query(`UPDATE orders SET stray_capture_pi = $2 WHERE order_id = $1 AND stray_capture_pi IS NULL`, [row.order_id, id]);
+        // A refund leaves it at succeeded, and that money is already back.
+        if (pi.status === "succeeded" && refundState(pi) !== true) {
+          await inTransaction(pool, (client) => recordStray(client, row.order_id, id));
           await deps.alert(`Order ${row.order_id}: replaced hold ${id} was captured. Refund it. The order collects nothing more until that refund lands.`);
         }
       }
@@ -106,6 +108,27 @@ export async function runHoldSweepOnce(pool: Pool, deps: HoldSweepDeps = default
     } catch (err) {
       console.error(`[hold sweep] could not cancel a replaced hold on order ${row.order_id}:`, describeError(err));
       await deps.alert(`Order ${row.order_id}: a replaced card hold is still open. Cancel it in Stripe.`).catch(() => undefined);
+    }
+  }
+
+  // The refund event clears a stray, but it can arrive first and be gone by the
+  // time the capture is recorded. Stripe has the last word on what was refunded.
+  const strayOrders = await pool.query<{ order_id: string; stray_capture_pi: string; more_stray_capture_pis: string[] | null }>(
+    `SELECT order_id, stray_capture_pi, more_stray_capture_pis FROM orders WHERE stray_capture_pi IS NOT NULL ${liveOnly()}`
+  );
+  for (const row of strayOrders.rows) {
+    try {
+      const refunded: string[] = [];
+      for (const id of [row.stray_capture_pi, ...(row.more_stray_capture_pis ?? [])]) {
+        if (refundState(await deps.retrievePaymentIntent(id)) === true) refunded.push(id);
+      }
+      if (!refunded.length) continue;
+      const left = await inTransaction(pool, (client) => dropStrays(client, row.order_id, refunded));
+      await deps
+        .alert(`Order ${row.order_id}: ${refunded.join(", ")} was refunded. ${left.length ? `Money still sits on ${left.join(", ")}. Refund that too.` : "The order can go on."}`)
+        .catch(() => undefined);
+    } catch (err) {
+      console.error(`[hold sweep] could not check a stray payment on order ${row.order_id}:`, describeError(err));
     }
   }
 
@@ -123,8 +146,8 @@ export async function runHoldSweepOnce(pool: Pool, deps: HoldSweepDeps = default
 
   const held = await pool.query<HeldOrderRow & RenewalFacts>(
     `SELECT o.order_id, o.capture_before, o.proof_of_filing_at, o.hold_expiry_flagged_at, o.hold_final_flagged_at, o.fulfillment_status, o.filing_approved_at,
-            fs.registered_agent_status, fs.filing_data
-     FROM orders o LEFT JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id
+            fs.registered_agent_status, fs.filing_data, ${HAS_ARTICLES}
+     FROM orders o LEFT JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id ${JOIN_ARTICLES}
      WHERE o.payment_status = 'authorized' AND o.capture_before IS NOT NULL`
   );
   const heldRow = (orderId: string) => held.rows.find((r) => r.order_id === orderId);
@@ -179,8 +202,8 @@ export async function runHoldSweepOnce(pool: Pool, deps: HoldSweepDeps = default
   // order with no Articles or no agent can't file. Those run out, which raises
   // the lapse alert. Renewing clears an approval, so one in use is left to run out.
   const expiring48 = await pool.query<RenewalFacts & { order_id: string; replacement_last_attempt_at: Date | null }>(
-    `SELECT o.order_id, o.replacement_last_attempt_at, o.fulfillment_status, o.filing_approved_at, fs.registered_agent_status, fs.filing_data
-     FROM orders o LEFT JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id
+    `SELECT o.order_id, o.replacement_last_attempt_at, o.fulfillment_status, o.filing_approved_at, fs.registered_agent_status, fs.filing_data, ${HAS_ARTICLES}
+     FROM orders o LEFT JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id ${JOIN_ARTICLES}
      WHERE o.cancelled_at IS NULL AND o.proof_of_filing_at IS NULL AND o.replacement_attempts < $2
        AND o.payment_status = 'authorized' AND o.capture_before IS NOT NULL AND o.capture_before <= $1
        AND o.fulfillment_status <> 'rejected'

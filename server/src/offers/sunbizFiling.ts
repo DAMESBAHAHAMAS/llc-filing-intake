@@ -8,7 +8,7 @@ import { isLiveTestOrder } from "./liveTest.js";
  * orders never touch that pipeline at all.
  *
  * Its own module (not defined inline in routes/webhooksStripe.ts) so
- * routes/registeredAgent.ts can reuse the exact same test when a
+ * registeredAgent/customerNotice.ts can reuse the exact same test when a
  * registered agent accepts after an order is already paid
  * (reevaluateFulfillmentAfterAcceptance) without a route-to-route import.
  */

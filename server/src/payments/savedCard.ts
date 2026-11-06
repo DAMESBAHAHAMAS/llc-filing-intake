@@ -1,4 +1,4 @@
-import { chargeSavedCard, listPaymentIntents, StripeApiError, type StripePaymentIntent } from "../stripe/restClient.js";
+import { chargeSavedCard, listPaymentIntents, refundState, StripeApiError, type StripePaymentIntent } from "../stripe/restClient.js";
 import { describeError } from "../db/describeError.js";
 
 export type SavedCardOutcome =
@@ -34,10 +34,23 @@ export function stripeResultUnknown(err: unknown): boolean {
   return err.httpStatus >= 500 || err.httpStatus === 409;
 }
 
-/** Money Stripe took, or is taking, for this order. Deferred service charges are money for something else. */
+/**
+ * Money Stripe holds, or is taking, for this order. Deferred service charges
+ * are money for something else, and money refunded in full is not held. A
+ * payment whose refund state can't be read stops the caller: guessing either
+ * way could charge the customer twice, or report a charge that isn't there.
+ */
 export async function findCollectedPayment(customerId: string, orderId: string): Promise<StripePaymentIntent | null> {
   const intents = await listPaymentIntents(customerId);
-  return intents.find((pi) => pi.metadata?.order_id === orderId && pi.metadata?.kind !== "deferred_service" && ["succeeded", "processing"].includes(pi.status)) ?? null;
+  for (const pi of intents) {
+    if (pi.metadata?.order_id !== orderId || pi.metadata?.kind === "deferred_service") continue;
+    if (pi.status === "processing") return pi;
+    if (pi.status !== "succeeded") continue;
+    const refunded = refundState(pi);
+    if (refunded === undefined) throw new Error(`Stripe did not say whether ${pi.id} was refunded`);
+    if (!refunded) return pi;
+  }
+  return null;
 }
 
 export async function attemptSavedCardCharge(params: {
@@ -48,6 +61,7 @@ export async function attemptSavedCardCharge(params: {
   amountCents: number;
   currency: string;
   metadata: Record<string, string>;
+  description?: string;
 }): Promise<SavedCardOutcome> {
   const { original } = params;
   if (!original.customer || !original.payment_method) {
@@ -61,6 +75,7 @@ export async function attemptSavedCardCharge(params: {
       currency: params.currency,
       idempotencyKey: savedCardIdempotencyKey(params.prefix, params.orderId, params.declinedAttempts),
       metadata: params.metadata,
+      description: params.description,
       receiptEmail: original.receipt_email,
     });
     return { kind: "charged", paymentIntentId: charged.id, status: charged.status };

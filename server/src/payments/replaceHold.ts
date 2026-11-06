@@ -1,10 +1,10 @@
 import type { Pool, PoolClient } from "pg";
 import { describeError } from "../db/describeError.js";
-import { hasDiyPackage } from "../offers/diyPackage.js";
+import { diyBreakdownFor, hasDiyPackage } from "../offers/diyPackage.js";
 import { REPLACEMENT_CONSENT_PHRASE } from "../offers/payAfterFiling.js";
 import { sendOpsAlert } from "../ops/alerts.js";
 import { alertEmailsNotQueued, enqueueCustomerEmails } from "../orderEmails/worker.js";
-import { cancelPaymentIntent, listPaymentIntents, placeReplacementHold, retrievePaymentIntent, type StripePaymentIntent } from "../stripe/restClient.js";
+import { cancelPaymentIntent, holdDetails, listPaymentIntents, placeReplacementHold, retrievePaymentIntent, type StripePaymentIntent } from "../stripe/restClient.js";
 import { approvalCurrent } from "./filingClearance.js";
 import { claimOrder, releaseOrder } from "./holdLock.js";
 import { isCardDecline, stripeResultUnknown } from "./savedCard.js";
@@ -43,14 +43,16 @@ export interface ReplaceDeps {
 
 const OPS_ALERTS: ReplaceDeps = { alert: sendOpsAlert };
 
-/** Bank said no; Stripe gave no answer; or nothing was sent to the bank at all. */
-type FailureKind = "declined" | "no_answer" | "nothing_placed";
+/** Bank said no; Stripe gave no answer; nothing was sent to the bank at all; or the key returned a hold already gone. */
+type FailureKind = "declined" | "no_answer" | "nothing_placed" | "key_spent";
 
 export interface RenewalFacts {
   fulfillment_status: string;
   filing_approved_at: Date | string | null;
   registered_agent_status?: string | null;
   filing_data?: { registered_agent_path?: string } | null;
+  /** Articles are stored for this order. */
+  has_articles?: boolean | null;
 }
 
 interface HoldRow extends RenewalFacts {
@@ -89,12 +91,17 @@ export function stuckOn(order: RenewalFacts): string | null {
   if (order.fulfillment_status === "rejected") return "Florida rejected the filing and we are waiting for the customer";
   if (order.fulfillment_status === "failed") return "its Articles could not be generated";
   if (order.fulfillment_status === "in_progress") return "its Articles are still being generated";
-  const agentGone = ["declined", "expired"].includes(order.registered_agent_status ?? "");
-  if (order.fulfillment_status === "not_ready" && order.filing_data?.registered_agent_path === "customer" && agentGone) {
+  const agentGone = order.filing_data?.registered_agent_path === "customer" && ["declined", "expired"].includes(order.registered_agent_status ?? "");
+  if (agentGone && ["not_ready", "ready", "requires_review"].includes(order.fulfillment_status)) {
     return "its registered agent did not accept, and we are waiting for the customer";
   }
+  if (order.fulfillment_status === "requires_review" && !order.has_articles) return "it has no Articles, so it can't be approved";
   return null;
 }
+
+/** Fills `has_articles` for a query over orders `o`. */
+export const HAS_ARTICLES = `articles.order_id IS NOT NULL AS has_articles`;
+export const JOIN_ARTICLES = `LEFT JOIN (SELECT DISTINCT order_id FROM filing_documents) articles ON articles.order_id = o.order_id`;
 
 /** Stuck, or an approval is in use, which a renewal would clear. */
 function cannotRenewByItself(order: RenewalFacts, now: Date): string | null {
@@ -116,8 +123,8 @@ async function readHold(pool: Pool, orderId: string): Promise<HoldRow | undefine
     `SELECT o.order_id, o.filing_session_id, o.payment_status, o.stripe_payment_intent_id, o.total_cents, o.currency, o.line_items, o.cancelled_at,
             o.proof_of_filing_at, o.superseded_payment_intent_ids, o.saved_card_authorized_at, o.saved_card_authorization_text, o.replacement_attempts,
             o.replacement_key_seq, o.replacement_unknown_at, o.replacement_last_attempt_at, o.capture_before, o.stray_capture_pi, o.filing_approved_at,
-            o.sunbiz_submitted_at, o.fulfillment_status, o.stripe_livemode, fs.registered_agent_status, fs.filing_data
-     FROM orders o LEFT JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id WHERE o.order_id = $1`,
+            o.sunbiz_submitted_at, o.fulfillment_status, o.stripe_livemode, fs.registered_agent_status, fs.filing_data, ${HAS_ARTICLES}
+     FROM orders o LEFT JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id ${JOIN_ARTICLES} WHERE o.order_id = $1`,
     [orderId]
   );
   return rows[0];
@@ -142,6 +149,11 @@ export async function replaceHold(
 /** The sweep's renewal. Unlike a person's, it stops if the order changed after the sweep listed it. */
 export function renewHoldFromSweep(pool: Pool, orderId: string, deps: ReplaceDeps = OPS_ALERTS): Promise<ReplaceOutcome> {
   return replaceHold(pool, orderId, deps, undefined, new Date());
+}
+
+function nearItsEnd(pi: StripePaymentIntent, now: Date): boolean {
+  const { captureBefore } = holdDetails(pi);
+  return Boolean(captureBefore) && (captureBefore as Date).getTime() - now.getTime() <= RENEWAL_WINDOW_HOURS * 3600 * 1000;
 }
 
 function isUnknownToOrder(pi: StripePaymentIntent, order: HoldRow): boolean {
@@ -214,8 +226,11 @@ export async function settleUnknownReplacement(pool: Pool, orderId: string, deps
     const current = await retrievePaymentIntent(order.stripe_payment_intent_id);
     const strays = current.customer ? await findOpenStrays(current.customer, order) : [];
     if (!strays.length) {
+      // Whatever that request did is over, and nothing of it stands. Its key
+      // can only replay that, a stored 500 or a hold cancelled since, so the
+      // next attempt must reach the bank with a new one.
       if (now.getTime() - new Date(order.replacement_unknown_at).getTime() >= UNKNOWN_RESULT_SETTLE_MS) {
-        await pool.query(`UPDATE orders SET replacement_unknown_at = NULL WHERE order_id = $1`, [orderId]);
+        await pool.query(`UPDATE orders SET replacement_unknown_at = NULL, replacement_key_seq = replacement_key_seq + 1 WHERE order_id = $1`, [orderId]);
       }
       return;
     }
@@ -357,10 +372,10 @@ async function replaceClaimedHold(pool: Pool, orderId: string, deps: ReplaceDeps
     return { kind: "refused", code: "no_replacement_consent", detail: "this order has no documented consent to a replacement hold" };
   }
   const attempts = order.replacement_attempts ?? 0;
-  // The limit stops unattended retries. With a lapsed hold, a person and the
-  // customer are acting. A lost answer must still be finished, and its repeat
-  // uses the same key, so the bank sees nothing new.
-  if (attempts >= MAX_REPLACEMENT_ATTEMPTS && !lapsed && !order.replacement_unknown_at) {
+  // The limit stops unattended retries. With customer agreement, a person and
+  // the customer are acting. A lost answer must still be finished, and its
+  // repeat uses the same key, so the bank sees nothing new.
+  if (attempts >= MAX_REPLACEMENT_ATTEMPTS && !customerAgreed && !order.replacement_unknown_at) {
     return { kind: "refused", code: "replacement_attempts_used", detail: `${attempts} replacement attempts have been made on this hold` };
   }
   if (sweepAt) {
@@ -381,7 +396,7 @@ async function replaceClaimedHold(pool: Pool, orderId: string, deps: ReplaceDeps
       await client.query("BEGIN");
       await client.query(
         `UPDATE orders SET replacement_attempts = $2, replacement_last_attempt_at = now(), replacement_last_error = $3, replacement_key_seq = $4, replacement_unknown_at = $5 WHERE order_id = $1`,
-        [orderId, used, detail.slice(0, 500), keySeq + (kind === "declined" ? 1 : 0), kind === "declined" ? null : kind === "no_answer" ? new Date() : order.replacement_unknown_at]
+        [orderId, used, detail.slice(0, 500), keySeq + (kind === "declined" || kind === "key_spent" ? 1 : 0), kind === "declined" ? null : kind === "no_answer" ? new Date() : order.replacement_unknown_at]
       );
       if (kind === "declined" || used >= MAX_REPLACEMENT_ATTEMPTS) {
         // Once per hold, so a retry does not email the customer again.
@@ -419,6 +434,13 @@ async function replaceClaimedHold(pool: Pool, orderId: string, deps: ReplaceDeps
   if ((!stillHeld && !lapsed) || !original.customer || !original.payment_method) {
     return fail("hold_not_replaceable", `the hold is ${original.status}, or has no saved card`, "nothing_placed", stillHeld);
   }
+  // The customer's consent covers a hold about to end, and a repeat of a call
+  // that already worked lands here too. The column is empty right after a
+  // renewal, so the deadline comes from Stripe. Refused before anything is
+  // tried, so this uses up no attempt.
+  if (!sweepAt && stillHeld && !customerAgreed && !order.replacement_unknown_at && !nearItsEnd(original, new Date())) {
+    return { kind: "refused", code: "hold_not_near_end", detail: `this hold does not end within ${RENEWAL_WINDOW_HOURS} hours, so the customer's consent does not cover a new one. If they asked for one, say how in customer_agreed` };
+  }
 
   // Unable to see what exists, a new hold could be a second one.
   let untracked: StripePaymentIntent[];
@@ -442,6 +464,7 @@ async function replaceClaimedHold(pool: Pool, orderId: string, deps: ReplaceDeps
         currency: order.currency || "usd",
         idempotencyKey: `replace-${orderId}-${oldId}-${keySeq + 1}`,
         metadata: { order_id: orderId, kind: "replacement_hold", replaces: oldId },
+        description: diyBreakdownFor(order.line_items, order.total_cents),
         receiptEmail: original.receipt_email,
       });
     } catch (err) {
@@ -451,6 +474,18 @@ async function replaceClaimedHold(pool: Pool, orderId: string, deps: ReplaceDeps
       if (!stripeResultUnknown(err)) return fail("replacement_refused", describeError(err), "nothing_placed", stillHeld);
       return fail("replacement_result_unknown", describeError(err), "no_answer", stillHeld);
     }
+    // Stripe replays the first answer for a key, however the hold has changed
+    // since. Only a fresh read can show there is something to move to.
+    let fresh: StripePaymentIntent;
+    try {
+      fresh = await retrievePaymentIntent(replacement.id);
+    } catch (err) {
+      return fail("replacement_result_unknown", `could not read the new hold ${replacement.id}: ${describeError(err)}`, "no_answer", stillHeld);
+    }
+    if (fresh.status === "canceled" || fresh.status === "succeeded") {
+      return fail("replacement_key_spent", `this request's key returned ${replacement.id}, which is ${fresh.status}, so no new hold was placed. The next attempt uses a new key`, "key_spent", stillHeld);
+    }
+    replacement = { ...replacement, status: fresh.status };
   }
   if (replacement.status !== "requires_capture") {
     // It holds nothing we can use, and must not sit open on the customer's card.

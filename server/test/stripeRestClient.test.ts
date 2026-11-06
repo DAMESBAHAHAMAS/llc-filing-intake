@@ -145,7 +145,7 @@ describe("listPaymentIntents", () => {
       return new Response(JSON.stringify({ data: [{ id: "pi_1", status: "requires_capture", metadata: { order_id: "o" } }] }), { status: 200 });
     }) as unknown as typeof fetch;
     const found = await listPaymentIntents("cus_1");
-    expect(capturedUrl).toBe("https://api.stripe.com/v1/payment_intents?customer=cus_1&limit=100");
+    expect(capturedUrl).toBe("https://api.stripe.com/v1/payment_intents?customer=cus_1&limit=100&expand%5B0%5D=data.latest_charge");
     expect(found.map((pi) => pi.id)).toEqual(["pi_1"]);
   });
 });

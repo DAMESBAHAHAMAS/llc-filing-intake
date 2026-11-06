@@ -28,6 +28,12 @@ export function hasDiyPackage(lineItems: Array<{ offer_code?: string }>): boolea
   return lineItems.some((li) => li.offer_code === DIY_PACKAGE_OFFER_CODE);
 }
 
+/** For a Stripe payment of exactly the $139, which has no line items of its
+ *  own to show the breakdown. Another amount is not what this line describes. */
+export function diyBreakdownFor(lineItems: Array<{ offer_code?: string }> | null | undefined, cents: number): string | undefined {
+  return hasDiyPackage(lineItems ?? []) && cents === DIY_PACKAGE_TOTAL_CENTS ? DIY_PACKAGE_BREAKDOWN_LINE : undefined;
+}
+
 /** The DIY total, sold either as one $139 Price or as its three parts. */
 export function diyTotalCents(amounts: Map<string, number>): number {
   const single = amounts.get(DIY_PACKAGE_OFFER_CODE);

@@ -237,6 +237,8 @@ export interface StripePaymentIntent {
     | {
         id: string;
         captured?: boolean;
+        /** True only once the whole charge is refunded. */
+        refunded?: boolean;
         payment_method_details?: {
           card?: {
             capture_before?: number | null;
@@ -256,10 +258,21 @@ export async function retrievePaymentIntent(paymentIntentId: string): Promise<St
 }
 
 /** A Customer's PaymentIntents, newest first. Checkout makes a Customer per
- *  order, so the first page holds all of them. */
+ *  order, so the first page holds all of them. Charges are expanded because a
+ *  refund shows only there. */
 export async function listPaymentIntents(customerId: string): Promise<StripePaymentIntent[]> {
-  const page = await stripeRequest<{ data: StripePaymentIntent[] }>("GET", "/payment_intents", { customer: customerId, limit: 100 });
+  const page = await stripeRequest<{ data: StripePaymentIntent[] }>("GET", "/payment_intents", { customer: customerId, limit: 100, expand: ["data.latest_charge"] });
   return page.data;
+}
+
+/**
+ * A refund leaves a PaymentIntent at succeeded, so only its Charge shows the
+ * money went back. `undefined` means the Charge doesn't say, and callers
+ * must not read that as either answer.
+ */
+export function refundState(pi: Pick<StripePaymentIntent, "latest_charge">): boolean | undefined {
+  const charge = pi.latest_charge;
+  return typeof charge === "object" && charge !== null && typeof charge.refunded === "boolean" ? charge.refunded : undefined;
 }
 
 /** Collects a held payment. The idempotency key makes a repeat call
@@ -305,6 +318,8 @@ export async function placeReplacementHold(params: {
   idempotencyKey: string;
   metadata?: Record<string, string>;
   receiptEmail?: string | null;
+  /** What the money covers. A payment made here has no Checkout line items to say so. */
+  description?: string;
 }): Promise<StripePaymentIntent> {
   return stripeRequest<StripePaymentIntent>(
     "POST",
@@ -318,6 +333,7 @@ export async function placeReplacementHold(params: {
       off_session: true,
       confirm: true,
       metadata: params.metadata,
+      ...(params.description ? { description: params.description } : {}),
       ...(params.receiptEmail ? { receipt_email: params.receiptEmail } : {}),
     },
     params.idempotencyKey
@@ -338,6 +354,8 @@ export async function chargeSavedCard(params: {
   idempotencyKey: string;
   metadata?: Record<string, string>;
   receiptEmail?: string | null;
+  /** What the money covers. A payment made here has no Checkout line items to say so. */
+  description?: string;
 }): Promise<StripePaymentIntent> {
   return stripeRequest<StripePaymentIntent>(
     "POST",
@@ -350,6 +368,7 @@ export async function chargeSavedCard(params: {
       off_session: true,
       confirm: true,
       metadata: params.metadata,
+      ...(params.description ? { description: params.description } : {}),
       ...(params.receiptEmail ? { receipt_email: params.receiptEmail } : {}),
     },
     params.idempotencyKey

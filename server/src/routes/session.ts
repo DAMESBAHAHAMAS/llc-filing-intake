@@ -56,6 +56,8 @@ const SESSION_FIELDS = [
   "filing_data",
 ] as const;
 
+const LOCKED_WITH_THE_ORDER = ["email", "entity_name_primary", "entity_name_backup"] as const;
+
 type SessionField = (typeof SESSION_FIELDS)[number];
 type SessionPatch = Partial<Record<SessionField, unknown>>;
 
@@ -135,14 +137,20 @@ sessionRouter.post("/api/session/stage", async (req, res) => {
     // or paid a stale tab could rewrite what was reviewed and filed. A
     // corrected filing goes through the operator's resubmission route, and
     // a new registered agent through /registered-agent/select.
-    if (sessionExists && patch.filing_data !== undefined && filingDataIsLocked(await listSessionOrders(client, sessionId))) {
-      const stored = await client.query<{ filing_data: unknown }>("SELECT filing_data FROM filing_sessions WHERE filing_session_id = $1", [sessionId]);
-      if (!filingDataUnchanged(stored.rows[0]?.filing_data, patch.filing_data)) {
+    // The names are what proof of filing checks Florida's record against, and
+    // the email is where the customer's proof goes, so they lock with it.
+    const lockedFields = LOCKED_WITH_THE_ORDER.filter((field) => patch[field] !== undefined);
+    if (sessionExists && (patch.filing_data !== undefined || lockedFields.length) && filingDataIsLocked(await listSessionOrders(client, sessionId))) {
+      const stored = await client.query<Record<string, unknown>>(`SELECT filing_data, ${LOCKED_WITH_THE_ORDER.join(", ")} FROM filing_sessions WHERE filing_session_id = $1`, [sessionId]);
+      const current = stored.rows[0];
+      const filingDataSame = patch.filing_data === undefined || filingDataUnchanged(current?.filing_data, patch.filing_data);
+      if (!filingDataSame || lockedFields.some((field) => patch[field] !== current?.[field])) {
         await client.query("ROLLBACK");
         res.status(409).json({ error: "this filing has an order, so its filing details can no longer be changed here", code: "filing_data_locked" });
         return;
       }
       delete patch.filing_data;
+      for (const field of lockedFields) delete patch[field];
     }
 
     // Build a dynamic but safe SET list — only columns in SESSION_FIELDS,
