@@ -13,7 +13,7 @@ import { findFilingBlocker } from "../fulfillment/filingGate.js";
 import { hasDiyPackage } from "../offers/diyPackage.js";
 import { isLiveTestOrder } from "../offers/liveTest.js";
 import { orderIsLiveTest } from "../offers/liveTestSeal.js";
-import { approvalCurrent, clearanceFor, entityNameKey, sameEntityName } from "../payments/filingClearance.js";
+import { APPROVAL_VALID_HOURS, approvalCurrent, clearanceFor, entityNameKey, sameEntityName } from "../payments/filingClearance.js";
 import { oneStepAtATime } from "../payments/holdLock.js";
 import { MAX_REPLACEMENT_ATTEMPTS, replaceHold } from "../payments/replaceHold.js";
 import { isFloridaLlcDocumentNumber } from "../payments/documentNumber.js";
@@ -327,7 +327,7 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", oneStep, async (req, r
  * nothing is ever charged before the LLC is filed. Charged once: the
  * idempotency key is per order, and a recorded charge is never repeated.
  */
-ordersRouter.post("/api/orders/:orderId/service-complete", async (req, res) => {
+ordersRouter.post("/api/orders/:orderId/service-complete", oneStep, async (req, res) => {
   if (!operatorAuthorized(req)) {
     res.status(401).json({ error: "operator key required" });
     return;
@@ -459,7 +459,7 @@ ordersRouter.post("/api/orders/:orderId/release-hold", oneStep, async (req, res)
 
 /**
  * POST /api/orders/:orderId/cancel
- * Body: { reason?: string }
+ * Body: { reason?: string, confirm_not_filed?: boolean }
  *
  * The customer cancelled, or the filing cannot go ahead: "You can cancel
  * any time until we submit your filing. We release any hold still in place
@@ -473,6 +473,9 @@ ordersRouter.post("/api/orders/:orderId/release-hold", oneStep, async (req, res)
  * customer who won't correct it, or a filing that can't be filed, closes:
  * "we release any hold still in place and you pay nothing." The saved card
  * comes off at the next card sweep.
+ *
+ * In the hours after an approval Florida may have been paid with nothing
+ * recorded yet, so the operator must say it was not (`confirm_not_filed`).
  */
 ordersRouter.post("/api/orders/:orderId/cancel", oneStep, async (req, res) => {
   if (!operatorAuthorized(req)) {
@@ -491,9 +494,10 @@ ordersRouter.post("/api/orders/:orderId/cancel", oneStep, async (req, res) => {
       cancelled_at: Date | null;
       crm_deal_id: string | null;
       sunbiz_rejected_at: Date | null;
+      filing_approved_at: Date | null;
       line_items: Array<{ offer_code?: string }> | null;
     }>(
-      `SELECT order_id, filing_session_id, payment_status, fulfillment_status, line_items, stripe_payment_intent_id, proof_of_filing_at, cancelled_at, crm_deal_id, sunbiz_rejected_at
+      `SELECT order_id, filing_session_id, payment_status, fulfillment_status, line_items, stripe_payment_intent_id, proof_of_filing_at, cancelled_at, crm_deal_id, sunbiz_rejected_at, filing_approved_at
        FROM orders WHERE order_id = $1`,
       [req.params.orderId]
     );
@@ -510,6 +514,14 @@ ordersRouter.post("/api/orders/:orderId/cancel", oneStep, async (req, res) => {
     }
     if (![...(closingTest ? ["pending"] : []), "authorized", "released"].includes(order.payment_status)) {
       res.status(409).json({ error: `order payment_status is ${order.payment_status}; no hold to cancel`, order_id: order.order_id });
+      return;
+    }
+    if (!closingTest && !order.cancelled_at && approvalCurrent(order.filing_approved_at, new Date()) && req.body?.confirm_not_filed !== true) {
+      res.status(409).json({
+        error: "this order was just approved for filing, so Florida may have been paid. If it was filed, record the filing. If not, send confirm_not_filed: true",
+        code: "approved_for_filing",
+        order_id: order.order_id,
+      });
       return;
     }
 
@@ -587,46 +599,79 @@ const DAYS_TO_KEEP_FILING_DATE = 60;
 
 type Refusal = { status: number; body: Record<string, unknown> };
 
-/**
- * Asked at the moment of filing, not trusted from the approval: a hold can end
- * in the hours between. Returns the refusal, or null to go ahead.
- */
-async function hasCapturableHoldNow(orderId: string): Promise<Refusal | null> {
-  const { rows } = await pool.query<{ line_items: Array<{ offer_code?: string }> | null; stripe_payment_intent_id: string | null; total_cents: number; fulfillment_status: string; payment_status: string }>(
-    `SELECT line_items, stripe_payment_intent_id, total_cents, fulfillment_status, payment_status FROM orders WHERE order_id = $1`,
-    [orderId]
-  );
-  const order = rows[0];
-  if (!order || !hasDiyPackage(order.line_items ?? []) || order.payment_status !== "authorized" || !order.stripe_payment_intent_id) return null;
-  try {
-    const clearance = clearanceFor(await retrievePaymentIntent(order.stripe_payment_intent_id), order.total_cents, new Date());
-    return clearance.cleared ? null : { status: 409, body: { error: clearance.detail, code: clearance.code, order_id: orderId } };
-  } catch (err) {
-    return { status: 502, body: { error: "could not confirm the hold with Stripe; do not file", detail: describeError(err), order_id: orderId } };
-  }
-}
-
-/** A $139 order goes to Florida only on a capturable hold a person cleared. */
-function clearanceRefusal(order: FilingStateOrder): Refusal | null {
-  if (!hasDiyPackage(order.line_items ?? [])) return null;
-  if (order.payment_status !== "authorized") {
-    return { status: 409, body: { error: `payment_status is ${order.payment_status}; there is no hold to file on`, code: "hold_not_capturable", order_id: order.order_id } };
-  }
-  if (!approvalCurrent(order.filing_approved_at, new Date())) {
-    return { status: 409, body: { error: "approve this filing first, so Stripe is checked before Florida is paid", code: "filing_not_approved", order_id: order.order_id } };
+/** What not even a filing that really happened can be recorded on. */
+function cannotRecordFiling(order: FilingStateOrder): Refusal | null {
+  if (order.cancelled_at) return { status: 409, body: { error: "order is cancelled; nothing is filed or collected", code: "order_cancelled", order_id: order.order_id } };
+  if (!needsSunbizFiling(order.line_items ?? [])) return { status: 409, body: { error: "order includes no Sunbiz filing", order_id: order.order_id } };
+  if (order.proof_of_filing_at) return { status: 409, body: { error: "Florida has already confirmed this filing", code: "filing_confirmed", order_id: order.order_id } };
+  // Never paid for, and orders_fulfillment_requires_paid won't store a filing on it.
+  if (order.payment_status === "pending" || order.payment_status === "failed") {
+    return { status: 409, body: { error: `order payment_status is ${order.payment_status}; there is no payment to record a filing on`, code: "no_payment_on_order", order_id: order.order_id } };
   }
   return null;
 }
 
 /** What stops any filing step on this order, before its own state is looked at. */
 function filingRefusal(order: FilingStateOrder): Refusal | null {
-  if (order.cancelled_at) return { status: 409, body: { error: "order is cancelled; nothing is filed or collected", code: "order_cancelled", order_id: order.order_id } };
-  if (!needsSunbizFiling(order.line_items ?? [])) return { status: 409, body: { error: "order includes no Sunbiz filing", order_id: order.order_id } };
+  const refused = cannotRecordFiling(order);
+  if (refused) return refused;
   if (!FILABLE_PAYMENT.includes(order.payment_status)) {
     return { status: 409, body: { error: `order payment_status is ${order.payment_status}; it cannot be filed`, order_id: order.order_id } };
   }
-  if (order.proof_of_filing_at) return { status: 409, body: { error: "Florida has already confirmed this filing", code: "filing_confirmed", order_id: order.order_id } };
   return null;
+}
+
+const FILING_NOT_APPROVED = (orderId: string): Refusal => ({
+  status: 409,
+  body: {
+    error: "this order has no approval. Approve it before paying Florida. If it was filed anyway, send filed_without_approval_reason",
+    code: "filing_not_approved",
+    order_id: orderId,
+  },
+});
+
+/** Why a filing went to Florida with no approval, in the operator's words. */
+function filedWithoutApprovalReason(body: unknown): string {
+  const reason = (body as { filed_without_approval_reason?: unknown } | undefined)?.filed_without_approval_reason;
+  return typeof reason === "string" ? reason.trim().slice(0, 500) : "";
+}
+
+/** A filing that happened, and what a person should know about how it went. */
+interface RecordedFiling {
+  order: FilingStateOrder;
+  filedAnyway: string;
+  nameClash: string | null;
+}
+
+/** Stripe's word on the hold now. Never a reason to refuse: Florida is already paid. */
+async function holdProblemNow(orderId: string): Promise<string | null> {
+  const { rows } = await pool.query<{ stripe_payment_intent_id: string | null; total_cents: number }>(`SELECT stripe_payment_intent_id, total_cents FROM orders WHERE order_id = $1`, [orderId]);
+  if (!rows[0]?.stripe_payment_intent_id) return "the order has no hold";
+  try {
+    const clearance = clearanceFor(await retrievePaymentIntent(rows[0].stripe_payment_intent_id), rows[0].total_cents, new Date());
+    return clearance.cleared ? null : clearance.detail;
+  } catch (err) {
+    return `Stripe could not confirm the hold: ${describeError(err)}`;
+  }
+}
+
+/** After the commit, so nothing here can undo the record. */
+async function alertIfFiledOutsideApproval({ order, filedAnyway, nameClash }: RecordedFiling): Promise<void> {
+  try {
+    const problems: string[] = [];
+    if (filedAnyway) problems.push(`it was filed with no approval: ${filedAnyway}`);
+    else if (!approvalCurrent(order.filing_approved_at, new Date())) problems.push(`its approval was over ${APPROVAL_VALID_HOURS} hours old`);
+    if (nameClash) problems.push(nameClash);
+    if (hasDiyPackage(order.line_items ?? [])) {
+      const hold = await holdProblemNow(order.order_id);
+      if (hold) problems.push(hold);
+    }
+    if (problems.length) {
+      await sendOpsAlert("A filing was recorded outside its approval", `Order ${order.order_id}: ${problems.join("; ")}. Florida has been paid. Check how this order will be collected.`);
+    }
+  } catch (err) {
+    console.error(`[payments] could not raise the filing alert for order ${order.order_id}:`, describeError(err));
+  }
 }
 
 /**
@@ -664,6 +709,24 @@ function isDuplicateFiling(err: unknown): boolean {
 }
 
 const DUPLICATE_FILING_BODY = { error: "this LLC name is already being filed on another order", code: "duplicate_filing" };
+
+/**
+ * The same claim for a filing that already happened. A clash can't undo it, so
+ * it comes back as text for a person. The savepoint keeps a lost race on the
+ * unique index from aborting the record.
+ */
+async function claimNameOfRecordedFiling(client: PoolClient, order: FilingStateOrder, name?: string): Promise<string | null> {
+  await client.query("SAVEPOINT filing_name");
+  try {
+    const refused = await claimFilingName(client, order, name);
+    await client.query("RELEASE SAVEPOINT filing_name");
+    return refused ? String(refused.body.error) : null;
+  } catch (err) {
+    await client.query("ROLLBACK TO SAVEPOINT filing_name");
+    if (isDuplicateFiling(err)) return DUPLICATE_FILING_BODY.error;
+    throw err;
+  }
+}
 
 /**
  * Runs `step` with the order's row locked, so a filing step and a cancel
@@ -738,11 +801,15 @@ ordersRouter.post("/api/orders/:orderId/correct-document-number", oneStep, async
 
 /**
  * POST /api/orders/:orderId/approve-filing
+ * Body: { llc_name?: string }
  *
- * The step before Damian pays Florida. It asks Stripe, not the order row,
- * whether the hold can be captured and for how long, and refuses a second
- * filing of the same LLC. Submission needs this approval, less than 24 hours
- * old. Its answer also records the hold's real deadline.
+ * The last check before Damian pays Florida, so it runs everything that can
+ * stop a filing. A tracking number only exists after filing, so nothing later
+ * can. It asks Stripe, not the order row, whether the hold can be captured and
+ * for how long, and refuses a second filing of the same LLC. Its answer also
+ * records the hold's real deadline. An approval covers filing in the next 4
+ * hours. On a rejected filing, `llc_name` is a corrected name, so that name is
+ * the one checked and claimed before Florida is paid again.
  */
 ordersRouter.post("/api/orders/:orderId/approve-filing", oneStep, async (req, res) => {
   if (!operatorAuthorized(req)) {
@@ -775,7 +842,17 @@ ordersRouter.post("/api/orders/:orderId/approve-filing", oneStep, async (req, re
       res.status(409).json({ error: `payment_status is ${order.payment_status}; there is no hold to file on`, code: "hold_not_capturable", order_id: order.order_id });
       return;
     }
-    const nameKey = entityNameKey(order.filing_data?.llc_name ?? order.entity_name_primary);
+    if (order.fulfillment_status !== "requires_review" && order.fulfillment_status !== "rejected") {
+      res.status(409).json({ error: `this order is not ready to file (fulfillment_status ${order.fulfillment_status})`, code: "filing_not_ready", order_id: order.order_id });
+      return;
+    }
+    const blocker = await findFilingBlocker(pool, order);
+    if (blocker) {
+      res.status(409).json({ ...blocker, order_id: order.order_id });
+      return;
+    }
+    const correctedName = order.fulfillment_status === "rejected" && typeof req.body?.llc_name === "string" ? req.body.llc_name : "";
+    const nameKey = entityNameKey(correctedName || order.filing_data?.llc_name || order.entity_name_primary);
     if (!nameKey) {
       res.status(409).json({ error: "this order has no LLC name to file", code: "filing_name_missing", order_id: order.order_id });
       return;
@@ -795,10 +872,16 @@ ordersRouter.post("/api/orders/:orderId/approve-filing", oneStep, async (req, re
       return;
     }
     try {
-      await pool.query(
-        `UPDATE orders SET filing_approved_at = now(), capture_before = $2, extended_authorization = $3, filing_name_key = $4 WHERE order_id = $1`,
-        [order.order_id, clearance.captureBefore, clearance.extended, nameKey]
+      // The clearance is for the hold read above, and only that hold.
+      const approved = await pool.query(
+        `UPDATE orders SET filing_approved_at = now(), capture_before = $2, extended_authorization = $3, filing_name_key = $4
+          WHERE order_id = $1 AND stripe_payment_intent_id = $5 AND payment_status = 'authorized' AND cancelled_at IS NULL`,
+        [order.order_id, clearance.captureBefore, clearance.extended, nameKey, order.stripe_payment_intent_id]
       );
+      if (!approved.rowCount) {
+        res.status(409).json({ error: "the order changed during this check; do not file, and approve it again", code: "order_changed", order_id: order.order_id });
+        return;
+      }
     } catch (err) {
       if (isDuplicateFiling(err)) {
         res.status(409).json(DUPLICATE_FILING_BODY);
@@ -814,24 +897,31 @@ ordersRouter.post("/api/orders/:orderId/approve-filing", oneStep, async (req, re
 
 /**
  * POST /api/orders/:orderId/replace-authorization
+ * Body: { customer_agreed?: string }
  *
  * For a hold about to end with Florida's answer still due. The new hold is
  * placed first and must be capturable before the order moves to it, so the
  * order is never left with nothing. Only then is the old one cancelled, and
  * its cancel event is ignored by the webhook. If the bank refuses or wants
  * the customer present, the old hold stands and the operator is told.
+ *
+ * A hold that has already ended is renewed only here, not by the sweep, and
+ * needs `customer_agreed`, saying how the customer agreed. That covers an
+ * order not yet submitted, and a rejected filing the customer is correcting.
  */
 ordersRouter.post("/api/orders/:orderId/replace-authorization", async (req, res) => {
   if (!operatorAuthorized(req)) {
     res.status(401).json({ error: "operator key required" });
     return;
   }
+  const customerAgreed = typeof req.body?.customer_agreed === "string" ? req.body.customer_agreed.trim().slice(0, 500) : "";
   try {
-    const outcome = await replaceHold(pool, req.params.orderId);
+    const outcome = await replaceHold(pool, req.params.orderId, undefined, customerAgreed || undefined);
     if (outcome.kind === "replaced") {
       res.status(200).json({ order_id: req.params.orderId, status: outcome.oldHoldStillOpen ? "replaced_old_hold_still_open" : "replaced", payment_intent: outcome.paymentIntentId });
     } else if (outcome.kind === "failed") {
-      res.status(402).json({ error: "no new hold was placed; the current hold still stands", code: outcome.code, detail: outcome.detail, attempts: outcome.attempts });
+      const unknown = outcome.code === "replacement_result_unknown";
+      res.status(unknown ? 502 : 402).json({ error: unknown ? "Stripe gave no answer, so a new hold may exist. The order has not moved, and the next attempt looks for it" : "no new hold was placed", code: outcome.code, detail: outcome.detail, attempts: outcome.attempts });
     } else {
       res.status(outcome.code === "order_not_found" ? 404 : 409).json({ error: outcome.detail, code: outcome.code });
     }
@@ -842,13 +932,18 @@ ordersRouter.post("/api/orders/:orderId/replace-authorization", async (req, res)
 
 /**
  * POST /api/orders/:orderId/submitted-to-sunbiz
- * Body: { tracking_number: string }
+ * Body: { tracking_number: string, filed_without_approval_reason?: string }
  *
- * Damian has reviewed the order, filed it at Sunbiz and paid Florida. From
- * here "After we submit. Your order can't be cancelled through us." The order
- * must be ready to file: reviewed by the worker, Articles present, and any
- * customer agent accepted. Repeating the call with the same number changes
- * nothing.
+ * Damian has filed the order at Sunbiz and paid Florida. From here "After we
+ * submit. Your order can't be cancelled through us." The tracking number only
+ * exists after filing, so for a $139 order this is a record, not a gate: the
+ * gate is approve-filing. With an approval it records the filing, even if the
+ * approval is old or the hold has since ended, and tells a person. With none it
+ * refuses, unless `filed_without_approval_reason` says why it was filed anyway.
+ *
+ * Other packages have no approval step, so they must be ready to file here:
+ * reviewed by the worker, Articles present, and any customer agent accepted.
+ * Repeating the call with the same number changes nothing.
  */
 ordersRouter.post("/api/orders/:orderId/submitted-to-sunbiz", oneStep, async (req, res) => {
   if (!operatorAuthorized(req)) {
@@ -860,14 +955,13 @@ ordersRouter.post("/api/orders/:orderId/submitted-to-sunbiz", oneStep, async (re
     res.status(400).json({ error: "tracking_number is required (the Sunbiz tracking number from the filing confirmation)" });
     return;
   }
+  const filedAnyway = filedWithoutApprovalReason(req.body);
   try {
-    const stale = await hasCapturableHoldNow(req.params.orderId);
-    if (stale) {
-      res.status(stale.status).json(stale.body);
-      return;
-    }
+    let recorded: RecordedFiling | null = null;
     const outcome = await withLockedOrder(req.params.orderId, async (client, order) => {
-      const refused = filingRefusal(order);
+      const diy = hasDiyPackage(order.line_items ?? []);
+      const alreadyHappened = (diy && Boolean(order.filing_approved_at)) || Boolean(filedAnyway);
+      const refused = alreadyHappened ? cannotRecordFiling(order) : filingRefusal(order);
       if (refused) return refused;
       if (order.fulfillment_status === "transmitted") {
         if (order.sunbiz_tracking_number === trackingNumber) {
@@ -878,23 +972,29 @@ ordersRouter.post("/api/orders/:orderId/submitted-to-sunbiz", oneStep, async (re
       if (order.fulfillment_status === "rejected") {
         return { status: 409, body: { error: "Florida rejected this filing; use the resubmission route", code: "filing_rejected", order_id: order.order_id } };
       }
-      const notCleared = clearanceRefusal(order);
-      if (notCleared) return notCleared;
-      const blocker = await findFilingBlocker(client, order);
-      if (blocker) return { status: 409, body: { ...blocker, order_id: order.order_id } };
-      if (order.fulfillment_status !== "requires_review") {
-        return { status: 409, body: { error: `this order is not ready to file (fulfillment_status ${order.fulfillment_status})`, code: "filing_not_ready", order_id: order.order_id } };
+      let nameClash: string | null = null;
+      if (alreadyHappened) {
+        nameClash = await claimNameOfRecordedFiling(client, order);
+      } else {
+        if (diy) return FILING_NOT_APPROVED(order.order_id);
+        const blocker = await findFilingBlocker(client, order);
+        if (blocker) return { status: 409, body: { ...blocker, order_id: order.order_id } };
+        if (order.fulfillment_status !== "requires_review") {
+          return { status: 409, body: { error: `this order is not ready to file (fulfillment_status ${order.fulfillment_status})`, code: "filing_not_ready", order_id: order.order_id } };
+        }
+        const nameTaken = await claimFilingName(client, order);
+        if (nameTaken) return nameTaken;
       }
-      const nameTaken = await claimFilingName(client, order);
-      if (nameTaken) return nameTaken;
       const { rows } = await client.query<{ sunbiz_submitted_at: Date }>(
         `UPDATE orders SET fulfillment_status = 'transmitted', sunbiz_tracking_number = $2, sunbiz_submitted_at = now(), fulfillment_last_error = NULL
          WHERE order_id = $1 RETURNING sunbiz_submitted_at`,
         [order.order_id, trackingNumber]
       );
-      await filingEvent(client, order, "sunbiz_submitted", { tracking_number: trackingNumber });
+      await filingEvent(client, order, "sunbiz_submitted", { tracking_number: trackingNumber, ...(filedAnyway ? { filed_without_approval_reason: filedAnyway } : {}) });
+      if (alreadyHappened) recorded = { order, filedAnyway, nameClash };
       return { ok: true, body: { order_id: order.order_id, status: "submitted", tracking_number: trackingNumber, submitted_at: rows[0].sunbiz_submitted_at } };
     });
+    if (recorded) await alertIfFiledOutsideApproval(recorded);
     if ("ok" in outcome) res.status(200).json(outcome.body);
     else res.status(outcome.status).json(outcome.body);
   } catch (err) {
@@ -979,10 +1079,11 @@ function pickCorrections(raw: unknown): Record<string, unknown> {
 
 /**
  * POST /api/orders/:orderId/resubmitted-to-sunbiz
- * Body: { tracking_number?: string, corrections?: { llc_name?, principal_address?, ... } }
+ * Body: { tracking_number?: string, corrections?: { llc_name?, principal_address?, ... }, filed_without_approval_reason?: string }
  *
  * The corrected filing is back with Florida, so the order is submitted again
- * and /cancel is refused again. Sunbiz keeps the tracking number on a
+ * and /cancel is refused again. Like the first submission, on a $139 order this
+ * records what happened: approve-filing is the gate. Sunbiz keeps the tracking number on a
  * correction, so it is optional. `corrections` records what changed: the
  * filing details are locked once an order stands, and without this the filing
  * confirmation would name what Florida rejected. Corrected Articles are
@@ -1008,13 +1109,10 @@ ordersRouter.post("/api/orders/:orderId/resubmitted-to-sunbiz", oneStep, async (
   const corrections = pickCorrections(req.body?.corrections);
   const correcting = Object.keys(corrections).length > 0;
   const orderId = req.params.orderId;
+  const filedAnyway = filedWithoutApprovalReason(req.body);
 
   try {
-    const stale = await hasCapturableHoldNow(orderId);
-    if (stale) {
-      res.status(stale.status).json(stale.body);
-      return;
-    }
+    let recorded: RecordedFiling | null = null;
     let corrected: { filingData: Record<string, unknown>; pdf: { pdfBytes: Buffer; sha256: string } } | null = null;
     if (correcting) {
       const session = await pool.query<{ filing_data: Record<string, unknown> | null; registered_agent_status: string | null }>(
@@ -1040,7 +1138,9 @@ ordersRouter.post("/api/orders/:orderId/resubmitted-to-sunbiz", oneStep, async (
     }
 
     const outcome = await withLockedOrder(orderId, async (client, order) => {
-      const refused = filingRefusal(order);
+      const diy = hasDiyPackage(order.line_items ?? []);
+      const alreadyHappened = (diy && Boolean(order.filing_approved_at)) || Boolean(filedAnyway);
+      const refused = alreadyHappened ? cannotRecordFiling(order) : filingRefusal(order);
       if (refused) return refused;
       if (order.fulfillment_status === "transmitted" && order.sunbiz_resubmitted_at && (!trackingNumber || trackingNumber === order.sunbiz_tracking_number) && !correcting) {
         return { ok: true, body: { order_id: order.order_id, status: "already_resubmitted", tracking_number: order.sunbiz_tracking_number } };
@@ -1051,12 +1151,17 @@ ordersRouter.post("/api/orders/:orderId/resubmitted-to-sunbiz", oneStep, async (
       if (!trackingNumber && !order.sunbiz_tracking_number) {
         return { status: 400, body: { error: "tracking_number is required" } };
       }
-      const notCleared = clearanceRefusal(order);
-      if (notCleared) return notCleared;
-      const blocker = await findFilingBlocker(client, order);
-      if (blocker) return { status: 409, body: { ...blocker, order_id: order.order_id } };
-      const nameTaken = await claimFilingName(client, order, typeof corrections.llc_name === "string" ? corrections.llc_name : undefined);
-      if (nameTaken) return nameTaken;
+      const correctedName = typeof corrections.llc_name === "string" ? corrections.llc_name : undefined;
+      let nameClash: string | null = null;
+      if (alreadyHappened) {
+        nameClash = await claimNameOfRecordedFiling(client, order, correctedName);
+      } else {
+        if (diy) return FILING_NOT_APPROVED(order.order_id);
+        const blocker = await findFilingBlocker(client, order);
+        if (blocker) return { status: 409, body: { ...blocker, order_id: order.order_id } };
+        const nameTaken = await claimFilingName(client, order, correctedName);
+        if (nameTaken) return nameTaken;
+      }
 
       if (corrected) {
         await client.query(`UPDATE filing_sessions SET filing_data = $2, entity_name_primary = COALESCE($3, entity_name_primary) WHERE filing_session_id = $1`, [
@@ -1074,11 +1179,13 @@ ordersRouter.post("/api/orders/:orderId/resubmitted-to-sunbiz", oneStep, async (
       }
       const tracking = trackingNumber || order.sunbiz_tracking_number;
       await client.query(`UPDATE orders SET fulfillment_status = 'transmitted', sunbiz_tracking_number = $2, sunbiz_resubmitted_at = now() WHERE order_id = $1`, [order.order_id, tracking]);
-      await filingEvent(client, order, "sunbiz_resubmitted", { tracking_number: tracking, corrected_fields: Object.keys(corrections) });
+      await filingEvent(client, order, "sunbiz_resubmitted", { tracking_number: tracking, corrected_fields: Object.keys(corrections), ...(filedAnyway ? { filed_without_approval_reason: filedAnyway } : {}) });
+      if (alreadyHappened) recorded = { order, filedAnyway, nameClash };
 
       const days = order.sunbiz_rejected_at ? (Date.now() - new Date(order.sunbiz_rejected_at).getTime()) / (24 * 3600 * 1000) : 0;
       return { ok: true, body: { order_id: order.order_id, status: "resubmitted", tracking_number: tracking, corrected_fields: Object.keys(corrections), within_60_days: days <= DAYS_TO_KEEP_FILING_DATE } };
     });
+    if (recorded) await alertIfFiledOutsideApproval(recorded);
     if ("ok" in outcome) res.status(200).json(outcome.body);
     else res.status(outcome.status).json(outcome.body);
   } catch (err) {
@@ -1102,7 +1209,7 @@ ordersRouter.post("/api/orders/:orderId/resubmitted-to-sunbiz", oneStep, async (
  * also refused if Stripe may have taken the money, to keep one order from
  * being paid twice.
  */
-ordersRouter.post("/api/orders/:orderId/payment-received", async (req, res) => {
+ordersRouter.post("/api/orders/:orderId/payment-received", oneStep, async (req, res) => {
   if (!operatorAuthorized(req)) {
     res.status(401).json({ error: "operator key required" });
     return;

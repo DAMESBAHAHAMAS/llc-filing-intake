@@ -14,13 +14,14 @@ export interface OpenFilingOrder {
   authorized_at: Date | string | null;
   paid_at: Date | string | null;
   line_items: Array<{ offer_code?: string }> | null;
+  stripe_livemode?: boolean | null;
 }
 
 /** Orders still waiting to be filed. A released hold stays open: the card
  *  saved at checkout covers it, unless the order was cancelled. */
 export async function openFilingOrders(pool: Pool, filingSessionId: string): Promise<OpenFilingOrder[]> {
   const { rows } = await pool.query<OpenFilingOrder>(
-    `SELECT order_id, filing_session_id, payment_status, authorized_at, paid_at, line_items FROM orders
+    `SELECT order_id, filing_session_id, payment_status, authorized_at, paid_at, line_items, stripe_livemode FROM orders
      WHERE filing_session_id = $1 AND payment_status IN ('authorized', 'released', 'paid')
        AND cancelled_at IS NULL AND proof_of_filing_at IS NULL`,
     [filingSessionId]

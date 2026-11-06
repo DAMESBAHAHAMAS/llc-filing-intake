@@ -8,8 +8,8 @@ import { holdDetails, type StripePaymentIntent } from "../stripe/restClient.js";
 
 /** Enough hold left to file and get Florida's answer. */
 export const MIN_HOLD_HOURS_TO_FILE = 24;
-/** An approval goes stale. The hold it read can change in a day. */
-export const APPROVAL_VALID_HOURS = 24;
+/** An approval covers the filing that follows it. The hold it read can change. */
+export const APPROVAL_VALID_HOURS = 4;
 
 export type Clearance =
   | { cleared: true; captureBefore: Date; extended: boolean }

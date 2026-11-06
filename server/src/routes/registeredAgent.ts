@@ -73,10 +73,12 @@ const FILING_AT_FLORIDA = {
  * lasts, and the customer authorized the saved card for exactly that case;
  * it is charged after Florida confirms (routes/orders.ts). Ops hears about
  * it, because Damian is paying Sunbiz with no hold behind the order. A
- * cancelled order never files.
+ * cancelled order never files, and neither does a Stripe test-mode order: the
+ * same rule the webhook applied when it was paid.
  */
 async function reevaluateFulfillmentAfterAcceptance(filingSessionId: string): Promise<void> {
   for (const order of await openFilingOrders(pool, filingSessionId)) {
+    if (order.stripe_livemode === false && process.env.TEST_MODE_ORDERS_FILE !== "true") continue;
     const started = await pool.query(
       `UPDATE orders SET fulfillment_status = 'ready', fulfillment_ready_at = now()
        WHERE order_id = $1 AND fulfillment_status = 'not_ready' AND cancelled_at IS NULL`,

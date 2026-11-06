@@ -16,6 +16,13 @@
 
 const STRIPE_API_BASE = "https://api.stripe.com/v1";
 
+/**
+ * Well inside the 3 minute claim on an order (payments/holdLock.ts), so a
+ * stalled call can't outlive it. A timeout says nothing about what Stripe did:
+ * callers treat it as an unknown result, never as a refusal.
+ */
+export const STRIPE_TIMEOUT_MS = 20_000;
+
 function getSecretKey(): string {
   const key = process.env.STRIPE_SECRET_KEY;
   if (!key) throw new Error("STRIPE_SECRET_KEY is not set. See .env.example.");
@@ -80,6 +87,7 @@ async function stripeRequest<T>(
       ...(method === "POST" && idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
     },
     body: method === "POST" && params ? toFormBody(params).toString() : undefined,
+    signal: AbortSignal.timeout(STRIPE_TIMEOUT_MS),
   });
 
   const body = (await res.json()) as unknown;
@@ -247,6 +255,13 @@ export async function retrievePaymentIntent(paymentIntentId: string): Promise<St
   });
 }
 
+/** A Customer's PaymentIntents, newest first. Checkout makes a Customer per
+ *  order, so the first page holds all of them. */
+export async function listPaymentIntents(customerId: string): Promise<StripePaymentIntent[]> {
+  const page = await stripeRequest<{ data: StripePaymentIntent[] }>("GET", "/payment_intents", { customer: customerId, limit: 100 });
+  return page.data;
+}
+
 /** Collects a held payment. The idempotency key makes a repeat call
  *  return the first result instead of attempting a second capture. With
  *  amountToCapture below the held amount, Stripe collects only that much
@@ -278,7 +293,8 @@ export async function cancelPaymentIntent(paymentIntentId: string, idempotencyKe
  * A new hold on the saved card, for an order whose hold is about to end and
  * whose filing is not confirmed. Manual capture, so nothing is collected.
  * The idempotency key names the hold it replaces, so a retry cannot place a
- * second one. The bank can refuse or ask for the customer: the caller then
+ * second one, and metadata ties the hold to its order, so one whose response
+ * was lost can be found again. The bank can refuse or ask for the customer: the caller then
  * keeps the old hold and raises it with a person.
  */
 export async function placeReplacementHold(params: {

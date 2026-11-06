@@ -2,10 +2,12 @@
 --   filing_approved_at: a person cleared this order to file, after Stripe
 --     confirmed a capturable authorization. Required before submission.
 --   hold_final_flagged_at: the second expiry escalation, at 24 hours.
+--   hold_lapsed_flagged_at: a person was told this order's hold ended.
 --   superseded_payment_intent_ids: holds replaced by a newer one, kept so a
 --     late event from an old hold is recognised and ignored.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS filing_approved_at timestamptz;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS hold_final_flagged_at timestamptz;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS hold_lapsed_flagged_at timestamptz;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS superseded_payment_intent_ids jsonb NOT NULL DEFAULT '[]'::jsonb;
 
 -- One Florida document number collects on one order.
@@ -26,8 +28,10 @@ CREATE UNIQUE INDEX orders_one_open_filing_per_name ON orders (filing_name_key)
   WHERE filing_name_key IS NOT NULL AND cancelled_at IS NULL;
 
 -- A short claim on the order while an operator step talks to Stripe, so two
--- money steps can't overlap. It lapses by itself if the process dies.
+-- money steps can't overlap. It lapses by itself if the process dies. The token
+-- lets a step clear only its own claim, not the one that followed it.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS hold_op_until timestamptz;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS hold_op_token text;
 -- A replaced hold not yet confirmed cancelled. The sweep finishes the job.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS superseded_open boolean NOT NULL DEFAULT false;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS hold_unknown_flagged_at timestamptz;

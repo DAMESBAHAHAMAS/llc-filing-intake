@@ -1,6 +1,7 @@
 DROP INDEX IF EXISTS orders_one_document_number;
 ALTER TABLE orders DROP COLUMN IF EXISTS filing_approved_at;
 ALTER TABLE orders DROP COLUMN IF EXISTS hold_final_flagged_at;
+ALTER TABLE orders DROP COLUMN IF EXISTS hold_lapsed_flagged_at;
 ALTER TABLE orders DROP COLUMN IF EXISTS superseded_payment_intent_ids;
 ALTER TABLE orders DROP COLUMN IF EXISTS replacement_attempts;
 ALTER TABLE orders DROP COLUMN IF EXISTS replacement_last_attempt_at;
@@ -8,5 +9,6 @@ ALTER TABLE orders DROP COLUMN IF EXISTS replacement_last_error;
 DROP INDEX IF EXISTS orders_one_open_filing_per_name;
 ALTER TABLE orders DROP COLUMN IF EXISTS filing_name_key;
 ALTER TABLE orders DROP COLUMN IF EXISTS hold_op_until;
+ALTER TABLE orders DROP COLUMN IF EXISTS hold_op_token;
 ALTER TABLE orders DROP COLUMN IF EXISTS superseded_open;
 ALTER TABLE orders DROP COLUMN IF EXISTS hold_unknown_flagged_at;

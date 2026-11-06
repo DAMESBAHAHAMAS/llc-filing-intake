@@ -1,3 +1,4 @@
+import { hasDiyPackage } from "../offers/diyPackage.js";
 import { LATER_SERVICES_LINE, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { HOUSE_REGISTERED_AGENT } from "../pdf/types.js";
@@ -74,6 +75,8 @@ interface OrderEmailContext {
   orderId: string;
   paymentMode: PaymentMode;
   sunbizFiling: boolean;
+  /** The $139 order, whose hold can be renewed. */
+  diyPackage: boolean;
   /** Any filing at all, state or federal. Registered Agent or Credentials Kit orders have none. */
   anyFiling: boolean;
   /** An EIN on a formation order, charged when it is complete. */
@@ -124,6 +127,7 @@ function buildContext(row: OrderEmailRow, paymentMode: PaymentMode): OrderEmailC
     orderId: row.order_id,
     paymentMode,
     sunbizFiling: needsSunbizFiling(lineItems),
+    diyPackage: hasDiyPackage(lineItems),
     anyFiling: requiresPayAfterFiling(lineItems),
     laterService: Number(row.deferred_cents ?? 0) > 0,
     items: lineItems.map((li) => ({
@@ -243,9 +247,11 @@ function paymentTerms(ctx: OrderEmailContext): Block[] {
   const charged = ctx.sunbizFiling
     ? `We charge ${whatIsCharged} only after the Florida Division of Corporations confirms that your LLC has been filed, and we send you your filing confirmation.`
     : "We charge your card only after your filing is complete. We email you when it is.";
-  const lapse = ctx.sunbizFiling
-    ? `Holds last about 7 days. If your hold ends before Florida confirms your filing, we charge the card you authorized at checkout once, for ${whatIsCharged}, after Florida confirms it.`
-    : "Holds last about 7 days. If your hold ends before your filing is complete, we charge the card you authorized at checkout once, for the order total, after it is complete.";
+  const lapse = ctx.diyPackage
+    ? `Holds last about 7 days. If your hold is about to end before Florida confirms your filing, we may place a new temporary hold on the same card for the same amount, and we will email you when we do. If no hold is in place when Florida confirms your filing, we charge the card you authorized at checkout once, for ${whatIsCharged}.`
+    : ctx.sunbizFiling
+      ? `Holds last about 7 days. If your hold ends before Florida confirms your filing, we charge the card you authorized at checkout once, for ${whatIsCharged}, after Florida confirms it.`
+      : "Holds last about 7 days. If your hold ends before your filing is complete, we charge the card you authorized at checkout once, for the order total, after it is complete.";
   return [
     p(`We placed a hold of ${total} on your card. A hold is not a charge: the amount is reserved, not collected. Until it is charged or released, it can reduce the balance or credit available on your card.`),
     p(charged),

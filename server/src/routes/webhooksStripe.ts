@@ -322,8 +322,10 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
             failureReason,
           ]);
 
-if (isLiveTestOrder(order.line_items)) {
+          if (isLiveTestOrder(order.line_items)) {
             processingResult = "live_test_expired";
+          } else if (event.livemode === false && process.env.TEST_MODE_ORDERS_FILE !== "true") {
+            processingResult = "test_mode_expired";
           } else {
             const sessionRow = await client.query(
               `SELECT email, full_name, phone, entity_name_primary, crm_lead_id FROM filing_sessions WHERE filing_session_id = $1`,
@@ -473,6 +475,12 @@ export async function handlePaymentLifecycleEvent(
   if (event.type === "payment_intent.succeeded" && (order.superseded_payment_intent_ids ?? []).includes(obj.id)) {
     await sendOpsAlert("A replaced card hold was captured", `Order ${order.order_id}: ${obj.id} was captured, and the current hold ${order.stripe_payment_intent_id} is still open. Refund or release one of them.`);
     return { processingResult: "superseded_hold_captured", orderId: order.order_id };
+  }
+
+  // The same for a refund: that money was never this order's payment.
+  if (event.type === "charge.refunded" && paymentIntentId && (order.superseded_payment_intent_ids ?? []).includes(paymentIntentId)) {
+    await sendOpsAlert("A replaced card hold was refunded", `Order ${order.order_id}: ${paymentIntentId} was refunded. The order's own hold ${order.stripe_payment_intent_id} is unchanged. Check it in Stripe.`);
+    return { processingResult: "superseded_hold_refunded", orderId: order.order_id };
   }
 
   if (event.type === "payment_intent.succeeded") {

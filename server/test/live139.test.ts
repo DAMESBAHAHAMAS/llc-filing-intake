@@ -3,7 +3,7 @@ import http from "node:http";
 import express from "express";
 import type { Pool } from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { createOrderEmailDb, markSubmitted } from "./helpers/orderEmailDb.js";
+import { createOrderEmailDb, markSubmitted, storeArticles } from "./helpers/orderEmailDb.js";
 
 /**
  * The $139 DIY sale and the live payment test, through the real webhook,
@@ -19,15 +19,17 @@ vi.mock("../src/db/pool.js", () => ({
 }));
 const resend = vi.hoisted(() => ({ send: vi.fn() }));
 vi.mock("resend", () => ({ Resend: class { emails = { send: resend.send }; } }));
-const stripe = vi.hoisted(() => ({ capture: vi.fn(), create: vi.fn(), price: vi.fn(), retrieve: vi.fn(), replace: vi.fn(), cancel: vi.fn() }));
+const stripe = vi.hoisted(() => ({ capture: vi.fn(), charge: vi.fn(), create: vi.fn(), price: vi.fn(), retrieve: vi.fn(), replace: vi.fn(), cancel: vi.fn(), list: vi.fn() }));
 vi.mock("../src/stripe/restClient.js", async (orig) => ({
   ...(await orig<typeof import("../src/stripe/restClient.js")>()),
   capturePaymentIntent: stripe.capture,
+  chargeSavedCard: stripe.charge,
   createCheckoutSession: stripe.create,
   retrievePrice: stripe.price,
   retrievePaymentIntent: stripe.retrieve,
   placeReplacementHold: stripe.replace,
   cancelPaymentIntent: stripe.cancel,
+  listPaymentIntents: stripe.list,
 }));
 vi.mock("../src/ops/alerts.js", () => ({
   sendOpsAlert: vi.fn(async () => ({ channel: "log", ok: true })),
@@ -43,6 +45,8 @@ const { runHoldSweepOnce } = await import("../src/fulfillment/holdSweep.js");
 const { runSavedCardCleanupOnce } = await import("../src/payments/savedCardCleanup.js");
 const { clearanceFor, entityNameKey, sameEntityName, approvalCurrent } = await import("../src/payments/filingClearance.js");
 const { replaceHold } = await import("../src/payments/replaceHold.js");
+const { claimOrder, oneStepAtATime, releaseOrder } = await import("../src/payments/holdLock.js");
+const { StripeApiError } = await import("../src/stripe/restClient.js");
 const { sendOpsAlert } = await import("../src/ops/alerts.js");
 const { buildOrderEmail } = await import("../src/orderEmails/templates.js");
 const { sessionRouter } = await import("../src/routes/session.js");
@@ -154,6 +158,9 @@ beforeEach(async () => {
   stripe.retrieve.mockReset().mockResolvedValue(capturable());
   stripe.replace.mockReset().mockResolvedValue(capturable({ id: "pi_new" }));
   stripe.cancel.mockReset().mockResolvedValue({ id: "pi_hold", status: "canceled" });
+  stripe.charge.mockReset().mockResolvedValue({ id: "pi_saved_card", status: "succeeded" });
+  stripe.list.mockReset().mockResolvedValue([]);
+  vi.mocked(sendOpsAlert).mockClear();
 });
 
 describe("the $139 price", () => {
@@ -395,6 +402,7 @@ describe("control 1: a capturable hold before filing", () => {
     await state.db.query(`UPDATE filing_sessions SET entity_name_primary = 'Sol Ventures LLC' WHERE filing_session_id = (SELECT filing_session_id FROM orders WHERE order_id = $1)`, [orderId]);
     await deliver(hold(`evt_${session}`, session));
     await state.db.query(`UPDATE orders SET fulfillment_status = 'requires_review' WHERE order_id = $1`, [orderId]);
+    await storeArticles(state.db, orderId);
     return orderId;
   };
   const approve = (orderId: string) => operator(`/api/orders/${orderId}/approve-filing`);
@@ -440,7 +448,8 @@ describe("control 1: a capturable hold before filing", () => {
     const { rows } = await state.db.query(`SELECT filing_approved_at, capture_before FROM orders WHERE order_id = $1`, [orderId]);
     expect(rows[0].capture_before).not.toBeNull();
     expect(approvalCurrent(rows[0].filing_approved_at, new Date())).toBe(true);
-    expect(approvalCurrent(new Date(Date.now() - 25 * 3600 * 1000), new Date())).toBe(false);
+    expect(approvalCurrent(new Date(Date.now() - 3.9 * 3600 * 1000), new Date())).toBe(true);
+    expect(approvalCurrent(new Date(Date.now() - 4.1 * 3600 * 1000), new Date())).toBe(false);
   });
 
   it("control 5: will not approve a second filing of the same LLC", async () => {
@@ -452,12 +461,62 @@ describe("control 1: a capturable hold before filing", () => {
     expect(await code(res)).toBe("duplicate_filing");
   });
 
-  it("does not file on a released hold", async () => {
+  it("does not approve a released hold", async () => {
     const orderId = await seed("cs_a7");
-    await state.db.query(`UPDATE orders SET payment_status = 'released', filing_approved_at = now() WHERE order_id = $1`, [orderId]);
-    const res = await operator(`/api/orders/${orderId}/submitted-to-sunbiz`, { tracking_number: "T556" });
+    await state.db.query(`UPDATE orders SET payment_status = 'released' WHERE order_id = $1`, [orderId]);
+    const res = await approve(orderId);
     expect(res.status).toBe(409);
     expect(await code(res)).toBe("hold_not_capturable");
+    expect(stripe.retrieve).not.toHaveBeenCalled();
+  });
+
+  it("does not approve a filing that is not ready to go to Florida", async () => {
+    const orderId = await seed("cs_a8");
+    for (const status of ["ready", "in_progress", "failed", "not_ready", "transmitted"]) {
+      await state.db.query(`UPDATE orders SET fulfillment_status = $2 WHERE order_id = $1`, [orderId, status]);
+      const res = await approve(orderId);
+      expect(res.status).toBe(409);
+      expect(await code(res)).toBe("filing_not_ready");
+    }
+    expect(stripe.retrieve).not.toHaveBeenCalled();
+  });
+
+  it("does not approve before the customer's agent accepts, or without the Articles", async () => {
+    const orderId = await seed("cs_a9");
+    const session = `(SELECT filing_session_id FROM orders WHERE order_id = $1)`;
+    await state.db.query(`UPDATE filing_sessions SET filing_data = $2, registered_agent_status = 'acceptance_requested' WHERE filing_session_id = ${session}`, [orderId, JSON.stringify({ llc_name: "Sol Ventures LLC", registered_agent_path: "customer" })]);
+    const agent = await approve(orderId);
+    expect(agent.status).toBe(409);
+    expect(await code(agent)).toBe("registered_agent_not_accepted");
+
+    const noPdf = await seedOrder([DIY_ITEM], "DIY_PACKAGE", "cs_a10");
+    await deliver(hold("evt_cs_a10", "cs_a10"));
+    await state.db.query(`UPDATE orders SET fulfillment_status = 'requires_review' WHERE order_id = $1`, [noPdf]);
+    const pdf = await approve(noPdf);
+    expect(pdf.status).toBe(409);
+    expect(await code(pdf)).toBe("articles_pdf_missing");
+    expect(stripe.retrieve).not.toHaveBeenCalled();
+  });
+
+  it("does not approve a hold with less than a day left, because Florida's answer takes time", async () => {
+    const orderId = await seed("cs_a11");
+    stripe.retrieve.mockResolvedValueOnce(capturable({ latest_charge: { id: "c", payment_method_details: { card: { capture_before: Math.floor(Date.now() / 1000) + 20 * 3600 } } } }));
+    const res = await approve(orderId);
+    expect(res.status).toBe(409);
+    expect(await code(res)).toBe("hold_expiring");
+  });
+
+  it("does not leave an approval on a hold that changed while Stripe was being asked", async () => {
+    const orderId = await seed("cs_a12");
+    stripe.retrieve.mockImplementationOnce(async () => {
+      await state.db.query(`UPDATE orders SET stripe_payment_intent_id = 'pi_other' WHERE order_id = $1`, [orderId]);
+      return capturable();
+    });
+    const res = await approve(orderId);
+    expect(res.status).toBe(409);
+    expect(await code(res)).toBe("order_changed");
+    const { rows } = await state.db.query(`SELECT filing_approved_at FROM orders WHERE order_id = $1`, [orderId]);
+    expect(rows[0].filing_approved_at).toBeNull();
   });
 });
 
@@ -470,7 +529,8 @@ describe("controls 3 and 4: expiry and replacement", () => {
     }
     return orderId;
   };
-  const replace = (orderId: string) => operator(`/api/orders/${orderId}/replace-authorization`);
+  const replace = (orderId: string, body: unknown = {}) => operator(`/api/orders/${orderId}/replace-authorization`, body);
+  const declined = () => new StripeApiError("Your card was declined", 402, { code: "card_declined" });
   const current = async (orderId: string) =>
     (await state.db.query(`SELECT stripe_payment_intent_id, capture_before, hold_expiry_flagged_at, filing_approved_at, superseded_payment_intent_ids, payment_status FROM orders WHERE order_id = $1`, [orderId])).rows[0];
 
@@ -507,7 +567,7 @@ describe("controls 3 and 4: expiry and replacement", () => {
 
   it("keeps the old hold if the bank refuses the new one", async () => {
     const orderId = await heldOrder("cs_r2");
-    stripe.replace.mockRejectedValueOnce(new Error("card_declined"));
+    stripe.replace.mockRejectedValueOnce(declined());
     const res = await replace(orderId);
     expect(res.status).toBe(402);
     expect(stripe.cancel).not.toHaveBeenCalled();
@@ -550,7 +610,7 @@ describe("controls 3 and 4: expiry and replacement", () => {
 
   it("on a refusal: counts it, tells the customer once, and retries as a new attempt", async () => {
     const orderId = await heldOrder("cs_f1");
-    stripe.replace.mockRejectedValue(new Error("card_declined"));
+    stripe.replace.mockRejectedValue(declined());
     for (const attempt of [1, 2, 3]) {
       const res = await replace(orderId);
       expect(res.status).toBe(402);
@@ -707,7 +767,7 @@ describe("the price check before the live test", () => {
 });
 
 
-describe("what the independent review found", () => {
+describe("the manual capture path, end to end", () => {
   const seed = async (session: string) => {
     const orderId = await seedOrder([DIY_ITEM], "DIY_PACKAGE", session);
     await state.db.query(
@@ -719,6 +779,7 @@ describe("what the independent review found", () => {
       `UPDATE orders SET fulfillment_status = 'requires_review', saved_card_authorized_at = now(), saved_card_authorization_text = $2 WHERE order_id = $1`,
       [orderId, payAfter.DIY_SAVED_CARD_AUTHORIZATION]
     );
+    await storeArticles(state.db, orderId);
     return orderId;
   };
   const approve = (orderId: string) => operator(`/api/orders/${orderId}/approve-filing`);
@@ -752,6 +813,119 @@ describe("what the independent review found", () => {
       expect((await approve(orderId)).status).toBe(200);
     });
 
+    it("takes the claim on every route that moves money", async () => {
+      const orderId = await seed("cs_l5");
+      await state.db.query(`UPDATE orders SET proof_of_filing_at = now(), hold_op_until = $2 WHERE order_id = $1`, [orderId, inHours(1)]);
+      const replies = [
+        await operator(`/api/orders/${orderId}/payment-received`, { method: "wire", amount_cents: 13900 }),
+        await operator(`/api/orders/${orderId}/service-complete`, { service_ref: "EIN123456" }),
+        await operator(`/api/orders/${orderId}/release-hold`),
+        await operator(`/api/orders/${orderId}/cancel`),
+        await operator(`/api/orders/${orderId}/replace-authorization`),
+      ];
+      for (const reply of replies) {
+        expect(reply.status).toBe(409);
+        expect(await code(reply)).toBe("order_busy");
+      }
+      expect(stripe.retrieve).not.toHaveBeenCalled();
+      expect(stripe.cancel).not.toHaveBeenCalled();
+      expect((await fields(orderId)).other_payment_at).toBeNull();
+    });
+
+    it("frees the order after a payment recorded another way", async () => {
+      const orderId = await seed("cs_l6");
+      await state.db.query(`UPDATE orders SET proof_of_filing_at = now() WHERE order_id = $1`, [orderId]);
+      expect((await operator(`/api/orders/${orderId}/payment-received`, { method: "wire", amount_cents: 13900 })).status).toBe(200);
+      expect((await fields(orderId)).hold_op_until).toBeNull();
+    });
+
+    it("clears only its own claim", async () => {
+      const orderId = await seed("cs_l7");
+      const late = (await claimOrder(state.db, orderId)) as string;
+      await state.db.query(`UPDATE orders SET hold_op_until = $2 WHERE order_id = $1`, [orderId, inHours(-1)]);
+      const next = (await claimOrder(state.db, orderId)) as string;
+      expect(next).not.toBe(late);
+
+      await releaseOrder(state.db, orderId, late);
+      expect(await claimOrder(state.db, orderId)).toBeNull();
+      await releaseOrder(state.db, orderId, next);
+      expect(await claimOrder(state.db, orderId)).not.toBeNull();
+    });
+
+    it("keeps its own claim in a replacement that outlived it", async () => {
+      const orderId = await seed("cs_l8");
+      let next = "";
+      stripe.replace.mockImplementationOnce(async () => {
+        await state.db.query(`UPDATE orders SET hold_op_until = $2 WHERE order_id = $1`, [orderId, inHours(-1)]);
+        next = (await claimOrder(state.db, orderId)) as string;
+        return capturable({ id: "pi_new" });
+      });
+      await replaceHold(state.db, orderId);
+      expect((await fields(orderId)).hold_op_token).toBe(next);
+    });
+
+    it("keeps the claim when the client drops, until the handler has finished", async () => {
+      const orderId = await seed("cs_l9");
+      let finish: (value: unknown) => void = () => undefined;
+      let started: () => void = () => undefined;
+      const reached = new Promise<void>((resolve) => { started = resolve; });
+      stripe.retrieve.mockImplementationOnce(() => {
+        started();
+        return new Promise((resolve) => { finish = resolve; });
+      });
+      const client = new AbortController();
+      const dropped = fetch(`${base}/api/orders/${orderId}/approve-filing`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-operator-key": OPERATOR_KEY },
+        body: "{}",
+        signal: client.signal,
+      }).catch(() => undefined);
+      await reached;
+      client.abort();
+      await dropped;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      const during = await approve(orderId);
+      expect(during.status).toBe(409);
+      expect(await code(during)).toBe("order_busy");
+
+      finish(capturable());
+      await vi.waitFor(async () => expect((await fields(orderId)).hold_op_until).toBeNull());
+      expect((await fields(orderId)).filing_approved_at).not.toBeNull();
+    });
+
+    it("does not treat a capture that timed out as a decline, and retries with the same key", async () => {
+      const orderId = await seed("cs_l10");
+      await markSubmitted(state.db, orderId);
+      await state.db.query(`UPDATE filing_sessions SET email = 'owner+test@example.com' WHERE filing_session_id = (SELECT filing_session_id FROM orders WHERE order_id = $1)`, [orderId]);
+      await state.db.query(`UPDATE orders SET stripe_livemode = true WHERE order_id = $1`, [orderId]);
+      resend.send.mockResolvedValue({ data: { id: "re_l10" }, error: null });
+      process.env.RESEND_API_KEY = "re_x";
+      process.env.RESEND_FROM_EMAIL = "o@example.com";
+      stripe.capture.mockRejectedValueOnce(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+      expect((await proof(orderId, "L26000123456")).status).toBe(502);
+      expect(stripe.charge).not.toHaveBeenCalled();
+      expect((await proof(orderId, "L26000123456")).status).toBe(200);
+      expect(stripe.capture.mock.calls[0][1]).toBe(stripe.capture.mock.calls[1][1]);
+      expect(stripe.charge).not.toHaveBeenCalled();
+    });
+
+    it("does not treat a saved-card charge that timed out as a decline, and retries with the same key", async () => {
+      const orderId = await seed("cs_l11");
+      await markSubmitted(state.db, orderId);
+      await state.db.query(`UPDATE filing_sessions SET email = 'owner+test@example.com' WHERE filing_session_id = (SELECT filing_session_id FROM orders WHERE order_id = $1)`, [orderId]);
+      await state.db.query(`UPDATE orders SET stripe_livemode = true, payment_status = 'released' WHERE order_id = $1`, [orderId]);
+      resend.send.mockResolvedValue({ data: { id: "re_l11" }, error: null });
+      process.env.RESEND_API_KEY = "re_x";
+      process.env.RESEND_FROM_EMAIL = "o@example.com";
+      stripe.retrieve.mockResolvedValue(capturable({ status: "canceled", amount_capturable: 0 }));
+      stripe.charge.mockRejectedValueOnce(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+      expect((await proof(orderId, "L26000123456")).status).toBe(502);
+      expect((await fields(orderId)).saved_card_attempts).toBe(0);
+      expect((await proof(orderId, "L26000123456")).status).toBe(200);
+      expect(stripe.charge.mock.calls[0][0].idempotencyKey).toBe(stripe.charge.mock.calls[1][0].idempotencyKey);
+    });
+
     it("keeps the sweep's renewal out while an operator step runs", async () => {
       const orderId = await seed("cs_l4");
       await state.db.query(`UPDATE orders SET hold_op_until = $2 WHERE order_id = $1`, [orderId, inHours(1)]);
@@ -772,12 +946,24 @@ describe("what the independent review found", () => {
       expect(stripe.capture).not.toHaveBeenCalled();
     });
 
-    it("renews a hold that lapsed before filing, so the order can file", async () => {
+    it("renews a hold that lapsed before filing only when the customer agreed, and says how", async () => {
       const orderId = await seed("cs_h2");
-      await state.db.query(`UPDATE orders SET payment_status = 'released', fulfillment_status = 'not_ready' WHERE order_id = $1`, [orderId]);
+      await state.db.query(`UPDATE orders SET payment_status = 'released', fulfillment_status = 'not_ready', hold_lapsed_flagged_at = now() WHERE order_id = $1`, [orderId]);
       stripe.retrieve.mockResolvedValue(capturable({ status: "canceled", amount_capturable: 0 }));
-      expect(await replaceHold(state.db, orderId)).toMatchObject({ kind: "replaced", paymentIntentId: "pi_new" });
+
+      for (const body of [{}, { customer_agreed: "   " }]) {
+        const refused = await operator(`/api/orders/${orderId}/replace-authorization`, body);
+        expect(refused.status).toBe(409);
+        expect(await code(refused)).toBe("customer_agreement_required");
+      }
+      expect(stripe.replace).not.toHaveBeenCalled();
+
+      const res = await operator(`/api/orders/${orderId}/replace-authorization`, { customer_agreed: "Replied to our email on 6 Nov: yes, place it again" });
+      expect(res.status).toBe(200);
+      const events = await state.db.query(`SELECT payload FROM filing_events WHERE event_type = 'hold_renewed_by_agreement'`);
+      expect(JSON.stringify(events.rows[0].payload)).toContain("Replied to our email on 6 Nov");
       const order = await fields(orderId);
+      expect(order.hold_lapsed_flagged_at).toBeNull();
       expect(order.payment_status).toBe("authorized");
       expect(order.stripe_payment_intent_id).toBe("pi_new");
       expect(order.superseded_open).toBe(false);
@@ -785,11 +971,13 @@ describe("what the independent review found", () => {
       expect(stripe.cancel).not.toHaveBeenCalled();
     });
 
-    it("leaves a lapsed hold alone once the filing is with Florida", async () => {
+    it("leaves a lapsed hold alone once the filing is with Florida, whatever the customer said", async () => {
       const orderId = await seed("cs_h3");
       await markSubmitted(state.db, orderId);
       await state.db.query(`UPDATE orders SET payment_status = 'released' WHERE order_id = $1`, [orderId]);
-      expect((await replaceHold(state.db, orderId)).kind).toBe("refused");
+      const res = await operator(`/api/orders/${orderId}/replace-authorization`, { customer_agreed: "phone call" });
+      expect(res.status).toBe(409);
+      expect(await code(res)).toBe("no_hold_to_replace");
       expect(stripe.replace).not.toHaveBeenCalled();
     });
 
@@ -827,44 +1015,461 @@ describe("what the independent review found", () => {
       expect((await fields(orderId)).payment_status).toBe("authorized");
       expect(vi.mocked(sendOpsAlert).mock.calls[0][0]).toBe("A replaced card hold was captured");
     });
+
+    const lapse = (orderId: string, extra = "") =>
+      state.db.query(`UPDATE orders SET payment_status = 'released', stripe_payment_intent_id = 'pi_hold' ${extra} WHERE order_id = $1`, [orderId]);
+    const inStripe = (id: string, overrides: Record<string, unknown> = {}) => capturable({ id, metadata: { order_id: "" }, ...overrides });
+
+    it("never re-holds a hold that ended, on the sweep's own path, and tells a person once", async () => {
+      const orderId = await seed("cs_s1");
+      await lapse(orderId);
+      stripe.retrieve.mockResolvedValue(capturable({ status: "canceled", amount_capturable: 0 }));
+
+      const failing = vi.fn(async () => { throw new Error("cliq down"); });
+      await runHoldSweepOnce(state.db, { ...sweepDeps(), alert: failing, replace: (pool, id) => replaceHold(pool, id) });
+      expect(failing).toHaveBeenCalled();
+      expect((await fields(orderId)).hold_lapsed_flagged_at).toBeNull();
+
+      const deps = { ...sweepDeps(), replace: (pool: Pool, id: string) => replaceHold(pool, id) };
+      await runHoldSweepOnce(state.db, deps);
+      await runHoldSweepOnce(state.db, deps);
+      expect(deps.alert).toHaveBeenCalledTimes(1);
+      expect(String((deps.alert.mock.calls as unknown as string[][])[0][0])).toContain("customer_agreed");
+      expect((await fields(orderId)).hold_lapsed_flagged_at).not.toBeNull();
+      expect(stripe.replace).not.toHaveBeenCalled();
+      expect((await fields(orderId)).payment_status).toBe("released");
+    });
+
+    it("has replaceHold itself refuse a hold that ended, however it is reached", async () => {
+      const orderId = await seed("cs_s2");
+      await lapse(orderId);
+      expect(await replaceHold(state.db, orderId)).toMatchObject({ kind: "refused", code: "customer_agreement_required" });
+      expect(stripe.replace).not.toHaveBeenCalled();
+    });
+
+    it("does not flag a lapse a person has dealt with, or one the saved card covers", async () => {
+      const cancelled = await seed("cs_s3");
+      await lapse(cancelled, ", cancelled_at = now()");
+      const proved = await seed("cs_s4");
+      await lapse(proved, ", proof_of_filing_at = now()");
+      const withFlorida = await seed("cs_s5");
+      await markSubmitted(state.db, withFlorida);
+      await lapse(withFlorida);
+      const deps = sweepDeps();
+      await runHoldSweepOnce(state.db, deps);
+      expect(deps.alert).not.toHaveBeenCalled();
+    });
+
+    it("flags a lapse on a rejected filing, which can't go back without a new hold", async () => {
+      const orderId = await seed("cs_s6");
+      await markSubmitted(state.db, orderId);
+      await operator(`/api/orders/${orderId}/filing-rejected`, { reason: "name" });
+      await lapse(orderId);
+      const deps = sweepDeps();
+      await runHoldSweepOnce(state.db, deps);
+      expect(deps.alert).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not renew a hold on a rejected filing while we wait for the customer", async () => {
+      const orderId = await seed("cs_s7");
+      await markSubmitted(state.db, orderId);
+      await operator(`/api/orders/${orderId}/filing-rejected`, { reason: "name" });
+      await state.db.query(`UPDATE orders SET capture_before = $2 WHERE order_id = $1`, [orderId, inHours(30)]);
+      const deps = sweepDeps();
+      await runHoldSweepOnce(state.db, deps);
+      expect(deps.replace).not.toHaveBeenCalled();
+    });
+
+    it("leaves a hold alone while an approval is in use, because renewing would clear it", async () => {
+      const orderId = await seed("cs_s8");
+      await state.db.query(`UPDATE orders SET capture_before = $2, filing_approved_at = now() WHERE order_id = $1`, [orderId, inHours(30)]);
+      const deps = sweepDeps();
+      await runHoldSweepOnce(state.db, deps);
+      expect(deps.replace).not.toHaveBeenCalled();
+      await state.db.query(`UPDATE orders SET filing_approved_at = $2 WHERE order_id = $1`, [orderId, inHours(-5)]);
+      await runHoldSweepOnce(state.db, deps);
+      expect(deps.replace).toHaveBeenCalledTimes(1);
+    });
+
+    it("gets a rejected filing with a lapsed hold back to Florida, and to the capture", async () => {
+      const orderId = await seed("cs_s9");
+      expect((await approve(orderId)).status).toBe(200);
+      await operator(`/api/orders/${orderId}/submitted-to-sunbiz`, { tracking_number: "T900" });
+      await operator(`/api/orders/${orderId}/filing-rejected`, { reason: "name not distinguishable" });
+      await deliver({ id: "evt_s9", type: "payment_intent.canceled", livemode: true, data: { object: { id: "pi_hold", metadata: { order_id: orderId } } } });
+      expect((await fields(orderId)).payment_status).toBe("released");
+
+      stripe.retrieve.mockResolvedValueOnce(capturable({ status: "canceled", amount_capturable: 0 }));
+      expect((await approve(orderId)).status).toBe(409);
+      const renewed = await operator(`/api/orders/${orderId}/replace-authorization`, { customer_agreed: "Replied yes when correcting the name" });
+      expect(renewed.status).toBe(200);
+      const order = await fields(orderId);
+      expect(order).toMatchObject({ payment_status: "authorized", fulfillment_status: "rejected", stripe_payment_intent_id: "pi_new" });
+
+      stripe.retrieve.mockResolvedValue(capturable({ id: "pi_new" }));
+      expect((await approve(orderId)).status).toBe(200);
+      expect((await operator(`/api/orders/${orderId}/resubmitted-to-sunbiz`, {})).status).toBe(200);
+      await state.db.query(`UPDATE filing_sessions SET email = 'owner+test@example.com' WHERE filing_session_id = (SELECT filing_session_id FROM orders WHERE order_id = $1)`, [orderId]);
+      await state.db.query(`UPDATE orders SET stripe_livemode = true WHERE order_id = $1`, [orderId]);
+      resend.send.mockResolvedValue({ data: { id: "re_s9" }, error: null });
+      process.env.RESEND_API_KEY = "re_x";
+      process.env.RESEND_FROM_EMAIL = "o@example.com";
+      expect((await proof(orderId, "L26000123456")).status).toBe(200);
+      expect(stripe.capture.mock.calls[0].slice(0, 2)).toEqual(["pi_new", `capture-${orderId}-pi_new`]);
+    });
+
+    it("lets a person renew after the automatic tries ran out, because the customer has now agreed", async () => {
+      const orderId = await seed("cs_s10");
+      await lapse(orderId, ", replacement_attempts = 3");
+      stripe.retrieve.mockResolvedValue(capturable({ status: "canceled", amount_capturable: 0 }));
+      expect((await operator(`/api/orders/${orderId}/replace-authorization`, { customer_agreed: "phone call, 6 Nov" })).status).toBe(200);
+    });
+
+    it("tags a new hold so it can be found again", async () => {
+      const orderId = await seed("cs_s11");
+      await replaceHold(state.db, orderId);
+      expect(stripe.list).toHaveBeenCalledWith("cus_1");
+      expect(stripe.replace.mock.calls[0][0].metadata).toMatchObject({ order_id: orderId, replaces: "pi_hold" });
+    });
+
+    it("adopts a hold whose response was lost, instead of placing a second one", async () => {
+      const orderId = await seed("cs_s12");
+      stripe.list.mockResolvedValueOnce([
+        inStripe("pi_someone_else", { metadata: { order_id: randomUUID() } }),
+        inStripe("pi_hold", { metadata: { order_id: orderId } }),
+        inStripe("pi_done", { status: "canceled", metadata: { order_id: orderId } }),
+        inStripe("pi_lost", { metadata: { order_id: orderId, kind: "replacement_hold", replaces: "pi_hold" } }),
+      ]);
+      expect(await replaceHold(state.db, orderId)).toMatchObject({ kind: "replaced", paymentIntentId: "pi_lost" });
+      expect(stripe.replace).not.toHaveBeenCalled();
+      expect((await fields(orderId)).stripe_payment_intent_id).toBe("pi_lost");
+      expect(stripe.cancel).toHaveBeenCalledWith("pi_hold", "cancel-superseded-pi_hold");
+      expect(stripe.cancel).not.toHaveBeenCalledWith("pi_lost", expect.anything());
+    });
+
+    it("does not adopt a hold the order already moved on from", async () => {
+      const orderId = await seed("cs_s13");
+      await state.db.query(`UPDATE orders SET superseded_payment_intent_ids = '["pi_older"]' WHERE order_id = $1`, [orderId]);
+      stripe.list.mockResolvedValueOnce([inStripe("pi_older", { metadata: { order_id: orderId } })]);
+      expect(await replaceHold(state.db, orderId)).toMatchObject({ kind: "replaced", paymentIntentId: "pi_new" });
+      expect(stripe.replace).toHaveBeenCalledTimes(1);
+    });
+
+    it("places no hold when it can't see what exists, and counts the attempt", async () => {
+      const orderId = await seed("cs_s14");
+      stripe.list.mockRejectedValueOnce(new Error("stripe down"));
+      const res = await operator(`/api/orders/${orderId}/replace-authorization`);
+      expect(res.status).toBe(402);
+      expect(await code(res)).toBe("replacement_lookup_failed");
+      expect(stripe.replace).not.toHaveBeenCalled();
+      const order = await fields(orderId);
+      expect(order.replacement_attempts).toBe(1);
+      expect(order.replacement_last_attempt_at).not.toBeNull();
+      expect(order.stripe_payment_intent_id).toBe("pi_hold");
+      expect(await queued()).not.toContain("customer_email_hold_replacement_failed");
+    });
+
+    it("treats a timeout on the new hold as unknown, then finds the hold it placed", async () => {
+      const orderId = await seed("cs_s15");
+      stripe.replace.mockRejectedValueOnce(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+      const res = await operator(`/api/orders/${orderId}/replace-authorization`);
+      expect(res.status).toBe(502);
+      expect(await code(res)).toBe("replacement_result_unknown");
+      expect(await queued()).not.toContain("customer_email_hold_replacement_failed");
+      expect((await fields(orderId)).stripe_payment_intent_id).toBe("pi_hold");
+
+      stripe.list.mockResolvedValueOnce([inStripe("pi_after_timeout", { metadata: { order_id: orderId } })]);
+      expect((await operator(`/api/orders/${orderId}/replace-authorization`)).status).toBe(200);
+      expect(stripe.replace).toHaveBeenCalledTimes(1);
+      expect((await fields(orderId)).stripe_payment_intent_id).toBe("pi_after_timeout");
+    });
+
+    it("still tells the customer once the tries have run out, even with no clear answer", async () => {
+      const orderId = await seed("cs_s16");
+      stripe.list.mockRejectedValue(new Error("stripe down"));
+      for (let i = 0; i < 3; i++) await replaceHold(state.db, orderId, { alert: vi.fn(async () => undefined) });
+      expect(await queued()).toContain("customer_email_hold_replacement_failed");
+    });
+
+    it("survives a crash between Stripe placing the hold and the database move", async () => {
+      const orderId = await seed("cs_s17");
+      const realConnect = state.db.connect.bind(state.db);
+      state.db.connect = (async () => {
+        state.db.connect = realConnect;
+        throw new Error("the process died here");
+      }) as never;
+      await expect(replaceHold(state.db, orderId)).rejects.toThrow("the process died here");
+      expect(stripe.cancel).not.toHaveBeenCalled();
+      expect(await fields(orderId)).toMatchObject({ stripe_payment_intent_id: "pi_hold", superseded_open: false, replacement_attempts: 0 });
+
+      stripe.list.mockResolvedValueOnce([inStripe("pi_new", { metadata: { order_id: orderId } })]);
+      expect(await replaceHold(state.db, orderId)).toMatchObject({ kind: "replaced", paymentIntentId: "pi_new" });
+      expect(stripe.replace).toHaveBeenCalledTimes(1);
+      expect((await fields(orderId)).stripe_payment_intent_id).toBe("pi_new");
+    });
+
+    it("moves the order, its flags and the customer's email together, before touching the old hold", async () => {
+      const orderId = await seed("cs_s18");
+      await state.db.query(`UPDATE orders SET hold_unknown_flagged_at = now(), hold_expiry_flagged_at = now(), hold_final_flagged_at = now(), filing_approved_at = now() WHERE order_id = $1`, [orderId]);
+      let seenAtCancel: Record<string, unknown> | null = null;
+      let emailsAtCancel: string[] = [];
+      stripe.cancel.mockImplementationOnce(async () => {
+        seenAtCancel = await fields(orderId);
+        emailsAtCancel = await queued();
+        return { id: "pi_hold", status: "canceled" };
+      });
+      await replaceHold(state.db, orderId);
+      expect(seenAtCancel).toMatchObject({ stripe_payment_intent_id: "pi_new", superseded_open: true, hold_unknown_flagged_at: null, hold_expiry_flagged_at: null, hold_final_flagged_at: null, filing_approved_at: null });
+      expect(emailsAtCancel).toContain("customer_email_hold_replaced");
+      expect((await fields(orderId)).superseded_open).toBe(false);
+    });
+
+    // pg-mem ignores ROLLBACK, so this proves the shape. The Postgres check proves the undo.
+    it("makes the move one transaction, and touches no hold if it fails partway", async () => {
+      const orderId = await seed("cs_s19");
+      await state.db.query(`UPDATE orders SET payment_status = 'released' WHERE order_id = $1`, [orderId]);
+      stripe.retrieve.mockResolvedValue(capturable({ status: "canceled", amount_capturable: 0 }));
+      const realConnect = state.db.connect.bind(state.db);
+      const statements: string[] = [];
+      state.db.connect = (async () => {
+        const client = await realConnect();
+        return {
+          release: client.release,
+          query: (sql: string, params?: unknown[]) => {
+            statements.push(sql.trim().split(/\s+/).slice(0, 2).join(" "));
+            return /hold_renewed_by_agreement/.test(sql) ? Promise.reject(new Error("write failed")) : client.query(sql, params as never);
+          },
+        };
+      }) as never;
+      await expect(replaceHold(state.db, orderId, undefined, "phone call")).rejects.toThrow("write failed");
+      state.db.connect = realConnect;
+      expect(statements).toEqual(["BEGIN", "UPDATE orders", "SELECT filing_data,", "INSERT INTO", "ROLLBACK"].filter((step) => step !== "SELECT filing_data," || statements.includes(step)));
+      expect(stripe.cancel).not.toHaveBeenCalled();
+      expect(await queued()).not.toContain("customer_email_hold_replaced");
+    });
+
+    it("cannot move an order past a capture: a stalled replacement cancels its new hold", async () => {
+      const orderId = await seed("cs_s20");
+      stripe.replace.mockImplementationOnce(async () => {
+        await state.db.query(`UPDATE orders SET proof_of_filing_at = now() WHERE order_id = $1`, [orderId]);
+        return capturable({ id: "pi_new" });
+      });
+      expect(await replaceHold(state.db, orderId)).toMatchObject({ kind: "refused", code: "order_changed" });
+      expect((await fields(orderId)).stripe_payment_intent_id).toBe("pi_hold");
+      expect(stripe.cancel).toHaveBeenCalledWith("pi_new", "cancel-replacement-pi_new");
+      expect(stripe.cancel).not.toHaveBeenCalledWith("pi_hold", expect.anything());
+    });
+
+    it("alerts if the hold from a refused move can't be cancelled", async () => {
+      const orderId = await seed("cs_s21");
+      stripe.replace.mockImplementationOnce(async () => {
+        await state.db.query(`UPDATE orders SET cancelled_at = now() WHERE order_id = $1`, [orderId]);
+        return capturable({ id: "pi_new" });
+      });
+      stripe.cancel.mockRejectedValueOnce(new Error("stripe down"));
+      const alert = vi.fn(async () => undefined);
+      expect(await replaceHold(state.db, orderId, { alert })).toMatchObject({ kind: "refused", code: "order_changed" });
+      expect((alert.mock.calls as unknown as string[][])[0][0]).toBe("A new card hold is still open");
+    });
+
+    it("does not mark an order refunded for a refund on a replaced hold, and raises it", async () => {
+      const orderId = await seed("cs_s22");
+      await replaceHold(state.db, orderId);
+      await state.db.query(`UPDATE orders SET payment_status = 'paid' WHERE order_id = $1`, [orderId]);
+      vi.mocked(sendOpsAlert).mockClear();
+      await deliver({ id: "evt_r1", type: "charge.refunded", livemode: true, data: { object: { id: "ch_old", payment_intent: "pi_hold", refunded: true, metadata: {} } } });
+      expect((await fields(orderId)).payment_status).toBe("paid");
+      expect(vi.mocked(sendOpsAlert).mock.calls[0][0]).toBe("A replaced card hold was refunded");
+      const { rows } = await state.db.query(`SELECT processing_result FROM stripe_webhook_events WHERE id = 'evt_r1'`);
+      expect(rows[0].processing_result).toBe("superseded_hold_refunded");
+
+      await deliver({ id: "evt_r2", type: "charge.refunded", livemode: true, data: { object: { id: "ch_new", payment_intent: "pi_new", refunded: true, metadata: {} } } });
+      expect((await fields(orderId)).payment_status).toBe("refunded");
+    });
   });
 
   describe("control 1: the same clearance on every path to Florida", () => {
-    it("asks Stripe again at submission, and refuses if the hold has ended", async () => {
+    const submit = (orderId: string, body: Record<string, unknown> = {}) => operator(`/api/orders/${orderId}/submitted-to-sunbiz`, { tracking_number: "T700", ...body });
+    const resubmit = (orderId: string, body: Record<string, unknown> = {}) => operator(`/api/orders/${orderId}/resubmitted-to-sunbiz`, body);
+    const alerted = () => vi.mocked(sendOpsAlert).mock.calls.map(([title, body]) => `${title}: ${body}`).join("\n");
+    const history = async () => JSON.stringify((await state.db.query(`SELECT event_type, payload FROM filing_events`)).rows);
+
+    it("records a filing whose hold ended after approval, and says so", async () => {
       const orderId = await seed("cs_f1");
       expect((await approve(orderId)).status).toBe(200);
       stripe.retrieve.mockResolvedValueOnce(capturable({ status: "canceled" }));
-      const res = await operator(`/api/orders/${orderId}/submitted-to-sunbiz`, { tracking_number: "T700" });
-      expect(res.status).toBe(409);
-      expect(await code(res)).toBe("hold_not_capturable");
-      expect((await fields(orderId)).fulfillment_status).toBe("requires_review");
+      expect((await submit(orderId)).status).toBe(200);
+      expect((await fields(orderId)).fulfillment_status).toBe("transmitted");
+      expect(alerted()).toMatch(/recorded outside its approval.*canceled/);
     });
 
-    it("refuses to submit if Stripe can't be reached", async () => {
+    it("records a filing when Stripe can't be reached, and says so", async () => {
       const orderId = await seed("cs_f2");
       expect((await approve(orderId)).status).toBe(200);
       stripe.retrieve.mockRejectedValueOnce(new Error("stripe down"));
-      expect((await operator(`/api/orders/${orderId}/submitted-to-sunbiz`, { tracking_number: "T701" })).status).toBe(502);
+      expect((await submit(orderId)).status).toBe(200);
+      expect((await fields(orderId)).fulfillment_status).toBe("transmitted");
+      expect(alerted()).toMatch(/Stripe could not confirm the hold/);
     });
 
-    it("needs a new approval and a capturable hold to resubmit after a rejection", async () => {
+    it("records a filing made on an approval that has gone stale, and says so", async () => {
+      const orderId = await seed("cs_f5");
+      expect((await approve(orderId)).status).toBe(200);
+      await state.db.query(`UPDATE orders SET filing_approved_at = $2 WHERE order_id = $1`, [orderId, inHours(-5)]);
+      expect((await submit(orderId)).status).toBe(200);
+      expect(alerted()).toMatch(/approval was over 4 hours old/);
+    });
+
+    it("says nothing when the filing followed a current approval on a good hold", async () => {
+      const orderId = await seed("cs_f6");
+      expect((await approve(orderId)).status).toBe(200);
+      expect((await submit(orderId)).status).toBe(200);
+      expect(alerted()).not.toMatch(/outside its approval/);
+    });
+
+    it("takes a lapse between approval and record through to the saved card", async () => {
+      const orderId = await seed("cs_f7");
+      expect((await approve(orderId)).status).toBe(200);
+      await deliver({ id: "evt_lapse", type: "payment_intent.canceled", livemode: true, data: { object: { id: "pi_hold", metadata: { order_id: orderId } } } });
+      expect((await fields(orderId)).payment_status).toBe("released");
+      stripe.retrieve.mockResolvedValue(capturable({ status: "canceled", amount_capturable: 0 }));
+
+      expect((await submit(orderId)).status).toBe(200);
+      expect((await fields(orderId)).fulfillment_status).toBe("transmitted");
+
+      await state.db.query(`UPDATE filing_sessions SET email = 'owner+test@example.com' WHERE filing_session_id = (SELECT filing_session_id FROM orders WHERE order_id = $1)`, [orderId]);
+      resend.send.mockResolvedValue({ data: { id: "re_lapse" }, error: null });
+      process.env.RESEND_API_KEY = "re_x";
+      process.env.RESEND_FROM_EMAIL = "o@example.com";
+      const res = await proof(orderId, "L26000123456");
+      expect(res.status).toBe(200);
+      expect(stripe.capture).not.toHaveBeenCalled();
+      expect(stripe.charge).toHaveBeenCalledTimes(1);
+      expect(stripe.charge.mock.calls[0][0]).toMatchObject({ amountCents: 13900, customerId: "cus_1", paymentMethodId: "pm_1" });
+    });
+
+    it("refuses a filing with no approval, and asks why if it happened anyway", async () => {
+      const orderId = await seed("cs_f8");
+      for (const body of [{}, { filed_without_approval_reason: "   " }]) {
+        const res = await submit(orderId, body);
+        expect(res.status).toBe(409);
+        expect(await code(res)).toBe("filing_not_approved");
+      }
+      expect((await fields(orderId)).fulfillment_status).toBe("requires_review");
+
+      const res = await submit(orderId, { filed_without_approval_reason: "Approve returned a 502 and the filing went in by mistake" });
+      expect(res.status).toBe(200);
+      expect((await fields(orderId)).fulfillment_status).toBe("transmitted");
+      expect(await history()).toContain("Approve returned a 502");
+      expect(alerted()).toMatch(/filed with no approval: Approve returned a 502/);
+    });
+
+    it("can record a filing made on an order with no standing hold, or missing a step", async () => {
+      const orderId = await seed("cs_f9");
+      await state.db.query(`UPDATE orders SET payment_status = 'released', fulfillment_status = 'not_ready' WHERE order_id = $1`, [orderId]);
+      stripe.retrieve.mockResolvedValue(capturable({ status: "canceled", amount_capturable: 0 }));
+      expect((await submit(orderId, { filed_without_approval_reason: "filed from the wrong queue" })).status).toBe(200);
+      expect((await fields(orderId)).fulfillment_status).toBe("transmitted");
+    });
+
+    it("still will not record on a cancelled order, a test, or a confirmed filing", async () => {
+      const reason = { filed_without_approval_reason: "x" };
+      const cancelled = await seed("cs_f10");
+      await state.db.query(`UPDATE orders SET cancelled_at = now() WHERE order_id = $1`, [cancelled]);
+      const one = await submit(cancelled, reason);
+      expect(one.status).toBe(409);
+      expect(await code(one)).toBe("order_cancelled");
+
+      const confirmed = await seed("cs_f11");
+      await state.db.query(`UPDATE orders SET proof_of_filing_at = now() WHERE order_id = $1`, [confirmed]);
+      const two = await submit(confirmed, reason);
+      expect(two.status).toBe(409);
+      expect(await code(two)).toBe("filing_confirmed");
+
+      const test = await seedOrder([TEST_ITEM], LIVE_TEST_OFFER_CODE, "cs_f12");
+      await deliver(hold("evt_f12", "cs_f12"));
+      expect((await submit(test, reason)).status).toBe(409);
+      expect((await resubmit(test, reason)).status).toBe(409);
+      expect((await row(test)).fulfillment_status).toBe("not_ready");
+
+      const none = await seedOrder([{ offer_code: "CREDENTIALS_KIT" }], "CREDENTIALS_KIT", "cs_f13");
+      expect((await submit(none, reason)).status).toBe(409);
+    });
+
+    it("answers plainly for an order never paid for, which the database can't hold as filed", async () => {
+      const orderId = await seed("cs_f20");
+      for (const status of ["pending", "failed"]) {
+        await state.db.query(`UPDATE orders SET payment_status = $2, fulfillment_status = 'not_ready' WHERE order_id = $1`, [orderId, status]);
+        const res = await submit(orderId, { filed_without_approval_reason: "filed by mistake" });
+        expect(res.status).toBe(409);
+        expect(await code(res)).toBe("no_payment_on_order");
+      }
+    });
+
+    it("records a name clash a person must sort out, rather than losing the filing", async () => {
+      const orderId = await seed("cs_f14");
+      const other = await seed("cs_f15");
+      await state.db.query(`UPDATE orders SET filing_name_key = 'SOL VENTURES' WHERE order_id = $1`, [other]);
+      const res = await submit(orderId, { filed_without_approval_reason: "filed anyway" });
+      expect(res.status).toBe(200);
+      expect((await fields(orderId)).fulfillment_status).toBe("transmitted");
+      expect(alerted()).toMatch(/already being filed on another order/);
+    });
+
+    it("cancels an approved order only once the operator says it was not filed", async () => {
+      const orderId = await seed("cs_f16");
+      expect((await approve(orderId)).status).toBe(200);
+      const refused = await operator(`/api/orders/${orderId}/cancel`, { reason: "changed their mind" });
+      expect(refused.status).toBe(409);
+      expect(await code(refused)).toBe("approved_for_filing");
+      expect((await fields(orderId)).cancelled_at).toBeNull();
+      expect(stripe.cancel).not.toHaveBeenCalled();
+      expect((await operator(`/api/orders/${orderId}/cancel`, { confirm_not_filed: "yes" })).status).toBe(409);
+
+      expect((await operator(`/api/orders/${orderId}/cancel`, { reason: "changed their mind", confirm_not_filed: true })).status).toBe(200);
+      expect((await fields(orderId)).cancelled_at).not.toBeNull();
+      expect(stripe.cancel).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not ask for that once the approval has run out", async () => {
+      const orderId = await seed("cs_f17");
+      expect((await approve(orderId)).status).toBe(200);
+      await state.db.query(`UPDATE orders SET filing_approved_at = $2 WHERE order_id = $1`, [orderId, inHours(-5)]);
+      expect((await operator(`/api/orders/${orderId}/cancel`, {})).status).toBe(200);
+    });
+
+    it("lets a live test close whatever its approval says", async () => {
+      const test = await seedOrder([TEST_ITEM], LIVE_TEST_OFFER_CODE, "cs_f18");
+      await deliver(hold("evt_f18", "cs_f18"));
+      await state.db.query(`UPDATE orders SET filing_approved_at = now() WHERE order_id = $1`, [test]);
+      expect((await operator(`/api/orders/${test}/cancel`, {})).status).toBe(200);
+    });
+
+    it("needs a new approval to resubmit after a rejection, and records it even if the hold then ends", async () => {
       const orderId = await seed("cs_f3");
       expect((await approve(orderId)).status).toBe(200);
       await markSubmitted(state.db, orderId);
       expect((await operator(`/api/orders/${orderId}/filing-rejected`, { reason: "name not distinguishable" })).status).toBe(200);
       expect((await fields(orderId)).filing_approved_at).toBeNull();
 
-      const refused = await operator(`/api/orders/${orderId}/resubmitted-to-sunbiz`, {});
+      const refused = await resubmit(orderId);
       expect(refused.status).toBe(409);
       expect(await code(refused)).toBe("filing_not_approved");
 
       expect((await approve(orderId)).status).toBe(200);
       stripe.retrieve.mockResolvedValueOnce(capturable({ status: "canceled" }));
-      expect((await operator(`/api/orders/${orderId}/resubmitted-to-sunbiz`, {})).status).toBe(409);
-      expect((await fields(orderId)).fulfillment_status).toBe("rejected");
-
-      expect((await operator(`/api/orders/${orderId}/resubmitted-to-sunbiz`, {})).status).toBe(200);
+      expect((await resubmit(orderId)).status).toBe(200);
       expect((await fields(orderId)).fulfillment_status).toBe("transmitted");
+      expect(alerted()).toMatch(/recorded outside its approval.*canceled/);
+    });
+
+    it("records a resubmission with no approval when the operator says why", async () => {
+      const orderId = await seed("cs_f19");
+      await markSubmitted(state.db, orderId);
+      await operator(`/api/orders/${orderId}/filing-rejected`, { reason: "name" });
+      expect((await resubmit(orderId, { filed_without_approval_reason: "resent from Sunbiz by mistake" })).status).toBe(200);
+      expect((await fields(orderId)).fulfillment_status).toBe("transmitted");
+      expect(await history()).toContain("resent from Sunbiz by mistake");
     });
 
     it("clears the approval when a person releases the hold, and stops it renewing", async () => {
@@ -904,7 +1509,7 @@ describe("what the independent review found", () => {
       const [a, b] = [await seed("cs_d3"), await seed("cs_d4")];
       expect((await approve(a)).status).toBe(200);
       expect((await approve(b)).status).toBe(409);
-      expect((await operator(`/api/orders/${a}/cancel`, { reason: "customer changed their mind" })).status).toBe(200);
+      expect((await operator(`/api/orders/${a}/cancel`, { reason: "customer changed their mind", confirm_not_filed: true })).status).toBe(200);
       expect((await approve(b)).status).toBe(200);
     });
 
@@ -916,22 +1521,25 @@ describe("what the independent review found", () => {
       expect(await code(res)).toBe("filing_name_missing");
     });
 
-    it("re-checks a corrected name at resubmission", async () => {
+    it("checks a corrected name at approval, before Florida is paid again", async () => {
       const [a, b] = [await seed("cs_d6"), await seed("cs_d7")];
-      await state.db.query(`UPDATE filing_sessions SET filing_data = filing_data WHERE filing_session_id IS NULL`);
       await state.db.query(`UPDATE orders SET filing_name_key = 'OTHER NAME' WHERE order_id = $1`, [b]);
       expect((await approve(a)).status).toBe(200);
       await markSubmitted(state.db, a);
       expect((await operator(`/api/orders/${a}/filing-rejected`, { reason: "name" })).status).toBe(200);
-      expect((await approve(a)).status).toBe(200);
-      const res = await operator(`/api/orders/${a}/resubmitted-to-sunbiz`, {
-        corrections: {
-          llc_name: "Other Name LLC", principal_address_line1: "1 Main St", principal_city: "Miami", principal_state: "FL", principal_zip: "33101",
-          organizer_name: "Ana Sol", registered_agent_name: "Ana Sol", registered_agent_address_line1: "1 Main St", registered_agent_city: "Miami", registered_agent_state: "FL", registered_agent_zip: "33101",
-        },
-      });
-      expect([409, 422]).toContain(res.status);
-      if (res.status === 409) expect(await code(res)).toBe("duplicate_filing");
+
+      const clash = await operator(`/api/orders/${a}/approve-filing`, { llc_name: "Other Name LLC" });
+      expect(clash.status).toBe(409);
+      expect(await code(clash)).toBe("duplicate_filing");
+
+      expect((await operator(`/api/orders/${a}/approve-filing`, { llc_name: "Free Name LLC" })).status).toBe(200);
+      expect((await fields(a)).filing_name_key).toBe("FREE NAME");
+    });
+
+    it("takes a corrected name only on a rejected filing, because the name is locked before that", async () => {
+      const orderId = await seed("cs_d8");
+      expect((await operator(`/api/orders/${orderId}/approve-filing`, { llc_name: "Another Name LLC" })).status).toBe(200);
+      expect((await fields(orderId)).filing_name_key).toBe("SOL VENTURES");
     });
   });
 
@@ -1018,6 +1626,8 @@ describe("what the independent review found", () => {
   });
 
   describe("control 6: test orders stay out of everything", () => {
+    const post = (path: string, body: unknown) =>
+      fetch(`${base}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const testEvent = (id: string, session: string) => ({ ...hold(id, session), livemode: false });
 
     it("keeps a Stripe test-mode order out of the CRM and away from Florida", async () => {
@@ -1040,6 +1650,83 @@ describe("what the independent review found", () => {
       }
     });
 
+    it("queues no abandoned cart for a Stripe test-mode checkout", async () => {
+      await seedOrder([DIY_ITEM], "DIY_PACKAGE", "cs_t6");
+      await deliver({ id: "evt_t6", type: "checkout.session.expired", livemode: false, data: { object: { id: "cs_t6", metadata: {} } } });
+      await seedOrder([DIY_ITEM], "DIY_PACKAGE", "cs_t7");
+      await deliver({ id: "evt_t7", type: "checkout.session.async_payment_failed", livemode: false, data: { object: { id: "cs_t7", metadata: {} } } });
+      expect(await queued()).toEqual([]);
+      const { rows } = await state.db.query(`SELECT payment_status FROM orders`);
+      expect(rows.map((r: { payment_status: string }) => r.payment_status)).toEqual(["failed", "failed"]);
+    });
+
+    it("queues one for a live checkout, and for test mode when QA opts in", async () => {
+      await seedOrder([DIY_ITEM], "DIY_PACKAGE", "cs_t8");
+      await deliver({ id: "evt_t8", type: "checkout.session.expired", livemode: true, data: { object: { id: "cs_t8", metadata: {} } } });
+      expect(await queued()).toEqual(["abandoned_cart"]);
+      process.env.TEST_MODE_ORDERS_FILE = "true";
+      try {
+        await seedOrder([DIY_ITEM], "DIY_PACKAGE", "cs_t9");
+        await deliver({ id: "evt_t9", type: "checkout.session.expired", livemode: false, data: { object: { id: "cs_t9", metadata: {} } } });
+        expect(await queued()).toEqual(["abandoned_cart", "abandoned_cart"]);
+      } finally {
+        delete process.env.TEST_MODE_ORDERS_FILE;
+      }
+    });
+
+    const awaitingAgent = async (session: string, livemode: boolean) => {
+      const orderId = await seedOrder([DIY_ITEM], "DIY_PACKAGE", session);
+      const { rows } = await state.db.query(`SELECT filing_session_id FROM orders WHERE order_id = $1`, [orderId]);
+      await state.db.query(`UPDATE filing_sessions SET filing_data = $2, registered_agent_status = 'acceptance_requested' WHERE filing_session_id = $1`, [
+        rows[0].filing_session_id,
+        JSON.stringify({ llc_name: "Sol Ventures LLC", registered_agent_path: "customer" }),
+      ]);
+      await state.db.query(
+        `INSERT INTO registered_agent_acceptances (filing_session_id, status, requested_at, registered_agent_name, registered_agent_email, acceptance_token_id, acceptance_version) VALUES ($1, 'acceptance_requested', now(), 'Sam', 'sam@example.com', $2, 'v1')`,
+        [rows[0].filing_session_id, `token-${session}`]
+      );
+      await deliver({ ...hold(`evt_${session}`, session), livemode });
+      expect((await row(orderId)).fulfillment_status).toBe("not_ready");
+      return orderId;
+    };
+
+    it("does not start a test-mode order when its agent accepts", async () => {
+      const orderId = await awaitingAgent("cs_t10", false);
+      expect((await post("/api/registered-agent/accept", { token: "token-cs_t10" })).status).toBe(200);
+      expect((await row(orderId)).fulfillment_status).toBe("not_ready");
+      expect(await claimNextReadyOrder(state.db, "t")).toBeNull();
+    });
+
+    it("starts a live order when its agent accepts, and a test one only if QA opts in", async () => {
+      const live = await awaitingAgent("cs_t11", true);
+      await post("/api/registered-agent/accept", { token: "token-cs_t11" });
+      expect((await row(live)).fulfillment_status).toBe("ready");
+
+      process.env.TEST_MODE_ORDERS_FILE = "true";
+      try {
+        const qa = await seedOrder([DIY_ITEM], "DIY_PACKAGE", "cs_t12");
+        const { rows } = await state.db.query(`SELECT filing_session_id FROM orders WHERE order_id = $1`, [qa]);
+        await state.db.query(`UPDATE filing_sessions SET filing_data = $2, registered_agent_status = 'acceptance_requested' WHERE filing_session_id = $1`, [rows[0].filing_session_id, JSON.stringify({ llc_name: "QA LLC", registered_agent_path: "customer" })]);
+        await state.db.query(
+          `INSERT INTO registered_agent_acceptances (filing_session_id, status, requested_at, registered_agent_name, registered_agent_email, acceptance_token_id, acceptance_version) VALUES ($1, 'acceptance_requested', now(), 'Sam', 'sam@example.com', 'token-qa', 'v1')`,
+          [rows[0].filing_session_id]
+        );
+        await deliver({ ...hold("evt_t12", "cs_t12"), livemode: false });
+        await post("/api/registered-agent/accept", { token: "token-qa" });
+        expect((await row(qa)).fulfillment_status).toBe("ready");
+      } finally {
+        delete process.env.TEST_MODE_ORDERS_FILE;
+      }
+    });
+
+    it("does not return a test-mode order to ready when its hold is renewed", async () => {
+      const orderId = await seed("cs_t13");
+      await state.db.query(`UPDATE orders SET payment_status = 'released', fulfillment_status = 'not_ready', stripe_livemode = false WHERE order_id = $1`, [orderId]);
+      stripe.retrieve.mockResolvedValue(capturable({ status: "canceled", amount_capturable: 0 }));
+      await replaceHold(state.db, orderId, undefined, "QA");
+      expect((await row(orderId)).fulfillment_status).toBe("not_ready");
+    });
+
     it("closes a live test whatever state it reached", async () => {
       const pending = await seedOrder([TEST_ITEM], LIVE_TEST_OFFER_CODE, "cs_t3");
       expect((await operator(`/api/orders/${pending}/cancel`, { reason: "test finished" })).status).toBe(200);
@@ -1054,6 +1741,19 @@ describe("what the independent review found", () => {
   });
 
   describe("control 7: the disclosure matches the order", () => {
+    const emailRow = (line_items: unknown[]) => ({ order_id: "ord-1", line_items, total_cents: 13900, proof_of_filing_ref: null, email: "a@example.com", full_name: "Ana Sol", phone: null, country: null, entity_name_primary: "Sol Ventures LLC", entity_name_backup: null, filing_data: {}, registered_agent_status: "accepted" });
+
+    it("tells a $139 customer in the confirmation that a new hold may be placed, and emailed", () => {
+      const { text } = buildOrderEmail("order_confirmation", emailRow([DIY_ITEM]) as never, "hold") as { text: string };
+      expect(text).toContain("If your hold is about to end before Florida confirms your filing, we may place a new temporary hold on the same card for the same amount, and we will email you when we do.");
+      expect(text).toContain("If no hold is in place when Florida confirms your filing, we charge the card you authorized at checkout once");
+    });
+
+    it("promises no renewal to an order that doesn't have one", () => {
+      const { text } = buildOrderEmail("order_confirmation", emailRow([{ offer_code: "FASTTRACK", unit_amount_cents: 13900, quantity: 1 }]) as never, "hold") as { text: string };
+      expect(text).not.toContain("new temporary hold");
+    });
+
     it("states the amount actually held", () => {
       expect(diy.holdFundsDisclosure(13900)).toContain("temporary hold of $139,");
       expect(diy.holdFundsDisclosure(23700)).toContain("temporary hold of $237,");

@@ -48,7 +48,7 @@ const SCHEMA = `
     cancelled_at timestamptz, cancellation_reason text,
     saved_card_detached_at timestamptz, saved_card_detach_error text,
     fulfillment_completed_at timestamptz,
-    filing_name_key text, hold_op_until timestamptz, superseded_open boolean NOT NULL DEFAULT false, hold_unknown_flagged_at timestamptz, replacement_attempts integer NOT NULL DEFAULT 0, replacement_last_attempt_at timestamptz, replacement_last_error text, filing_approved_at timestamptz, hold_final_flagged_at timestamptz, capture_before timestamptz, extended_authorization boolean, hold_expiry_flagged_at timestamptz, superseded_payment_intent_ids jsonb NOT NULL DEFAULT '[]',
+    filing_name_key text, hold_op_until timestamptz, hold_op_token text, hold_lapsed_flagged_at timestamptz, superseded_open boolean NOT NULL DEFAULT false, hold_unknown_flagged_at timestamptz, replacement_attempts integer NOT NULL DEFAULT 0, replacement_last_attempt_at timestamptz, replacement_last_error text, filing_approved_at timestamptz, hold_final_flagged_at timestamptz, capture_before timestamptz, extended_authorization boolean, hold_expiry_flagged_at timestamptz, superseded_payment_intent_ids jsonb NOT NULL DEFAULT '[]',
     sunbiz_tracking_number text, sunbiz_submitted_at timestamptz, sunbiz_resubmitted_at timestamptz,
     sunbiz_rejected_at timestamptz, sunbiz_rejection_reason text, sunbiz_rejection_count integer NOT NULL DEFAULT 0,
     other_payment_at timestamptz, other_payment_method text, other_payment_reference text, other_payment_cents integer,
@@ -122,14 +122,19 @@ async function run(runner: Runner, sql: string, params?: unknown[]) {
   return runner.query(adapt(sql), params as never);
 }
 
-/** What the operator's submission leaves behind: a filing proof can be accepted for. */
-export async function markSubmitted(db: Pool, orderId: string): Promise<void> {
+/** What the fulfillment worker leaves behind: the order's Articles. */
+export async function storeArticles(db: Pool, orderId: string): Promise<void> {
   const { rows } = await db.query<{ filing_session_id: string }>(`SELECT filing_session_id FROM orders WHERE order_id = $1`, [orderId]);
   await db.query(`INSERT INTO filing_documents (filing_session_id, order_id, byte_size, sha256, pdf_bytes) VALUES ($1, $2, 4, 'abc', $3)`, [
     rows[0].filing_session_id,
     orderId,
     Buffer.from("%PDF"),
   ]);
+}
+
+/** What the operator's submission leaves behind: a filing proof can be accepted for. */
+export async function markSubmitted(db: Pool, orderId: string): Promise<void> {
+  await storeArticles(db, orderId);
   await db.query(`UPDATE orders SET fulfillment_status = 'transmitted', sunbiz_tracking_number = 'T100', sunbiz_submitted_at = now() WHERE order_id = $1`, [orderId]);
 }
 
