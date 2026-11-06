@@ -10,6 +10,8 @@ import { attemptSavedCardCharge } from "../payments/savedCard.js";
 import { requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { findFilingBlocker } from "../fulfillment/filingGate.js";
+import { isLiveTestOrder } from "../offers/liveTest.js";
+import { isFloridaLlcDocumentNumber } from "../payments/documentNumber.js";
 import { buildPdfContext } from "../pdf/context.js";
 import { generateArticlesOfOrganizationPdf } from "../pdf/serviceClient.js";
 import type { FilingSessionRecord } from "../pdf/types.js";
@@ -24,7 +26,7 @@ export const ordersRouter = Router();
  * (header x-operator-key). With the key unset, the endpoints refuse every
  * request rather than run unprotected.
  */
-function operatorAuthorized(req: Request): boolean {
+export function operatorAuthorized(req: Request): boolean {
   const expected = process.env.OPERATOR_API_KEY;
   const given = req.header("x-operator-key");
   if (!expected || !given) return false;
@@ -32,6 +34,9 @@ function operatorAuthorized(req: Request): boolean {
   const b = Buffer.from(given);
   return a.length === b.length && timingSafeEqual(a, b);
 }
+
+/** A live test files nothing, so there is no filing confirmation to send. */
+const NO_PROOF_EMAIL_FOR_LIVE_TEST = { ok: true, alreadyDelivered: false } as const;
 
 interface ProofOrder {
   order_id: string;
@@ -84,6 +89,7 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
 
   const orderId = req.params.orderId;
   let order: ProofOrder;
+  let liveTest = false;
   try {
     const existing = await pool.query<{
       order_id: string;
@@ -92,8 +98,9 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
       line_items: Array<{ offer_code?: string }> | null;
       cancelled_at: Date | null;
       fulfillment_status: string;
+      sunbiz_tracking_number: string | null;
     }>(
-      `SELECT order_id, filing_session_id, payment_status, line_items, cancelled_at, fulfillment_status FROM orders WHERE order_id = $1`,
+      `SELECT order_id, filing_session_id, payment_status, line_items, cancelled_at, fulfillment_status, sunbiz_tracking_number FROM orders WHERE order_id = $1`,
       [orderId]
     );
     if (!existing.rows.length) {
@@ -104,6 +111,7 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
       res.status(409).json({ error: "order is cancelled; nothing is filed or collected", order_id: orderId });
       return;
     }
+    liveTest = isLiveTestOrder(existing.rows[0].line_items);
     if (!requiresPayAfterFiling(existing.rows[0].line_items ?? [])) {
       res.status(409).json({ error: "order includes no filing", order_id: orderId });
       return;
@@ -121,6 +129,15 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
       const blocker = await findFilingBlocker(pool, filing);
       if (blocker) {
         res.status(409).json({ ...blocker, order_id: orderId });
+        return;
+      }
+      // The card is charged on this value, so it has to be what Florida issues.
+      if (!isFloridaLlcDocumentNumber(documentNumber)) {
+        res.status(400).json({ error: "document_number must be the Florida LLC document number, such as L26000123456", code: "document_number_invalid", order_id: orderId });
+        return;
+      }
+      if (filing.sunbiz_tracking_number && filing.sunbiz_tracking_number.toUpperCase() === documentNumber.toUpperCase()) {
+        res.status(400).json({ error: "that is the Sunbiz tracking number, not the document number", code: "document_number_is_tracking_number", order_id: orderId });
         return;
       }
     }
@@ -141,7 +158,7 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
 
   if (order.payment_status === "paid") {
     // Already collected, so nothing depends on this send; the customer still gets their proof.
-    const delivery = await deliverProofToCustomer(pool, order.order_id);
+    const delivery = liveTest ? NO_PROOF_EMAIL_FOR_LIVE_TEST : await deliverProofToCustomer(pool, order.order_id);
     if (!delivery.ok) await alertProofNotDelivered(order.order_id, delivery.error);
     res.status(200).json({ order_id: order.order_id, status: "already_paid", proof_delivered: delivery.ok });
     return;
@@ -151,7 +168,7 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
     return;
   }
 
-  const delivery = await deliverProofToCustomer(pool, order.order_id);
+  const delivery = liveTest ? NO_PROOF_EMAIL_FOR_LIVE_TEST : await deliverProofToCustomer(pool, order.order_id);
   if (!delivery.ok) {
     await alertProofNotDelivered(order.order_id, delivery.error);
     res.status(502).json({ error: "proof of filing was not delivered to the customer; nothing was collected", detail: delivery.error, order_id: order.order_id });

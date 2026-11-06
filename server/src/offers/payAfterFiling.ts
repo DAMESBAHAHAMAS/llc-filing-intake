@@ -1,3 +1,5 @@
+import { DIY_PACKAGE_BREAKDOWN_LINE, hasDiyPackage } from "./diyPackage.js";
+import { isLiveTestOrder } from "./liveTest.js";
 import { needsSunbizFiling } from "./sunbizFiling.js";
 
 /**
@@ -12,7 +14,9 @@ const EIN_FILING_OFFER_CODES = new Set(["EIN_FILING", "EIN_FILING_EXPRESS"]);
 
 export function requiresPayAfterFiling(lineItems: Array<{ offer_code?: string }>): boolean {
   return (
-    needsSunbizFiling(lineItems) || lineItems.some((li) => li.offer_code && EIN_FILING_OFFER_CODES.has(li.offer_code))
+    needsSunbizFiling(lineItems) ||
+    isLiveTestOrder(lineItems) ||
+    lineItems.some((li) => li.offer_code && EIN_FILING_OFFER_CODES.has(li.offer_code))
   );
 }
 
@@ -50,18 +54,31 @@ export const SAVED_CARD_AUTHORIZATION_EIN_ONLY =
 /** Approved 2 Oct 2026. Shown when an EIN is charged after the filing. */
 export const LATER_SERVICES_LINE = "Services such as EIN filing are charged when that service is complete, using the card you checked out with.";
 
+/** Internal only: the operator's live payment test. No LLC is filed. */
+export const LIVE_TEST_CHECKOUT_MESSAGE =
+  "Internal payment test. No LLC is filed. Your card is held and charged only after the test confirmation step.";
+
 /** The text a held Checkout Session shows, for custom_text. */
 export function holdCheckoutText(lineItems: Array<{ offer_code?: string; unit_amount_cents?: number; quantity?: number }>): {
   submit: string;
   afterSubmit?: string;
 } {
+  if (isLiveTestOrder(lineItems)) return { submit: LIVE_TEST_CHECKOUT_MESSAGE };
   if (!needsSunbizFiling(lineItems)) return { submit: SAVED_CARD_AUTHORIZATION_EIN_ONLY };
   const later = deferredServiceCents(lineItems) > 0 ? ` ${LATER_SERVICES_LINE}` : "";
-  return { submit: SAVED_CARD_AUTHORIZATION, afterSubmit: `${HOLD_CHECKOUT_MESSAGE}${later}` };
+  const breakdown = hasDiyPackage(lineItems) ? ` ${DIY_PACKAGE_BREAKDOWN_LINE}` : "";
+  return { submit: SAVED_CARD_AUTHORIZATION, afterSubmit: `${HOLD_CHECKOUT_MESSAGE}${later}${breakdown}` };
 }
 
 /** PAYMENT_CAPTURE_MODE=immediate turns holds off everywhere (rollback
  *  switch). Anything else, including unset, keeps the rule on. */
 export function holdsEnabled(): boolean {
   return (process.env.PAYMENT_CAPTURE_MODE ?? "hold").toLowerCase() !== "immediate";
+}
+
+/** The rollback switch exists for test mode. With a live key it would charge
+ *  a customer before Florida confirms, so checkout refuses instead. */
+export function immediateChargeForbidden(lineItems: Array<{ offer_code?: string }>, env: NodeJS.ProcessEnv = process.env): boolean {
+  const liveKey = /^(sk|rk)_live_/.test(env.STRIPE_SECRET_KEY ?? "");
+  return liveKey && requiresPayAfterFiling(lineItems) && !holdsEnabled();
 }

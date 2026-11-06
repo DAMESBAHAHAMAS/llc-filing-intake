@@ -1,12 +1,13 @@
 import { Router } from "express";
 import { closedCodesIn } from "../offers/closedOffers.js";
+import { DIY_PACKAGE_BREAKDOWN, DIY_PACKAGE_OFFER_CODE } from "../offers/diyPackage.js";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { resolveActiveOffers } from "../offers/catalog.js";
 import { createCheckoutSession, expireCheckoutSession, retrieveCheckoutSession, StripeApiError } from "../stripe/restClient.js";
 import { getEinExpressAvailability } from "../ein/capacity.js";
 import { houseAgentLineMissing } from "../offers/houseAgentRule.js";
-import { deferredServiceCents, holdCheckoutText, holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
+import { deferredServiceCents, holdCheckoutText, holdsEnabled, immediateChargeForbidden, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { articlesBlockers } from "../pdf/context.js";
 import type { FilingSessionRecord } from "../pdf/types.js";
@@ -229,11 +230,17 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         stripe_price_id: offer.stripe_price_id,
         unit_amount_cents: offer.unit_amount_cents,
         quantity: item.quantity,
+        ...(offer.offer_code === DIY_PACKAGE_OFFER_CODE ? { breakdown: DIY_PACKAGE_BREAKDOWN } : {}),
       };
     });
 
     const totalCents = lineItemSnapshots.reduce((sum, li) => sum + li.unit_amount_cents * li.quantity, 0);
     const primaryOffer = resolvedByCode.get(requestedItems[0].offer_code)!;
+
+    if (immediateChargeForbidden(lineItemSnapshots)) {
+      res.status(503).json({ error: "checkout is closed: filing orders must use a card hold", code: "hold_required" });
+      return;
+    }
 
     // Pay-after-filing: filing orders place a card hold that is collected
     // only when proof of filing is recorded (routes/orders.ts).

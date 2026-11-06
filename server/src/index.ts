@@ -12,6 +12,7 @@ import { einExpressRouter } from "./routes/einExpress.js";
 import { offersRouter } from "./routes/offers.js";
 import { filingDocumentRouter } from "./routes/filingDocument.js";
 import { ordersRouter } from "./routes/orders.js";
+import { liveTestRouter } from "./routes/liveTest.js";
 import { scorecardRouter } from "./routes/scorecard.js";
 import { runScorecardTick } from "./scorecard/service.js";
 import { realScorecardSender } from "./scorecard/sender.js";
@@ -63,6 +64,7 @@ app.use(einExpressRouter);
 app.use(offersRouter);
 app.use(filingDocumentRouter);
 app.use(ordersRouter);
+app.use(liveTestRouter);
 app.use(scorecardRouter);
 
 const port = Number(process.env.PORT ?? 3000);

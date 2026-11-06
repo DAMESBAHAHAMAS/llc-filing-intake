@@ -3,6 +3,7 @@ import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { notifyOrderEvent } from "../ops/alerts.js";
 import { verifyStripeSignature, WebhookSignatureError } from "../stripe/webhookSignature.js";
+import { isLiveTestOrder } from "../offers/liveTest.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
 import { alertEmailsNotQueued, CHECKOUT_EMAIL_TYPES, enqueueCustomerEmails } from "../orderEmails/worker.js";
@@ -190,12 +191,16 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
           // crm_deal_id (known here via Stripe metadata — routes/checkout.ts
           // sets it, read back from this already-signature-verified event
           // body), updating that Deal instead of creating a second one.
+          const liveTest = isLiveTestOrder(order.line_items);
           const crmDealId = session.metadata?.crm_deal_id;
           const targetStage = held
             ? process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED"
             : process.env.ZOHO_DEAL_STAGE_ON_PAYMENT;
           const expectedEmail = sessionRow.rows[0]?.email;
-          if (crmDealId) {
+          if (liveTest) {
+            // A payment test is not a customer: no Deal, no customer email.
+            processingResult = held ? "live_test_held" : "live_test_paid";
+          } else if (crmDealId) {
             await client.query(`UPDATE orders SET crm_deal_id = $2 WHERE order_id = $1`, [orderId, crmDealId]);
             if (targetStage && expectedEmail) {
               // expected_email is what zoho/client.ts's updateDealStage
@@ -263,12 +268,14 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
 
           // Welcome, order confirmation and intake summary. Queued here so
           // they commit with the hold; orderEmails/worker.ts sends them.
-          customerEmailsNotQueued = !(await enqueueCustomerEmails(client, {
-            orderId: order.order_id,
-            filingSessionId: order.filing_session_id,
-            emailTypes: CHECKOUT_EMAIL_TYPES,
-            paymentMode: held ? "hold" : "paid",
-          }));
+          if (!liveTest) {
+            customerEmailsNotQueued = !(await enqueueCustomerEmails(client, {
+              orderId: order.order_id,
+              filingSessionId: order.filing_session_id,
+              emailTypes: CHECKOUT_EMAIL_TYPES,
+              paymentMode: held ? "hold" : "paid",
+            }));
+          }
         } else {
           processingResult = "payment_status_not_paid_or_already_paid";
         }
@@ -289,8 +296,9 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
         product: string;
         total_cents: number;
         payment_status: string;
+        line_items: Array<{ offer_code?: string }> | null;
       }>(
-        `SELECT order_id, filing_session_id, product, total_cents, payment_status
+        `SELECT order_id, filing_session_id, product, total_cents, payment_status, line_items
          FROM orders WHERE stripe_checkout_session_id = $1 FOR UPDATE`,
         [session.id]
       );
@@ -309,33 +317,37 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
             failureReason,
           ]);
 
-          const sessionRow = await client.query(
-            `SELECT email, full_name, phone, entity_name_primary, crm_lead_id FROM filing_sessions WHERE filing_session_id = $1`,
-            [order.filing_session_id]
-          );
+if (isLiveTestOrder(order.line_items)) {
+            processingResult = "live_test_expired";
+          } else {
+            const sessionRow = await client.query(
+              `SELECT email, full_name, phone, entity_name_primary, crm_lead_id FROM filing_sessions WHERE filing_session_id = $1`,
+              [order.filing_session_id]
+            );
 
-          await client.query(
-            `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot)
-             VALUES ($1, $2, 'abandoned_cart', $3)`,
-            [
-              order.filing_session_id,
-              orderId,
-              JSON.stringify({
-                kind: "abandoned_cart",
-                order: {
-                  order_id: orderId,
-                  filing_session_id: order.filing_session_id,
-                  product: order.product,
-                  crm_intent: order.product,
-                  total_cents: order.total_cents,
-                  failure_reason: failureReason,
-                },
-                filing_session: sessionRow.rows[0] ?? {},
-              }),
-            ]
-          );
+            await client.query(
+              `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot)
+               VALUES ($1, $2, 'abandoned_cart', $3)`,
+              [
+                order.filing_session_id,
+                orderId,
+                JSON.stringify({
+                  kind: "abandoned_cart",
+                  order: {
+                    order_id: orderId,
+                    filing_session_id: order.filing_session_id,
+                    product: order.product,
+                    crm_intent: order.product,
+                    total_cents: order.total_cents,
+                    failure_reason: failureReason,
+                  },
+                  filing_session: sessionRow.rows[0] ?? {},
+                }),
+              ]
+            );
 
-          processingResult = "abandoned_cart_enqueued";
+            processingResult = "abandoned_cart_enqueued";
+          }
         } else {
           // Already paid or held (e.g. a late/duplicate expired event racing
           // a completed one) — never overwrite a secured order as failed.

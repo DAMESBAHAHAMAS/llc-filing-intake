@@ -11,6 +11,7 @@
  */
 import "dotenv/config";
 import { pool } from "../db/pool.js";
+import { diyTotalCents, parityDecisionsFor } from "../offers/diyPackage.js";
 import { retrievePrice } from "../stripe/restClient.js";
 
 /** Totals from the decision record, in cents. Change only with a DECISIONS.md entry. */
@@ -23,7 +24,6 @@ export const DECIDED_TOTALS_CENTS = {
   CREDENTIALS_KIT: 8_900,
 } as const;
 
-const DIY_COMPONENTS = ["DIY_STATE_FEE", "DIY_SERVICE_FEE", "DIY_CERT_OF_STATUS"];
 
 async function main() {
   const { rows } = await pool.query<{ offer_code: string; offer_version: string; stripe_price_id: string; unit_amount_cents: number }>(
@@ -41,10 +41,9 @@ async function main() {
     amounts.set(row.offer_code, row.unit_amount_cents);
   }
 
-  const diy = DIY_COMPONENTS.reduce((sum, code) => sum + (amounts.get(code) ?? NaN), 0);
-  const totals: Record<string, number> = { DIY: diy };
+  const totals: Record<string, number> = { DIY: diyTotalCents(amounts) };
   for (const code of Object.keys(DECIDED_TOTALS_CENTS)) if (code !== "DIY") totals[code] = amounts.get(code) ?? NaN;
-  for (const [code, decided] of Object.entries(DECIDED_TOTALS_CENTS)) {
+  for (const [code, decided] of parityDecisionsFor(DECIDED_TOTALS_CENTS, amounts)) {
     const ok = totals[code] === decided;
     console.log(`${ok ? "OK  " : "FAIL"} decision ${code}: expected ${decided}, catalog ${totals[code]}`);
     if (!ok) failures.push(`decision:${code}`);
