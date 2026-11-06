@@ -9,6 +9,7 @@ describe("runHoldSweepOnce", () => {
     const updates: unknown[][] = [];
     const pool = {
       query: vi.fn(async (sql: string, params?: unknown[]) => {
+        if (/hold_unknown_flagged_at IS NULL|superseded_open = true/.test(sql)) return { rows: [] };
         if (/capture_before IS NULL/.test(sql)) return { rows: [{ order_id: "ord-1", stripe_payment_intent_id: "pi_1" }] };
         if (/capture_before IS NOT NULL/.test(sql))
           return { rows: [{ order_id: "ord-1", capture_before: soon, proof_of_filing_at: null, hold_expiry_flagged_at: null }] };
@@ -20,6 +21,7 @@ describe("runHoldSweepOnce", () => {
     const result = await runHoldSweepOnce(pool as never, {
       now: () => now,
       alert,
+      replace: vi.fn(),
       retrievePaymentIntent: async () =>
         ({
           id: "pi_1",

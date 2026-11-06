@@ -56,11 +56,12 @@ export interface HeldOrderRow {
   hold_final_flagged_at?: Date | null;
 }
 
-/** Holds within `windowHours` of expiry, with no proof of filing yet and not already flagged. */
+/** Holds within `windowHours` of expiry and not already flagged. Proof doesn't end the watch: a hold still
+ *  standing after proof is money not yet collected. */
 export function ordersNeedingExpiryFlag(rows: HeldOrderRow[], now: Date, windowHours = 48): string[] {
   const limit = now.getTime() + windowHours * 3600 * 1000;
   return rows
-    .filter((r) => r.capture_before && !r.proof_of_filing_at && !r.hold_expiry_flagged_at && r.capture_before.getTime() <= limit)
+    .filter((r) => r.capture_before && !r.hold_expiry_flagged_at && r.capture_before.getTime() <= limit)
     .map((r) => r.order_id);
 }
 
@@ -68,7 +69,7 @@ export function ordersNeedingExpiryFlag(rows: HeldOrderRow[], now: Date, windowH
 export function ordersNeedingFinalFlag(rows: HeldOrderRow[], now: Date, windowHours = 24): string[] {
   const limit = now.getTime() + windowHours * 3600 * 1000;
   return rows
-    .filter((r) => r.capture_before && !r.proof_of_filing_at && !r.hold_final_flagged_at && r.capture_before.getTime() <= limit)
+    .filter((r) => r.capture_before && !r.hold_final_flagged_at && r.capture_before.getTime() <= limit)
     .map((r) => r.order_id);
 }
 

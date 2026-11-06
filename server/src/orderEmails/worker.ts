@@ -40,7 +40,7 @@ interface EnqueueInput {
    *  for example). Without it, each type is sent once per order. */
   dedupeKey?: string;
   /** Extra fields the template needs, kept on the job. */
-  details?: { amount_cents?: number; agent_problem?: AgentProblem; charge_kind?: "fallback" | "deferred"; rejection_reason?: string };
+  details?: { amount_cents?: number; agent_problem?: AgentProblem; charge_kind?: "fallback" | "deferred"; rejection_reason?: string; filing_submitted?: boolean };
 }
 
 type QueryClient = { query: (text: string, params?: unknown[]) => Promise<unknown> };
@@ -128,6 +128,7 @@ export interface ClaimedEmailJob {
     agent_problem?: AgentProblem;
     charge_kind?: "fallback" | "deferred";
     rejection_reason?: string;
+    filing_submitted?: boolean;
   } & Record<string, unknown>;
   attempts: number;
   max_attempts: number;
@@ -230,6 +231,12 @@ export function decideSend(type: OrderEmailType, row: OrderEmailState, job: Pick
     return { send: true, mode: "hold" };
   }
 
+  if (type === "hold_replaced" || type === "hold_replacement_failed") {
+    if (row.cancelled_at) return skip("the order is cancelled");
+    if (row.payment_status !== "authorized" && row.payment_status !== "released") return skip(orderIs);
+    return { send: true, mode: "hold" };
+  }
+
   if (type === "agent_action_needed") {
     if (row.registered_agent_status === "accepted") return skip("the registered agent has since accepted");
     if (row.payment_status === "released") return { send: true, mode: "hold" };
@@ -283,6 +290,7 @@ async function sendJob(pool: Pool, sender: OrderEmailSender, job: ClaimedEmailJo
     amountCents: job.payload_snapshot.amount_cents,
     agentProblem: job.payload_snapshot.agent_problem,
     rejectionReason: job.payload_snapshot.rejection_reason,
+    filingSubmitted: job.payload_snapshot.filing_submitted,
   });
   const result = await sender.send({ to: row.email, ...email, idempotencyKey: idempotencyKeyFor(job, type, row.email, email) });
   return { ok: result.ok, error: result.error, providerMessageId: result.providerMessageId };

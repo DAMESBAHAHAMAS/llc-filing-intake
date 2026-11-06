@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { sendOpsAlert } from "../ops/alerts.js";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { notifyOrderEvent } from "../ops/alerts.js";
@@ -151,7 +152,7 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
           const registeredAgentPath = sessionForGate.rows[0]?.filing_data?.registered_agent_path;
           const registeredAgentStatus = sessionForGate.rows[0]?.registered_agent_status ?? null;
           const blockedOnRegisteredAgent = registeredAgentPath === "customer" && registeredAgentStatus !== "accepted";
-          const fulfillmentReady = requiresFiling && !blockedOnRegisteredAgent;
+          const fulfillmentReady = requiresFiling && !blockedOnRegisteredAgent && !(event.livemode === false && process.env.TEST_MODE_ORDERS_FILE !== "true");
 
           await client.query(
             held
@@ -191,13 +192,17 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
           // crm_deal_id (known here via Stripe metadata — routes/checkout.ts
           // sets it, read back from this already-signature-verified event
           // body), updating that Deal instead of creating a second one.
+          // A Stripe test-mode order never reaches the CRM or Florida. Its email
+          // is already held back by blockedByTestMode, which lets a reserved
+          // test address through for QA.
           const liveTest = isLiveTestOrder(order.line_items);
+          const stripeTestOrder = event.livemode === false && process.env.TEST_MODE_ORDERS_FILE !== "true";
           const crmDealId = session.metadata?.crm_deal_id;
           const targetStage = held
             ? process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED"
             : process.env.ZOHO_DEAL_STAGE_ON_PAYMENT;
           const expectedEmail = sessionRow.rows[0]?.email;
-          if (liveTest) {
+          if (liveTest || stripeTestOrder) {
             // A payment test is not a customer: no Deal, no customer email.
             processingResult = held ? "live_test_held" : "live_test_paid";
           } else if (crmDealId) {
@@ -425,11 +430,12 @@ export async function handlePaymentLifecycleEvent(
   const uuidLike = /^[0-9a-f-]{36}$/i;
 
   const found = await client.query(
-    `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at, stripe_payment_intent_id, deferred_payment_intent_id, cancelled_at
+    `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at, stripe_payment_intent_id, superseded_payment_intent_ids, deferred_payment_intent_id, cancelled_at
      FROM orders
      WHERE ($1::uuid IS NOT NULL AND order_id = $1::uuid) OR ($2::text IS NOT NULL AND stripe_payment_intent_id = $2::text)
+        OR ($2::text IS NOT NULL AND superseded_payment_intent_ids @> $3::jsonb)
      ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
-    [metadataOrderId && uuidLike.test(metadataOrderId) ? metadataOrderId : null, paymentIntentId]
+    [metadataOrderId && uuidLike.test(metadataOrderId) ? metadataOrderId : null, paymentIntentId, JSON.stringify([paymentIntentId])]
   );
   if (!found.rowCount) return { processingResult: "order_not_found", orderId: null };
   const order = found.rows[0] as {
@@ -442,6 +448,7 @@ export async function handlePaymentLifecycleEvent(
     deferred_payment_intent_id?: string | null;
     cancelled_at?: Date | null;
     stripe_payment_intent_id?: string | null;
+    superseded_payment_intent_ids?: string[] | null;
   };
 
   // The separate charge for a service completed after the filing (EIN).
@@ -460,6 +467,12 @@ export async function handlePaymentLifecycleEvent(
       return { processingResult: "deferred_service_collected", orderId: order.order_id };
     }
     return { processingResult: `deferred_service_${event.type.replace(/\./g, "_")}_stripe_only`, orderId: order.order_id };
+  }
+
+  // Money on a replaced hold is an operator's mistake, not this order's payment.
+  if (event.type === "payment_intent.succeeded" && (order.superseded_payment_intent_ids ?? []).includes(obj.id)) {
+    await sendOpsAlert("A replaced card hold was captured", `Order ${order.order_id}: ${obj.id} was captured, and the current hold ${order.stripe_payment_intent_id} is still open. Refund or release one of them.`);
+    return { processingResult: "superseded_hold_captured", orderId: order.order_id };
   }
 
   if (event.type === "payment_intent.succeeded") {

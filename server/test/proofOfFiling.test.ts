@@ -379,7 +379,7 @@ describe("POST /api/orders/:orderId/cancel", () => {
     stripe.cancel.mockResolvedValue({ id: "pi_hold", status: "canceled" });
     const r = await cancel();
     expect(r.json).toMatchObject({ status: "cancelled" });
-    expect(stripe.cancel).toHaveBeenCalledWith("pi_hold", "release-ord-1");
+    expect(stripe.cancel).toHaveBeenCalledWith("pi_hold", "release-ord-1-pi_hold");
     const sql = db.queries.join("\n");
     expect(sql).toMatch(/cancelled_at = now\(\)/);
     expect(sql).toMatch(/fulfillment_status = 'not_ready'/);
@@ -435,6 +435,6 @@ describe("POST /api/orders/:orderId/release-hold", () => {
     stripe.cancel.mockResolvedValue({ id: "pi_hold", status: "canceled" });
     const r = await post("/api/orders/ord-1/release-hold", {});
     expect(r.status).toBe(200);
-    expect(stripe.cancel).toHaveBeenCalledWith("pi_hold", "release-ord-1");
+    expect(stripe.cancel).toHaveBeenCalledWith("pi_hold", "release-ord-1-pi_hold");
   });
 });

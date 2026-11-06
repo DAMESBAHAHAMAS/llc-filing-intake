@@ -11,7 +11,7 @@
  */
 import "dotenv/config";
 import { pool } from "../db/pool.js";
-import { diyTotalCents, parityDecisionsFor } from "../offers/diyPackage.js";
+import { DIY_PACKAGE_OFFER_CODE, diyTotalCents, livePriceProblems, parityDecisionsFor } from "../offers/diyPackage.js";
 import { retrievePrice } from "../stripe/restClient.js";
 
 /** Totals from the decision record, in cents. Change only with a DECISIONS.md entry. */
@@ -40,6 +40,11 @@ async function main() {
       console.log(`FAIL ${row.offer_code} ${row.offer_version}: Stripe cannot read ${row.stripe_price_id}: ${(err as Error).message}`);
       failures.push(row.offer_code);
       continue;
+    }
+    if (row.offer_code === DIY_PACKAGE_OFFER_CODE) {
+      const problems = livePriceProblems(price);
+      for (const problem of problems) console.log(`FAIL ${row.offer_code}: ${problem}`);
+      if (problems.length) failures.push(row.offer_code);
     }
     const charged = price.unit_amount ?? -1;
     const ok = price.active && charged === row.unit_amount_cents;

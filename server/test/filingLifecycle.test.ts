@@ -340,7 +340,7 @@ describe("a rejected filing", () => {
     it("closes the order, releases the hold, detaches the card and emails 'you pay nothing'", async () => {
       const r = await op("cancel", { reason: "customer will not correct" });
       expect(r.status).toBe(200);
-      expect(stripe.cancel).toHaveBeenCalledWith(`pi_${orderId}`, `release-${orderId}`);
+      expect(stripe.cancel).toHaveBeenCalledWith(`pi_${orderId}`, `release-${orderId}-pi_${orderId}`);
       const row = await orderRow();
       expect(row.cancelled_at).toBeTruthy();
       expect(row.fulfillment_status).toBe("not_ready");

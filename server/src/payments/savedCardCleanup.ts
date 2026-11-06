@@ -34,6 +34,7 @@ export async function runSavedCardCleanupOnce(pool: Pool, deps: SavedCardCleanup
   const { rows } = await pool.query<{ order_id: string; stripe_payment_intent_id: string; saved_card_detach_error: string | null }>(
     `SELECT order_id, stripe_payment_intent_id, saved_card_detach_error FROM orders
      WHERE authorized_at IS NOT NULL AND stripe_payment_intent_id IS NOT NULL AND saved_card_detached_at IS NULL
+       ${/^(sk|rk)_live_/.test(process.env.STRIPE_SECRET_KEY ?? "") ? "AND stripe_livemode = true" : ""}
        AND (
          (payment_status = 'paid' AND (deferred_cents = 0 OR deferred_charged_at IS NOT NULL))
          OR payment_status = 'refunded'

@@ -1,4 +1,4 @@
-import { DIY_PACKAGE_BREAKDOWN_LINE, hasDiyPackage, HOLD_FUNDS_DISCLOSURE } from "./diyPackage.js";
+import { DIY_PACKAGE_BREAKDOWN_LINE, DIY_PACKAGE_TOTAL_CENTS, hasDiyPackage, holdFundsDisclosure } from "./diyPackage.js";
 import { isLiveTestOrder } from "./liveTest.js";
 import { needsSunbizFiling } from "./sunbizFiling.js";
 
@@ -46,6 +46,19 @@ export const HOLD_CHECKOUT_MESSAGE =
 export const SAVED_CARD_AUTHORIZATION =
   "By completing checkout, you authorize us to keep your card on file with Stripe. If your hold ends before Florida confirms your filing, you authorize us to charge that card once, without contacting you first, for the order total shown at checkout, after Florida confirms it. We use the saved card only for this order.";
 
+/** The phrase that makes a replacement hold permitted on an order. It must
+ *  stay in DIY_SAVED_CARD_AUTHORIZATION: replaceHold.ts looks for it in the
+ *  text the customer saw. */
+export const REPLACEMENT_CONSENT_PHRASE = "place a new temporary hold on that card";
+
+/** The $139 order's authorization (Damian, 6 Nov 2026). Not yet approved
+ *  wording in Cliq. */
+export const DIY_SAVED_CARD_AUTHORIZATION =
+  `By completing checkout, you authorize us to keep your card on file with Stripe for this order. If your hold is about to end before Florida confirms your filing, you authorize us to ${REPLACEMENT_CONSENT_PHRASE} for the same amount, and we will email you when we do. If no hold is in place when Florida confirms your filing, you authorize us to charge that card once, for the order total shown at checkout, without contacting you first. We use the saved card only for this order.`;
+
+/** The line below the pay button on a $139 order. */
+export const DIY_HOLD_CHECKOUT_MESSAGE = "Your card is held, not charged. We charge it only after Florida confirms your LLC filing.";
+
 /** The same authorization for an EIN-only hold, which Florida never
  *  confirms. This adaptation is not yet approved wording. */
 export const SAVED_CARD_AUTHORIZATION_EIN_ONLY =
@@ -65,9 +78,15 @@ export function holdCheckoutText(lineItems: Array<{ offer_code?: string; unit_am
 } {
   if (isLiveTestOrder(lineItems)) return { submit: LIVE_TEST_CHECKOUT_MESSAGE };
   if (!needsSunbizFiling(lineItems)) return { submit: SAVED_CARD_AUTHORIZATION_EIN_ONLY };
+  if (hasDiyPackage(lineItems)) {
+    const total = lineItems.reduce((sum, li) => sum + (li.unit_amount_cents ?? 0) * (li.quantity ?? 1), 0) || DIY_PACKAGE_TOTAL_CENTS;
+    return {
+      submit: DIY_SAVED_CARD_AUTHORIZATION,
+      afterSubmit: `${DIY_HOLD_CHECKOUT_MESSAGE} ${DIY_PACKAGE_BREAKDOWN_LINE} ${holdFundsDisclosure(total)}`,
+    };
+  }
   const later = deferredServiceCents(lineItems) > 0 ? ` ${LATER_SERVICES_LINE}` : "";
-  const breakdown = hasDiyPackage(lineItems) ? ` ${DIY_PACKAGE_BREAKDOWN_LINE} ${HOLD_FUNDS_DISCLOSURE}` : "";
-  return { submit: SAVED_CARD_AUTHORIZATION, afterSubmit: `${HOLD_CHECKOUT_MESSAGE}${later}${breakdown}` };
+  return { submit: SAVED_CARD_AUTHORIZATION, afterSubmit: `${HOLD_CHECKOUT_MESSAGE}${later}` };
 }
 
 /** PAYMENT_CAPTURE_MODE=immediate turns holds off everywhere (rollback

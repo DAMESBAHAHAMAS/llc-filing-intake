@@ -23,7 +23,9 @@ export type OrderEmailType =
   | "payment_problem"
   | "agent_action_needed"
   | "filing_rejected"
-  | "order_cancelled";
+  | "order_cancelled"
+  | "hold_replaced"
+  | "hold_replacement_failed";
 
 /** "hold": a card hold, collected after filing. "paid": collected at
  *  checkout. "collected": a hold or saved card that has since been charged. */
@@ -38,6 +40,8 @@ export interface OrderEmailExtras {
   agentProblem?: AgentProblem;
   /** Why Florida rejected the filing (filing_rejected). */
   rejectionReason?: string;
+  /** Whether the filing was already with Florida (hold_replacement_failed). */
+  filingSubmitted?: boolean;
 }
 
 export const DISCLAIMER = "Damian Knowles is a Business Developer, not a law firm or attorney, and does not provide legal advice.";
@@ -399,6 +403,35 @@ function orderCancelled(ctx: OrderEmailContext): RenderedEmail {
   ]);
 }
 
+function holdReplaced(ctx: OrderEmailContext): RenderedEmail {
+  return render("We renewed the temporary hold on your card", [
+    greeting(ctx),
+    p(`Your card hold was about to end before Florida confirmed your filing. As you authorized at checkout, we placed a new temporary hold of ${money(ctx.totalCents)} on the same card and released the old one.`),
+    p("A hold is not a charge. Your bank may show both holds as pending for a few days until the old one clears. It can reduce the balance or credit available on your card. You pay only once, after Florida confirms your filing."),
+    rows([["Order number", ctx.orderId]]),
+    p(REPLY_LINE),
+  ]);
+}
+
+function holdReplacementFailed(ctx: OrderEmailContext, extras: OrderEmailExtras): RenderedEmail {
+  const next = extras.filingSubmitted
+    ? [
+        p("You have not been charged, and your filing is with Florida, so you don't need to do anything to keep it moving."),
+        p(`If no hold is in place when Florida confirms your filing, we charge the card you authorized at checkout once, for ${money(ctx.totalCents)}. If that card has changed, reply to this email.`),
+      ]
+    : [
+        p("You have not been charged. We can't send your filing to Florida until a valid hold is in place, so your filing is waiting."),
+        p("Reply to this email and we'll help you authorize a card again, or cancel your order. If you cancel, you pay nothing."),
+      ];
+  return render("We could not renew the hold on your card", [
+    greeting(ctx),
+    p("The temporary hold on your card is ending, and your bank did not approve a new one."),
+    ...next,
+    rows([["Order number", ctx.orderId]]),
+    p(REPLY_LINE),
+  ]);
+}
+
 export function buildOrderEmail(type: OrderEmailType, row: OrderEmailRow, paymentMode: PaymentMode, extras: OrderEmailExtras = {}): RenderedEmail {
   const ctx = buildContext(row, paymentMode);
   switch (type) {
@@ -418,5 +451,9 @@ export function buildOrderEmail(type: OrderEmailType, row: OrderEmailRow, paymen
       return filingRejected(ctx, extras);
     case "order_cancelled":
       return orderCancelled(ctx);
+    case "hold_replaced":
+      return holdReplaced(ctx);
+    case "hold_replacement_failed":
+      return holdReplacementFailed(ctx, extras);
   }
 }

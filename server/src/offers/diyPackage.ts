@@ -17,9 +17,12 @@ export const DIY_PACKAGE_TOTAL_CENTS = DIY_PACKAGE_BREAKDOWN.reduce((sum, part) 
 export const DIY_PACKAGE_BREAKDOWN_LINE =
   "Your $139 includes the $125 Florida state filing fee, the $5 Certificate of Status and our $9 service fee.";
 
-/** What a hold does to the customer's money (Damian, 6 Nov 2026). */
-export const HOLD_FUNDS_DISCLOSURE =
-  "This is a temporary hold of $139, not a charge. Until it is charged or released, it can reduce the balance or credit available on your card.";
+/** What a hold does to the customer's money (Damian, 6 Nov 2026). The amount
+ *  comes from the order, because an order can hold more than the $139. */
+export function holdFundsDisclosure(totalCents: number): string {
+  const amount = `$${(totalCents / 100).toFixed(totalCents % 100 === 0 ? 0 : 2)}`;
+  return `This is a temporary hold of ${amount}, not a charge. Until it is charged or released, it can reduce the balance or credit available on your card.`;
+}
 
 export function hasDiyPackage(lineItems: Array<{ offer_code?: string }>): boolean {
   return lineItems.some((li) => li.offer_code === DIY_PACKAGE_OFFER_CODE);

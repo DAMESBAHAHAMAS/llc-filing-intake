@@ -25,7 +25,7 @@ export function isCardDecline(err: unknown): boolean {
 }
 
 export async function attemptSavedCardCharge(params: {
-  original: Pick<StripePaymentIntent, "customer" | "payment_method">;
+  original: Pick<StripePaymentIntent, "customer" | "payment_method" | "receipt_email">;
   orderId: string;
   prefix: "fallback" | "deferred";
   declinedAttempts: number;
@@ -45,6 +45,7 @@ export async function attemptSavedCardCharge(params: {
       currency: params.currency,
       idempotencyKey: savedCardIdempotencyKey(params.prefix, params.orderId, params.declinedAttempts),
       metadata: params.metadata,
+      receiptEmail: original.receipt_email,
     });
     return { kind: "charged", paymentIntentId: charged.id, status: charged.status };
   } catch (err) {

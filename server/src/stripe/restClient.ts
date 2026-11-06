@@ -120,6 +120,8 @@ export interface CreateCheckoutSessionParams {
   /** Written onto the PaymentIntent so payment_intent.* webhook events
    *  map back to the order without another Stripe call. */
   paymentIntentMetadata?: Record<string, string>;
+  /** Where Stripe sends the receipt when the money is collected. */
+  receiptEmail?: string;
   /** Shown above Stripe's pay button (custom_text.submit.message). */
   submitMessage?: string;
   /** Shown below Stripe's pay button (custom_text.after_submit.message). */
@@ -170,6 +172,7 @@ export async function createCheckoutSession(params: CreateCheckoutSessionParams)
             capture_method: "manual",
             setup_future_usage: "off_session",
             metadata: params.paymentIntentMetadata,
+            ...(params.receiptEmail ? { receipt_email: params.receiptEmail } : {}),
           },
           // Extended holds (up to 30 days) are opt-in: Stripe rejected the
           // request on this account on 30 Sep 2026 ("This account is not
@@ -219,6 +222,7 @@ export interface StripePaymentIntent {
   currency: string;
   customer: string | null;
   payment_method: string | null;
+  receipt_email?: string | null;
   metadata?: Record<string, string>;
   latest_charge?:
     | string
@@ -284,6 +288,7 @@ export async function placeReplacementHold(params: {
   currency: string;
   idempotencyKey: string;
   metadata?: Record<string, string>;
+  receiptEmail?: string | null;
 }): Promise<StripePaymentIntent> {
   return stripeRequest<StripePaymentIntent>(
     "POST",
@@ -297,6 +302,7 @@ export async function placeReplacementHold(params: {
       off_session: true,
       confirm: true,
       metadata: params.metadata,
+      ...(params.receiptEmail ? { receipt_email: params.receiptEmail } : {}),
     },
     params.idempotencyKey
   );
@@ -315,6 +321,7 @@ export async function chargeSavedCard(params: {
   currency: string;
   idempotencyKey: string;
   metadata?: Record<string, string>;
+  receiptEmail?: string | null;
 }): Promise<StripePaymentIntent> {
   return stripeRequest<StripePaymentIntent>(
     "POST",
@@ -327,6 +334,7 @@ export async function chargeSavedCard(params: {
       off_session: true,
       confirm: true,
       metadata: params.metadata,
+      ...(params.receiptEmail ? { receipt_email: params.receiptEmail } : {}),
     },
     params.idempotencyKey
   );

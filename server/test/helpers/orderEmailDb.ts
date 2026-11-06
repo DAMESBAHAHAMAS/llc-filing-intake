@@ -48,7 +48,7 @@ const SCHEMA = `
     cancelled_at timestamptz, cancellation_reason text,
     saved_card_detached_at timestamptz, saved_card_detach_error text,
     fulfillment_completed_at timestamptz,
-    filing_approved_at timestamptz, hold_final_flagged_at timestamptz, capture_before timestamptz, extended_authorization boolean, hold_expiry_flagged_at timestamptz, superseded_payment_intent_ids jsonb NOT NULL DEFAULT '[]',
+    filing_name_key text, hold_op_until timestamptz, superseded_open boolean NOT NULL DEFAULT false, hold_unknown_flagged_at timestamptz, replacement_attempts integer NOT NULL DEFAULT 0, replacement_last_attempt_at timestamptz, replacement_last_error text, filing_approved_at timestamptz, hold_final_flagged_at timestamptz, capture_before timestamptz, extended_authorization boolean, hold_expiry_flagged_at timestamptz, superseded_payment_intent_ids jsonb NOT NULL DEFAULT '[]',
     sunbiz_tracking_number text, sunbiz_submitted_at timestamptz, sunbiz_resubmitted_at timestamptz,
     sunbiz_rejected_at timestamptz, sunbiz_rejection_reason text, sunbiz_rejection_count integer NOT NULL DEFAULT 0,
     other_payment_at timestamptz, other_payment_method text, other_payment_reference text, other_payment_cents integer,
@@ -139,6 +139,7 @@ export async function createOrderEmailDb(): Promise<Pool> {
   const { Pool: MemPool } = db.adapters.createPg();
   const mem = new MemPool() as unknown as Pool;
   await mem.query(SCHEMA);
+  await mem.query(`CREATE UNIQUE INDEX orders_one_open_filing_per_name ON orders (filing_name_key) WHERE filing_name_key IS NOT NULL AND cancelled_at IS NULL`);
   return {
     query: (sql: string, params?: unknown[]) => run(mem as unknown as Runner, sql, params),
     connect: async () => {

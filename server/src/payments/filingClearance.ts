@@ -35,15 +35,26 @@ export function approvalCurrent(approvedAt: Date | string | null | undefined, no
   return now.getTime() - new Date(approvedAt).getTime() < APPROVAL_VALID_HOURS * 3600 * 1000;
 }
 
+const LLC_SUFFIX = /\b(L L C|L C|LLC|LC|LTD LIABILITY CO|LTD LIABILITY COMPANY|LIMITED LIABILITY CO|LIMITED LIABILITY COMPANY|LIMITED COMPANY)\s*$/;
+
+/** One LLC name, however it was punctuated. Null when there is no name. */
+export function entityNameKey(value: string | null | undefined): string | null {
+  const key = (value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .replace(/['\u2019.]/g, (mark) => (mark === "." ? " " : ""))
+    .replace(/&/g, " AND ")
+    .replace(/[^A-Z0-9 ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(LLC_SUFFIX, "")
+    .trim();
+  return key || null;
+}
+
 /** For comparing an LLC name typed from Sunbiz with the name on the order. */
 export function sameEntityName(a: string | null | undefined, b: string | null | undefined): boolean {
-  const norm = (value: string | null | undefined) =>
-    (value ?? "")
-      .toUpperCase()
-      .replace(/[^A-Z0-9 ]/g, " ")
-      .replace(/\b(LLC|L L C|LIMITED LIABILITY COMPANY)\b/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  const left = norm(a);
-  return left.length > 0 && left === norm(b);
+  const left = entityNameKey(a);
+  return left !== null && left === entityNameKey(b);
 }

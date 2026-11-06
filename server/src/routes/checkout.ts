@@ -303,6 +303,7 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         // Stripe Checkout would have landed on the 404 page.
         cancelUrl: `${frontendBaseUrl}/checkout/cancel?filing_session_id=${encodeURIComponent(filingSessionId)}&order_id=${encodeURIComponent(orderId)}`,
         customerEmail: session.rows[0].email ?? undefined,
+        receiptEmail: session.rows[0].email ?? undefined,
         // Carries a session's existing Deal id, if it has one
         // (filing_sessions.crm_deal_id, see routes/session.ts's
         // POST /api/session/stage), through to the webhook, so it can
