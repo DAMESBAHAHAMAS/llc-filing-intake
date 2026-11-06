@@ -1,6 +1,7 @@
 import type { Pool } from "pg";
 import { describeError } from "../db/describeError.js";
 import { realOrderEmailSender, type OrderEmailSender } from "../orderEmails/sender.js";
+import type { EmailSendResult } from "../registeredAgent/emailSender.js";
 import { buildOrderEmail, type RenderedEmail } from "../orderEmails/templates.js";
 import { blockedByTestMode, TEST_MODE_NOT_SENT } from "../orderEmails/testAddress.js";
 import { currentPaymentMode, ORDER_EMAIL_COLUMNS, type OrderEmailState } from "../orderEmails/worker.js";
@@ -27,6 +28,9 @@ import { currentPaymentMode, ORDER_EMAIL_COLUMNS, type OrderEmailState } from ".
  */
 export type ProofDeliveryResult = { ok: true; alreadyDelivered: boolean } | { ok: false; error: string };
 
+/** Well inside the 3 minute claim on an order. Resend's client has no timeout of its own. */
+export const PROOF_SEND_TIMEOUT_MS = 60_000;
+
 export interface ProofOrderRow extends OrderEmailState {
   proof_delivered_at: Date | string | null;
 }
@@ -48,7 +52,8 @@ async function recordFailure(pool: Pool, orderId: string, error: string): Promis
 export async function deliverProofToCustomer(
   pool: Pool,
   orderId: string,
-  sender: OrderEmailSender = realOrderEmailSender
+  sender: OrderEmailSender = realOrderEmailSender,
+  timeoutMs: number = PROOF_SEND_TIMEOUT_MS
 ): Promise<ProofDeliveryResult> {
   try {
     const { rows } = await pool.query<ProofOrderRow>(
@@ -73,11 +78,13 @@ export async function deliverProofToCustomer(
       return { ok: false, error: TEST_MODE_NOT_SENT };
     }
 
-    const sent = await sender.send({
-      to: email,
-      ...renderProofEmail(row),
-      idempotencyKey: `proof-of-filing/${orderId}`,
+    // Too slow counts as not delivered. The idempotency key stops a retry
+    // sending a second email if this one gets through after all.
+    let timer: NodeJS.Timeout | undefined;
+    const tooSlow = new Promise<EmailSendResult>((resolve) => {
+      timer = setTimeout(() => resolve({ ok: false, error: `the email provider did not answer within ${timeoutMs / 1000} seconds` }), timeoutMs);
     });
+    const sent = await Promise.race([sender.send({ to: email, ...renderProofEmail(row), idempotencyKey: `proof-of-filing/${orderId}` }), tooSlow]).finally(() => clearTimeout(timer));
     if (!sent.ok) {
       const error = sent.error ?? "the email provider did not accept the message";
       await recordFailure(pool, orderId, error);

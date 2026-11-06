@@ -64,6 +64,8 @@ export function orderAlertTitle(processingResult: string): string | null {
     case "collected":
     case "collected_deal_update_enqueued":
       return "Payment collected after filing";
+    case "collected_no_proof":
+      return "Money collected with no proof of filing";
     case "hold_released":
       return "Card hold released — check the order";
     case "refunded":

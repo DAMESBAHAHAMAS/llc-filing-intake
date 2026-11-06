@@ -4,13 +4,19 @@ import { buildPdfContext } from "../pdf/context.js";
 import type { FilingSessionRecord } from "../pdf/types.js";
 import { generateArticlesOfOrganizationPdf } from "../pdf/serviceClient.js";
 import { sendOpsAlert } from "../ops/alerts.js";
+import { hasDiyPackage } from "../offers/diyPackage.js";
 
 const MAX_FULFILLMENT_ATTEMPTS = 6;
+
+/** Far longer than one PDF render, so an order this old has no worker left. */
+export const STALLED_AFTER_MS = 15 * 60 * 1000;
 
 export interface ClaimedOrder {
   order_id: string;
   filing_session_id: string;
   fulfillment_attempts: number;
+  payment_status?: string;
+  line_items?: Array<{ offer_code?: string }> | null;
 }
 
 /**
@@ -43,7 +49,7 @@ export async function claimNextReadyOrder(pool: Pool, lockedBy: string): Promise
       `UPDATE orders
        SET fulfillment_status = 'in_progress', fulfillment_started_at = now()
        WHERE order_id = $1
-       RETURNING order_id, filing_session_id, fulfillment_attempts`,
+       RETURNING order_id, filing_session_id, fulfillment_attempts, payment_status, line_items`,
       [picked.rows[0].order_id]
     );
 
@@ -143,7 +149,44 @@ export async function processClaimedOrder(pool: Pool, order: ClaimedOrder): Prom
   } finally {
     client.release();
   }
-  await sendOpsAlert("Filing ready for review", `Order ${order.order_id}: the Articles are generated. Review them, file at Sunbiz, then record the submission.`);
+  await sendOpsAlert("Filing ready for review", readyForReview(order));
+}
+
+function readyForReview(order: ClaimedOrder): string {
+  const generated = `Order ${order.order_id}: the Articles are generated.`;
+  if (!hasDiyPackage(order.line_items ?? [])) return `${generated} Review them, file at Sunbiz, then record the submission.`;
+  if (order.payment_status === "released") {
+    return `${generated} Its card hold has ended, so it can't file. If the customer agrees to a new hold, use replace-authorization with customer_agreed. Otherwise use /cancel. Do not pay Florida until approve-filing succeeds.`;
+  }
+  return `${generated} Review them, then call approve-filing, the last check before Florida is paid. If it refuses, do not file. If it approves, file at Sunbiz at once, then record the submission.`;
+}
+
+/**
+ * Puts orders back whose worker died mid-render, which only a deploy or a
+ * thrown database error can do. They count as a failed attempt, so an order
+ * that kills its worker every time stops at 'failed' instead of looping.
+ */
+export async function reapStalledOrders(pool: Pool, now: Date): Promise<number> {
+  const { rows } = await pool.query<{ order_id: string; fulfillment_attempts: number }>(
+    `SELECT order_id, fulfillment_attempts FROM orders WHERE fulfillment_status = 'in_progress' AND fulfillment_started_at < $1`,
+    [new Date(now.getTime() - STALLED_AFTER_MS)]
+  );
+  for (const row of rows) {
+    const attempts = row.fulfillment_attempts + 1;
+    const gaveUp = isDeadLetter(attempts, MAX_FULFILLMENT_ATTEMPTS);
+    const { rowCount } = await pool.query(
+      `UPDATE orders SET fulfillment_status = $2, fulfillment_attempts = $3, fulfillment_last_error = 'the worker stopped before finishing this order'
+        WHERE order_id = $1 AND fulfillment_status = 'in_progress'`,
+      [row.order_id, gaveUp ? "failed" : "ready", attempts]
+    );
+    if (rowCount) {
+      await sendOpsAlert(
+        gaveUp ? "Articles could not be generated" : "A stalled filing was restarted",
+        `Order ${row.order_id}: the worker stopped while generating its Articles, attempt ${attempts}. ${gaveUp ? "It will not retry by itself. Fix the cause, then use retry-articles, or /cancel it." : "It has gone back in the queue."}`
+      );
+    }
+  }
+  return rows.length;
 }
 
 export async function processOne(pool: Pool, lockedBy: string): Promise<boolean> {

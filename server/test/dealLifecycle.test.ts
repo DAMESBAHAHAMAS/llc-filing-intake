@@ -20,6 +20,7 @@ const order = {
   payment_status: "authorized",
   fulfillment_status: "requires_review",
   crm_deal_id: "deal-1",
+  stripe_payment_intent_id: "pi_1",
   proof_of_filing_at: new Date("2026-11-04T15:00:00Z"),
 };
 function fakeClient() {

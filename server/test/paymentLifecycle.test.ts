@@ -13,6 +13,7 @@ function fakeClient(order: Record<string, unknown> | null, ownDeal = true) {
       if (/FROM orders\s+WHERE/.test(sql) && /FOR UPDATE/.test(sql)) return { rows: order ? [order] : [], rowCount: order ? 1 : 0 };
       if (/sync_type = 'order_deal'/.test(sql)) return { rows: ownDeal ? [{}] : [], rowCount: ownDeal ? 1 : 0 };
       if (/SELECT email FROM filing_sessions/.test(sql)) return { rows: [{ email: "founder@example.com" }], rowCount: 1 };
+      if (/SELECT stripe_livemode/.test(sql)) return { rows: [{ stripe_livemode: true }], rowCount: 1 };
       writes.push({ sql, params });
       return { rows: [], rowCount: 1 };
     }),
@@ -24,6 +25,7 @@ const baseOrder = {
   payment_status: "authorized",
   fulfillment_status: "ready",
   crm_deal_id: "deal-1",
+  stripe_payment_intent_id: "pi_1",
   proof_of_filing_at: new Date("2026-10-02T15:00:00Z"),
 };
 const event = (type: string, object: Record<string, unknown>) => ({ id: "evt_1", type, data: { object } }) as never;

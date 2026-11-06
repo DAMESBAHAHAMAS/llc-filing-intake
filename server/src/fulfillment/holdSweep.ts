@@ -5,7 +5,8 @@ import { holdDetails, retrievePaymentIntent, type StripePaymentIntent } from "..
 import { ordersNeedingExpiryFlag, ordersNeedingFinalFlag, type HeldOrderRow } from "../payments/holdState.js";
 import { sendOpsAlert } from "../ops/alerts.js";
 import { APPROVAL_VALID_HOURS } from "../payments/filingClearance.js";
-import { HOURS_BETWEEN_ATTEMPTS, MAX_REPLACEMENT_ATTEMPTS, replaceHold, type ReplaceOutcome } from "../payments/replaceHold.js";
+import { HOURS_BETWEEN_ATTEMPTS, MAX_REPLACEMENT_ATTEMPTS, renewHoldFromSweep, RENEWAL_WINDOW_HOURS, settleUnknownReplacement, stuckOn, type RenewalFacts, type ReplaceOutcome } from "../payments/replaceHold.js";
+import { reapStalledOrders } from "./fulfillmentWorker.js";
 
 /** With a live key, a test-mode hold can't be read and would only fail. */
 function liveOnly(): string {
@@ -17,6 +18,8 @@ export interface HoldSweepDeps {
   now: () => Date;
   alert: (message: string) => Promise<void>;
   replace: (pool: Pool, orderId: string) => Promise<ReplaceOutcome>;
+  /** Finishes a replacement Stripe never answered. */
+  settle?: (pool: Pool, orderId: string, now: Date) => Promise<void>;
 }
 
 const defaultDeps: HoldSweepDeps = {
@@ -28,7 +31,7 @@ const defaultDeps: HoldSweepDeps = {
     const sent = await sendOpsAlert("Card hold needs attention", message);
     if (!sent.ok || sent.channel === "log") throw new Error(sent.error ?? "the alert reached no person");
   },
-  replace: (pool, orderId) => replaceHold(pool, orderId),
+  replace: (pool, orderId) => renewHoldFromSweep(pool, orderId),
 };
 
 /**
@@ -37,9 +40,14 @@ const defaultDeps: HoldSweepDeps = {
  *  2. Flags held orders within 48 hours of expiry that still have no
  *     proof of filing, so the filing can be pushed through or the hold
  *     released on purpose instead of lapsing silently.
+ *  3. Finishes what an unanswered Stripe request left behind, and renews
+ *     holds near their end.
  */
 export async function runHoldSweepOnce(pool: Pool, deps: HoldSweepDeps = defaultDeps): Promise<{ recorded: number; flagged: string[] }> {
   let recorded = 0;
+  // A worker that died leaves its order stuck, so restart those first.
+  await reapStalledOrders(pool, deps.now()).catch((err) => console.error("[hold sweep] could not restart stalled orders:", describeError(err)));
+
   const missing = await pool.query<{ order_id: string; stripe_payment_intent_id: string }>(
     `SELECT order_id, stripe_payment_intent_id FROM orders
      WHERE payment_status = 'authorized' AND stripe_payment_intent_id IS NOT NULL AND capture_before IS NULL
@@ -88,6 +96,11 @@ export async function runHoldSweepOnce(pool: Pool, deps: HoldSweepDeps = default
       for (const id of row.superseded_payment_intent_ids ?? []) {
         const pi = await deps.retrievePaymentIntent(id);
         if (pi.status === "requires_capture") await cancelPaymentIntent(id, `cancel-superseded-${id}`);
+        // Captured before it could be cancelled, so it can't count as dealt with.
+        if (pi.status === "succeeded") {
+          await pool.query(`UPDATE orders SET stray_capture_pi = $2 WHERE order_id = $1 AND stray_capture_pi IS NULL`, [row.order_id, id]);
+          await deps.alert(`Order ${row.order_id}: replaced hold ${id} was captured. Refund it. The order collects nothing more until that refund lands.`);
+        }
       }
       await pool.query(`UPDATE orders SET superseded_open = false WHERE order_id = $1`, [row.order_id]);
     } catch (err) {
@@ -96,17 +109,37 @@ export async function runHoldSweepOnce(pool: Pool, deps: HoldSweepDeps = default
     }
   }
 
-  const held = await pool.query<HeldOrderRow>(
-    `SELECT order_id, capture_before, proof_of_filing_at, hold_expiry_flagged_at, hold_final_flagged_at FROM orders
-     WHERE payment_status = 'authorized' AND capture_before IS NOT NULL`
+  // A hold may stand that nothing on the order points at. This runs whatever
+  // the attempts and whatever state the order reached.
+  const unanswered = await pool.query<{ order_id: string }>(`SELECT order_id FROM orders WHERE replacement_unknown_at IS NOT NULL ${liveOnly()}`);
+  for (const row of unanswered.rows) {
+    try {
+      await (deps.settle ?? ((p, id, now) => settleUnknownReplacement(p, id, undefined, now)))(pool, row.order_id, deps.now());
+    } catch (err) {
+      console.error(`[hold sweep] could not finish an unanswered replacement on order ${row.order_id}:`, describeError(err));
+      await deps.alert(`Order ${row.order_id}: a new card hold may be on the card, and Stripe can't be checked. The next pass tries again. ${describeError(err)}`).catch(() => undefined);
+    }
+  }
+
+  const held = await pool.query<HeldOrderRow & RenewalFacts>(
+    `SELECT o.order_id, o.capture_before, o.proof_of_filing_at, o.hold_expiry_flagged_at, o.hold_final_flagged_at, o.fulfillment_status, o.filing_approved_at,
+            fs.registered_agent_status, fs.filing_data
+     FROM orders o LEFT JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id
+     WHERE o.payment_status = 'authorized' AND o.capture_before IS NOT NULL`
   );
-  const expiring = (orderId: string) => held.rows.find((r) => r.order_id === orderId)?.capture_before?.toISOString();
+  const heldRow = (orderId: string) => held.rows.find((r) => r.order_id === orderId);
+  const expiring = (orderId: string) => heldRow(orderId)?.capture_before?.toISOString();
+  const whyNotRenewed = (orderId: string) => {
+    const order = heldRow(orderId);
+    const stuck = order && stuckOn(order);
+    return stuck ? ` It will not be renewed, because ${stuck}. Sort that out, or use /cancel.` : "";
+  };
   // The alert goes first. If it fails, the flag stays unset and the next pass
   // tries again, so a person is not left unaware.
   const flagged: string[] = [];
   for (const orderId of ordersNeedingExpiryFlag(held.rows, deps.now())) {
     try {
-      await deps.alert(`Order ${orderId}: card hold expires ${expiring(orderId)} and there is no proof of filing yet.`);
+      await deps.alert(`Order ${orderId}: card hold expires ${expiring(orderId)} and there is no proof of filing yet.${whyNotRenewed(orderId)}`);
       await pool.query(`UPDATE orders SET hold_expiry_flagged_at = now() WHERE order_id = $1`, [orderId]);
       flagged.push(orderId);
     } catch (err) {
@@ -116,7 +149,7 @@ export async function runHoldSweepOnce(pool: Pool, deps: HoldSweepDeps = default
   // One alert per order per pass: the next pass escalates.
   for (const orderId of ordersNeedingFinalFlag(held.rows, deps.now()).filter((id) => !flagged.includes(id))) {
     try {
-      await deps.alert(`Order ${orderId}: card hold ends within 24 hours (${expiring(orderId)}). Replace it now, or it will lapse.`);
+      await deps.alert(`Order ${orderId}: card hold ends within 24 hours (${expiring(orderId)}). Replace it now, or it will lapse.${whyNotRenewed(orderId)}`);
       await pool.query(`UPDATE orders SET hold_final_flagged_at = now() WHERE order_id = $1`, [orderId]);
     } catch (err) {
       console.error(`[hold sweep] alert failed for order ${orderId}:`, describeError(err));
@@ -132,7 +165,7 @@ export async function runHoldSweepOnce(pool: Pool, deps: HoldSweepDeps = default
   );
   for (const row of ended.rows) {
     try {
-      await deps.alert(`Order ${row.order_id}: its card hold has ended, so it can't file. If the customer agrees to a new hold, use replace-authorization with customer_agreed. Otherwise use /cancel.`);
+      await deps.alert(`Order ${row.order_id}: its card hold has ended, so it can't file. If the customer agrees to a new hold, use replace-authorization with customer_agreed. Otherwise use /cancel. If this order was approved, check Sunbiz first: Florida may have been paid.`);
       await pool.query(`UPDATE orders SET hold_lapsed_flagged_at = now() WHERE order_id = $1`, [row.order_id]);
     } catch (err) {
       console.error(`[hold sweep] alert failed for order ${row.order_id}:`, describeError(err));
@@ -140,20 +173,24 @@ export async function runHoldSweepOnce(pool: Pool, deps: HoldSweepDeps = default
   }
 
   // A standing $139 hold within 48 hours of ending is renewed, if the customer
-  // agreed. replaceHold checks consent again and handles every outcome. A
-  // rejected filing may wait 60 days for a reply, so no hold sits on the card
-  // meanwhile. Renewing clears an approval, so one in use is left to run out.
-  const expiring48 = await pool.query<{ order_id: string; replacement_last_attempt_at: Date | null }>(
-    `SELECT order_id, replacement_last_attempt_at FROM orders
-     WHERE cancelled_at IS NULL AND proof_of_filing_at IS NULL AND replacement_attempts < $2
-       AND payment_status = 'authorized' AND capture_before IS NOT NULL AND capture_before <= $1
-       AND fulfillment_status <> 'rejected'
-       AND (filing_approved_at IS NULL OR filing_approved_at <= $3)
-       AND line_items @> '[{"offer_code":"DIY_PACKAGE"}]'::jsonb`,
-    [new Date(deps.now().getTime() + 48 * 3600 * 1000), MAX_REPLACEMENT_ATTEMPTS, new Date(deps.now().getTime() - APPROVAL_VALID_HOURS * 3600 * 1000)]
+  // agreed. replaceHold checks consent and this list again under its claim, and
+  // handles every outcome. A hold should not sit on the customer's funds while
+  // nothing is moving: a rejected filing may wait 60 days for a reply, and an
+  // order with no Articles or no agent can't file. Those run out, which raises
+  // the lapse alert. Renewing clears an approval, so one in use is left to run out.
+  const expiring48 = await pool.query<RenewalFacts & { order_id: string; replacement_last_attempt_at: Date | null }>(
+    `SELECT o.order_id, o.replacement_last_attempt_at, o.fulfillment_status, o.filing_approved_at, fs.registered_agent_status, fs.filing_data
+     FROM orders o LEFT JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id
+     WHERE o.cancelled_at IS NULL AND o.proof_of_filing_at IS NULL AND o.replacement_attempts < $2
+       AND o.payment_status = 'authorized' AND o.capture_before IS NOT NULL AND o.capture_before <= $1
+       AND o.fulfillment_status <> 'rejected'
+       AND (o.filing_approved_at IS NULL OR o.filing_approved_at <= $3)
+       AND o.line_items @> '[{"offer_code":"DIY_PACKAGE"}]'::jsonb`,
+    [new Date(deps.now().getTime() + RENEWAL_WINDOW_HOURS * 3600 * 1000), MAX_REPLACEMENT_ATTEMPTS, new Date(deps.now().getTime() - APPROVAL_VALID_HOURS * 3600 * 1000)]
   );
   const waitMs = HOURS_BETWEEN_ATTEMPTS * 3600 * 1000;
   for (const row of expiring48.rows) {
+    if (stuckOn(row)) continue;
     if (row.replacement_last_attempt_at && deps.now().getTime() - new Date(row.replacement_last_attempt_at).getTime() < waitMs) continue;
     try {
       await deps.replace(pool, row.order_id);

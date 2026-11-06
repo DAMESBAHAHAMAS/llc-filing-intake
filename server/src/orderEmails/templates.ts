@@ -43,6 +43,10 @@ export interface OrderEmailExtras {
   rejectionReason?: string;
   /** Whether the filing was already with Florida (hold_replacement_failed). */
   filingSubmitted?: boolean;
+  /** False when no bank answered, so the notice can't say one refused (hold_replacement_failed). */
+  bankDeclined?: boolean;
+  /** The hold had already ended, and the customer agreed to a new one separately (hold_replaced). */
+  holdEnded?: boolean;
 }
 
 export const DISCLAIMER = "Damian Knowles is a Business Developer, not a law firm or attorney, and does not provide legal advice.";
@@ -409,11 +413,19 @@ function orderCancelled(ctx: OrderEmailContext): RenderedEmail {
   ]);
 }
 
-function holdReplaced(ctx: OrderEmailContext): RenderedEmail {
+function holdReplaced(ctx: OrderEmailContext, extras: OrderEmailExtras): RenderedEmail {
+  const body = extras.holdEnded
+    ? [
+        p(`Your card hold had ended before Florida confirmed your filing. As you agreed with us, we placed a new temporary hold of ${money(ctx.totalCents)} on the same card.`),
+        p("A hold is not a charge. It can reduce the balance or credit available on your card. You pay only once, after Florida confirms your filing."),
+      ]
+    : [
+        p(`Your card hold was about to end before Florida confirmed your filing. As you authorized at checkout, we placed a new temporary hold of ${money(ctx.totalCents)} on the same card and are releasing the old one.`),
+        p("A hold is not a charge. Your bank may show both holds as pending for a few days until the old one clears. It can reduce the balance or credit available on your card. You pay only once, after Florida confirms your filing."),
+      ];
   return render("We renewed the temporary hold on your card", [
     greeting(ctx),
-    p(`Your card hold was about to end before Florida confirmed your filing. As you authorized at checkout, we placed a new temporary hold of ${money(ctx.totalCents)} on the same card and released the old one.`),
-    p("A hold is not a charge. Your bank may show both holds as pending for a few days until the old one clears. It can reduce the balance or credit available on your card. You pay only once, after Florida confirms your filing."),
+    ...body,
     rows([["Order number", ctx.orderId]]),
     p(REPLY_LINE),
   ]);
@@ -427,11 +439,11 @@ function holdReplacementFailed(ctx: OrderEmailContext, extras: OrderEmailExtras)
       ]
     : [
         p("You have not been charged. We can't send your filing to Florida until a valid hold is in place, so your filing is waiting."),
-        p("Reply to this email and we'll help you authorize a card again, or cancel your order. If you cancel, you pay nothing."),
+        p("Reply to this email and we'll try the same card again. To use a different card, cancel this order and place a new one. If you cancel, you pay nothing."),
       ];
   return render("We could not renew the hold on your card", [
     greeting(ctx),
-    p("The temporary hold on your card is ending, and your bank did not approve a new one."),
+    p(extras.bankDeclined === false ? "The temporary hold on your card is ending, and we could not place a new one." : "The temporary hold on your card is ending, and your bank did not approve a new one."),
     ...next,
     rows([["Order number", ctx.orderId]]),
     p(REPLY_LINE),
@@ -458,7 +470,7 @@ export function buildOrderEmail(type: OrderEmailType, row: OrderEmailRow, paymen
     case "order_cancelled":
       return orderCancelled(ctx);
     case "hold_replaced":
-      return holdReplaced(ctx);
+      return holdReplaced(ctx, extras);
     case "hold_replacement_failed":
       return holdReplacementFailed(ctx, extras);
   }

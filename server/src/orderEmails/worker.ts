@@ -40,7 +40,7 @@ interface EnqueueInput {
    *  for example). Without it, each type is sent once per order. */
   dedupeKey?: string;
   /** Extra fields the template needs, kept on the job. */
-  details?: { amount_cents?: number; agent_problem?: AgentProblem; charge_kind?: "fallback" | "deferred"; rejection_reason?: string; filing_submitted?: boolean };
+  details?: { amount_cents?: number; agent_problem?: AgentProblem; charge_kind?: "fallback" | "deferred"; rejection_reason?: string; filing_submitted?: boolean; bank_declined?: boolean; hold_ended?: boolean };
 }
 
 type QueryClient = { query: (text: string, params?: unknown[]) => Promise<unknown> };
@@ -129,6 +129,8 @@ export interface ClaimedEmailJob {
     charge_kind?: "fallback" | "deferred";
     rejection_reason?: string;
     filing_submitted?: boolean;
+    bank_declined?: boolean;
+    hold_ended?: boolean;
   } & Record<string, unknown>;
   attempts: number;
   max_attempts: number;
@@ -291,6 +293,8 @@ async function sendJob(pool: Pool, sender: OrderEmailSender, job: ClaimedEmailJo
     agentProblem: job.payload_snapshot.agent_problem,
     rejectionReason: job.payload_snapshot.rejection_reason,
     filingSubmitted: job.payload_snapshot.filing_submitted,
+    bankDeclined: job.payload_snapshot.bank_declined,
+    holdEnded: job.payload_snapshot.hold_ended,
   });
   const result = await sender.send({ to: row.email, ...email, idempotencyKey: idempotencyKeyFor(job, type, row.email, email) });
   return { ok: result.ok, error: result.error, providerMessageId: result.providerMessageId };
@@ -419,7 +423,7 @@ export async function listOrderEmails(pool: Pool, orderId: string): Promise<Orde
   return emails;
 }
 
-const RESENDABLE_TYPES: OrderEmailType[] = ["welcome", "order_confirmation", "intake_summary", "payment_problem", "agent_action_needed", "filing_rejected", "order_cancelled"];
+const RESENDABLE_TYPES: OrderEmailType[] = ["welcome", "order_confirmation", "intake_summary", "payment_problem", "agent_action_needed", "filing_rejected", "order_cancelled", "hold_replaced", "hold_replacement_failed"];
 
 export function isResendableEmailType(type: string): type is OrderEmailType {
   return (RESENDABLE_TYPES as string[]).includes(type);

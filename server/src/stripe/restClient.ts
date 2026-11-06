@@ -292,9 +292,9 @@ export async function cancelPaymentIntent(paymentIntentId: string, idempotencyKe
 /**
  * A new hold on the saved card, for an order whose hold is about to end and
  * whose filing is not confirmed. Manual capture, so nothing is collected.
- * The idempotency key names the hold it replaces, so a retry cannot place a
- * second one, and metadata ties the hold to its order, so one whose response
- * was lost can be found again. The bank can refuse or ask for the customer: the caller then
+ * The idempotency key names the hold it replaces, and the caller moves it only
+ * after a definite answer, so a retry cannot place a second one. Metadata ties
+ * the hold to its order, so one whose response was lost can be found again. The bank can refuse or ask for the customer: the caller then
  * keeps the old hold and raises it with a person.
  */
 export async function placeReplacementHold(params: {

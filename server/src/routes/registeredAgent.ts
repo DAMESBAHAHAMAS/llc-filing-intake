@@ -6,6 +6,7 @@ import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
 import { notifyAgentProblem, openFilingOrders } from "../registeredAgent/customerNotice.js";
 import { sendOpsAlert } from "../ops/alerts.js";
 import { looksLikePoBox } from "../registeredAgent/poBox.js";
+import { hasDiyPackage } from "../offers/diyPackage.js";
 
 export const registeredAgentRouter = Router();
 
@@ -45,12 +46,14 @@ async function mergeIntoFilingData(filingSessionId: string, patch: Record<string
   }
 }
 
-/** The agent is on the Articles Florida already holds. A rejected filing is
- *  the exception, because it comes back to be corrected. */
+/** The agent is on the Articles Florida holds, or is about to, because an
+ *  approval means Florida may have been paid with nothing recorded yet. A
+ *  rejected filing is the exception, because it comes back to be corrected. */
 async function filingAtFlorida(filingSessionId: string): Promise<boolean> {
   const { rowCount } = await pool.query(
     `SELECT 1 FROM orders
-     WHERE filing_session_id = $1 AND cancelled_at IS NULL AND sunbiz_submitted_at IS NOT NULL AND fulfillment_status <> 'rejected'
+     WHERE filing_session_id = $1 AND cancelled_at IS NULL
+       AND ((sunbiz_submitted_at IS NOT NULL AND fulfillment_status <> 'rejected') OR approved_unrecorded_at IS NOT NULL)
      LIMIT 1`,
     [filingSessionId]
   );
@@ -58,7 +61,7 @@ async function filingAtFlorida(filingSessionId: string): Promise<boolean> {
 }
 
 const FILING_AT_FLORIDA = {
-  error: "this filing has been submitted to Florida, so its registered agent can no longer be changed here",
+  error: "this filing has been approved or submitted to Florida, so its registered agent can no longer be changed here",
   code: "filing_submitted",
 };
 
@@ -69,12 +72,13 @@ const FILING_AT_FLORIDA = {
  * file's own registered-agent-gate comment). Most orders are held, not
  * paid, by this point: the card is charged only after Florida confirms.
  *
- * A released hold still files. The agent can take the full 7 days a hold
- * lasts, and the customer authorized the saved card for exactly that case;
- * it is charged after Florida confirms (routes/orders.ts). Ops hears about
- * it, because Damian is paying Sunbiz with no hold behind the order. A
- * cancelled order never files, and neither does a Stripe test-mode order: the
- * same rule the webhook applied when it was paid.
+ * A released hold still files on other packages. The agent can take the full
+ * 7 days a hold lasts, and the customer authorized the saved card for exactly
+ * that case; it is charged after Florida confirms (routes/orders.ts). Ops hears
+ * about it, because Damian is paying Sunbiz with no hold behind the order. A
+ * $139 order can't file on a released hold: approve-filing refuses it until a
+ * new hold is placed. A cancelled order never files, and neither does a Stripe
+ * test-mode order: the same rule the webhook applied when it was paid.
  */
 async function reevaluateFulfillmentAfterAcceptance(filingSessionId: string): Promise<void> {
   for (const order of await openFilingOrders(pool, filingSessionId)) {
@@ -84,7 +88,13 @@ async function reevaluateFulfillmentAfterAcceptance(filingSessionId: string): Pr
        WHERE order_id = $1 AND fulfillment_status = 'not_ready' AND cancelled_at IS NULL`,
       [order.order_id]
     );
-    if (started.rowCount && order.payment_status === "released") {
+    if (!started.rowCount || order.payment_status !== "released") continue;
+    if (hasDiyPackage(order.line_items ?? [])) {
+      await sendOpsAlert(
+        "Agent accepted on an order with no hold",
+        `Order ${order.order_id}: the registered agent accepted after the card hold ended, so this order can't file yet. If the customer agrees to a new hold, use replace-authorization with customer_agreed. Otherwise use /cancel. Do not pay Florida until approve-filing succeeds.`
+      );
+    } else {
       await sendOpsAlert(
         "Filing started with no hold in place",
         `Order ${order.order_id}: the registered agent accepted after the card hold ended. Filing is starting. The saved card is charged after Florida confirms, and it can still decline.`
@@ -189,6 +199,12 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
     if (!city) errors.push("registered agent city is required");
     if (!state) errors.push("registered agent state is required");
     if (!zip) errors.push("registered agent ZIP is required");
+
+    // An unusable answer changes nothing, or it would wipe the agent on file.
+    if (errors.length) {
+      res.status(200).json({ status: "pending", validationErrors: errors });
+      return;
+    }
 
     await mergeIntoFilingData(filingSessionId, {
       registered_agent_path: "customer",

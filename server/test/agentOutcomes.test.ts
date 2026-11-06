@@ -125,6 +125,14 @@ describe("the agent accepts", () => {
     expect((await claimNextReadyOrder(state.db, "test"))?.order_id).toBe(orderId);
   });
 
+  it("tells ops a released $139 order can't file, instead of saying filing is starting", async () => {
+    await order("released", [{ offer_code: "DIY_PACKAGE", unit_amount_cents: 13900, quantity: 1 }]);
+    await ask();
+    await post("/api/registered-agent/accept", { token: TOKEN });
+    expect(alerts.send).not.toHaveBeenCalledWith("Filing started with no hold in place", expect.anything());
+    expect(alerts.send).toHaveBeenCalledWith("Agent accepted on an order with no hold", expect.stringContaining("Do not pay Florida until approve-filing succeeds"));
+  });
+
   it("does not start a cancelled, refunded or failed order", async () => {
     for (const status of ["released", "refunded", "failed"]) {
       await order(status);

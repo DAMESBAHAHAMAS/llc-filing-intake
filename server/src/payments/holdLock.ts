@@ -26,6 +26,17 @@ export async function releaseOrder(pool: Pick<Pool, "query">, orderId: string, t
   await pool.query(`UPDATE orders SET hold_op_until = NULL, hold_op_token = NULL WHERE order_id = $1 AND hold_op_token = $2`, [orderId, token]);
 }
 
+/**
+ * For a step that waited on something slow before its money call. True while
+ * no other step has taken the order since this one claimed it, and renews the
+ * claim for the call ahead. A claim that lapsed unnoticed counts as held: the
+ * token is cleared or replaced as soon as any other step runs.
+ */
+export async function reconfirmClaim(pool: Pick<Pool, "query">, orderId: string, token: string): Promise<boolean> {
+  const { rowCount } = await pool.query(`UPDATE orders SET hold_op_until = now() + interval '3 minutes' WHERE order_id = $1 AND hold_op_token = $2`, [orderId, token]);
+  return (rowCount ?? 0) > 0;
+}
+
 /** Route guard: for a $139 order, one operator step at a time. */
 export function oneStepAtATime(pool: Pick<Pool, "query">, authorized: (req: Request) => boolean) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
@@ -45,6 +56,7 @@ export function oneStepAtATime(pool: Pick<Pool, "query">, authorized: (req: Requ
         res.status(409).json({ error: "another step is running on this order; try again in a moment", code: "order_busy" });
         return;
       }
+      res.locals.orderClaim = token;
       // Released when the handler answers, before the response leaves, so the
       // next step can't be refused by this one. Not on a dropped connection:
       // the handler keeps running, and may be mid-capture.

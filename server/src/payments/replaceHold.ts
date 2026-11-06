@@ -3,10 +3,11 @@ import { describeError } from "../db/describeError.js";
 import { hasDiyPackage } from "../offers/diyPackage.js";
 import { REPLACEMENT_CONSENT_PHRASE } from "../offers/payAfterFiling.js";
 import { sendOpsAlert } from "../ops/alerts.js";
-import { alertEmailsNotQueued, enqueueCustomerEmails, queueOrderEmail } from "../orderEmails/worker.js";
+import { alertEmailsNotQueued, enqueueCustomerEmails } from "../orderEmails/worker.js";
 import { cancelPaymentIntent, listPaymentIntents, placeReplacementHold, retrievePaymentIntent, type StripePaymentIntent } from "../stripe/restClient.js";
+import { approvalCurrent } from "./filingClearance.js";
 import { claimOrder, releaseOrder } from "./holdLock.js";
-import { isCardDecline } from "./savedCard.js";
+import { isCardDecline, stripeResultUnknown } from "./savedCard.js";
 
 /**
  * Replaces a card hold that is about to end, with the customer's documented
@@ -18,10 +19,18 @@ import { isCardDecline } from "./savedCard.js";
  * The new hold is placed first and must be capturable before the order moves
  * to it, so the order is never left with nothing. Every outcome reaches a
  * person: the customer is emailed, and a failure alerts the operator.
+ *
+ * A request Stripe never answered may still have placed a hold. The order
+ * remembers that (`replacement_unknown_at`) from before the request is sent, so
+ * a crash counts too, until that hold is taken or cancelled.
  */
 export const MAX_REPLACEMENT_ATTEMPTS = 3;
 /** A bank's answer rarely changes within hours, and each try is visible to it. */
 export const HOURS_BETWEEN_ATTEMPTS = 6;
+/** The sweep renews a hold this close to its end. */
+export const RENEWAL_WINDOW_HOURS = 48;
+/** How long Stripe may still be working on a request we stopped waiting for. */
+export const UNKNOWN_RESULT_SETTLE_MS = 3600 * 1000;
 
 export type ReplaceOutcome =
   | { kind: "replaced"; paymentIntentId: string; oldHoldStillOpen: boolean }
@@ -32,7 +41,19 @@ export interface ReplaceDeps {
   alert: (title: string, message: string) => Promise<unknown>;
 }
 
-interface HoldRow {
+const OPS_ALERTS: ReplaceDeps = { alert: sendOpsAlert };
+
+/** Bank said no; Stripe gave no answer; or nothing was sent to the bank at all. */
+type FailureKind = "declined" | "no_answer" | "nothing_placed";
+
+export interface RenewalFacts {
+  fulfillment_status: string;
+  filing_approved_at: Date | string | null;
+  registered_agent_status?: string | null;
+  filing_data?: { registered_agent_path?: string } | null;
+}
+
+interface HoldRow extends RenewalFacts {
   order_id: string;
   filing_session_id: string;
   payment_status: string;
@@ -46,8 +67,12 @@ interface HoldRow {
   saved_card_authorized_at: Date | null;
   saved_card_authorization_text: string | null;
   replacement_attempts: number | null;
+  replacement_key_seq: number | null;
+  replacement_unknown_at: Date | null;
+  replacement_last_attempt_at: Date | null;
+  capture_before: Date | null;
+  stray_capture_pi: string | null;
   sunbiz_submitted_at: Date | null;
-  fulfillment_status: string;
   stripe_livemode: boolean | null;
 }
 
@@ -56,19 +81,72 @@ export function hasReplacementConsent(order: Pick<HoldRow, "saved_card_authorize
   return Boolean(order.saved_card_authorized_at && order.saved_card_authorization_text?.includes(REPLACEMENT_CONSENT_PHRASE));
 }
 
+/**
+ * Why an order can't move for now, in words for a person. Its hold should not
+ * sit on the customer's funds meanwhile, so nothing renews it by itself.
+ */
+export function stuckOn(order: RenewalFacts): string | null {
+  if (order.fulfillment_status === "rejected") return "Florida rejected the filing and we are waiting for the customer";
+  if (order.fulfillment_status === "failed") return "its Articles could not be generated";
+  if (order.fulfillment_status === "in_progress") return "its Articles are still being generated";
+  const agentGone = ["declined", "expired"].includes(order.registered_agent_status ?? "");
+  if (order.fulfillment_status === "not_ready" && order.filing_data?.registered_agent_path === "customer" && agentGone) {
+    return "its registered agent did not accept, and we are waiting for the customer";
+  }
+  return null;
+}
+
+/** Stuck, or an approval is in use, which a renewal would clear. */
+function cannotRenewByItself(order: RenewalFacts, now: Date): string | null {
+  return stuckOn(order) ?? (approvalCurrent(order.filing_approved_at, now) ? "an approval is in use" : null);
+}
+
+/** The sweep's own rules, read again under the claim: the list it works from can be seconds old. */
+function sweepStopsHere(order: HoldRow, now: Date): string | null {
+  const blocked = cannotRenewByItself(order, now);
+  if (blocked) return blocked;
+  if (!order.capture_before || new Date(order.capture_before).getTime() - now.getTime() > RENEWAL_WINDOW_HOURS * 3600 * 1000) return "the hold is not near its end";
+  const last = order.replacement_last_attempt_at;
+  if (last && now.getTime() - new Date(last).getTime() < HOURS_BETWEEN_ATTEMPTS * 3600 * 1000) return "the last attempt was too recent";
+  return null;
+}
+
+async function readHold(pool: Pool, orderId: string): Promise<HoldRow | undefined> {
+  const { rows } = await pool.query<HoldRow>(
+    `SELECT o.order_id, o.filing_session_id, o.payment_status, o.stripe_payment_intent_id, o.total_cents, o.currency, o.line_items, o.cancelled_at,
+            o.proof_of_filing_at, o.superseded_payment_intent_ids, o.saved_card_authorized_at, o.saved_card_authorization_text, o.replacement_attempts,
+            o.replacement_key_seq, o.replacement_unknown_at, o.replacement_last_attempt_at, o.capture_before, o.stray_capture_pi, o.filing_approved_at,
+            o.sunbiz_submitted_at, o.fulfillment_status, o.stripe_livemode, fs.registered_agent_status, fs.filing_data
+     FROM orders o LEFT JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id WHERE o.order_id = $1`,
+    [orderId]
+  );
+  return rows[0];
+}
+
 export async function replaceHold(
   pool: Pool,
   orderId: string,
-  deps: ReplaceDeps = { alert: sendOpsAlert },
-  customerAgreed?: string
+  deps: ReplaceDeps = OPS_ALERTS,
+  customerAgreed?: string,
+  sweepAt?: Date
 ): Promise<ReplaceOutcome> {
   const claim = await claimOrder(pool, orderId);
   if (!claim) return { kind: "refused", code: "order_busy", detail: "another step is running on this order" };
   try {
-    return await replaceClaimedHold(pool, orderId, deps, customerAgreed);
+    return await replaceClaimedHold(pool, orderId, deps, customerAgreed, sweepAt);
   } finally {
     await releaseOrder(pool, orderId, claim);
   }
+}
+
+/** The sweep's renewal. Unlike a person's, it stops if the order changed after the sweep listed it. */
+export function renewHoldFromSweep(pool: Pool, orderId: string, deps: ReplaceDeps = OPS_ALERTS): Promise<ReplaceOutcome> {
+  return replaceHold(pool, orderId, deps, undefined, new Date());
+}
+
+function isUnknownToOrder(pi: StripePaymentIntent, order: HoldRow): boolean {
+  const known = new Set([order.stripe_payment_intent_id, ...(order.superseded_payment_intent_ids ?? [])]);
+  return pi.metadata?.order_id === order.order_id && !known.has(pi.id);
 }
 
 /**
@@ -76,9 +154,83 @@ export async function replaceHold(
  * response was lost, or the process died before the move.
  */
 async function findUntrackedHolds(customerId: string, order: HoldRow): Promise<StripePaymentIntent[]> {
-  const known = new Set([order.stripe_payment_intent_id, ...(order.superseded_payment_intent_ids ?? [])]);
   const intents = await listPaymentIntents(customerId);
-  return intents.filter((pi) => pi.status === "requires_capture" && pi.metadata?.order_id === order.order_id && !known.has(pi.id));
+  return intents.filter((pi) => pi.status === "requires_capture" && isUnknownToOrder(pi, order));
+}
+
+/** The same search for a hold to get rid of, so it includes one Stripe is still confirming. */
+async function findOpenStrays(customerId: string, order: HoldRow): Promise<StripePaymentIntent[]> {
+  const intents = await listPaymentIntents(customerId);
+  const stillOpen = (pi: StripePaymentIntent) => pi.status === "requires_capture" || (pi.metadata?.kind === "replacement_hold" && !["succeeded", "canceled"].includes(pi.status));
+  return intents.filter((pi) => stillOpen(pi) && isUnknownToOrder(pi, order));
+}
+
+async function cancelStrays(pool: Pool, order: HoldRow, strays: StripePaymentIntent[], deps: ReplaceDeps): Promise<void> {
+  const cancelled: string[] = [];
+  for (const pi of strays) {
+    try {
+      await cancelPaymentIntent(pi.id, `cancel-untracked-${pi.id}`);
+      cancelled.push(pi.id);
+    } catch (err) {
+      await deps.alert("A card hold nothing tracks is still open", `Order ${order.order_id}: ${pi.id} could not be cancelled, and the sweep keeps trying. The customer has this hold on top of anything else on the order, so cancel it in Stripe. ${describeError(err)}`);
+    }
+  }
+  if (cancelled.length) {
+    // The old key would replay a hold that no longer exists.
+    await pool.query(`UPDATE orders SET replacement_key_seq = replacement_key_seq + 1 WHERE order_id = $1`, [order.order_id]);
+    await deps.alert("A card hold nothing tracked was cancelled", `Order ${order.order_id}: ${cancelled.join(", ")}, left by a request Stripe never answered. It was not collected.`);
+  }
+}
+
+/**
+ * For a step that closes an order or takes its money: a hold from a lost answer
+ * must not stay on the card. Only runs when one may exist. Never throws: the
+ * sweep keeps looking until the question is settled.
+ */
+export async function closeUntrackedHolds(pool: Pool, orderId: string, deps: ReplaceDeps = OPS_ALERTS): Promise<void> {
+  try {
+    const order = await readHold(pool, orderId);
+    if (!order?.replacement_unknown_at || !order.stripe_payment_intent_id) return;
+    const current = await retrievePaymentIntent(order.stripe_payment_intent_id);
+    if (!current.customer) return;
+    await cancelStrays(pool, order, await findOpenStrays(current.customer, order), deps);
+  } catch (err) {
+    await deps.alert("A card hold nothing tracks may still be open", `Order ${orderId}: Stripe could not be checked for a hold left by an unanswered request, and the sweep keeps trying. ${describeError(err)}`);
+  }
+}
+
+/**
+ * Finishes a request that got no answer, with or without attempts left. A hold
+ * the order would have renewed onto is taken. Any other is cancelled, because
+ * nothing else on the order will ever look at it. The question closes only
+ * once a look long after the request finds nothing.
+ */
+export async function settleUnknownReplacement(pool: Pool, orderId: string, deps: ReplaceDeps = OPS_ALERTS, now: Date = new Date()): Promise<void> {
+  const claim = await claimOrder(pool, orderId);
+  if (!claim) return;
+  try {
+    const order = await readHold(pool, orderId);
+    if (!order?.replacement_unknown_at || !order.stripe_payment_intent_id) return;
+    const current = await retrievePaymentIntent(order.stripe_payment_intent_id);
+    const strays = current.customer ? await findOpenStrays(current.customer, order) : [];
+    if (!strays.length) {
+      if (now.getTime() - new Date(order.replacement_unknown_at).getTime() >= UNKNOWN_RESULT_SETTLE_MS) {
+        await pool.query(`UPDATE orders SET replacement_unknown_at = NULL WHERE order_id = $1`, [orderId]);
+      }
+      return;
+    }
+    const usable = strays.find((pi) => pi.status === "requires_capture");
+    const stillHeld = current.status === "requires_capture";
+    const orderOpen = order.payment_status === "authorized" && !order.cancelled_at && !order.proof_of_filing_at && !order.stray_capture_pi;
+    if (usable && stillHeld && orderOpen && hasReplacementConsent(order) && !cannotRenewByItself(order, now)) {
+      await moveToReplacement(pool, order, usable, true, false, undefined, deps);
+      await cancelStrays(pool, order, strays.filter((pi) => pi.id !== usable.id), deps);
+      return;
+    }
+    await cancelStrays(pool, order, strays, deps);
+  } finally {
+    await releaseOrder(pool, orderId, claim);
+  }
 }
 
 /** A lapse can stop a filing waiting to start. The same rule the webhook applied to the first hold. */
@@ -112,7 +264,7 @@ async function moveOrderToHold(
     const moved = await client.query(
       `UPDATE orders SET stripe_payment_intent_id = $2, payment_status = 'authorized', capture_before = NULL, hold_expiry_flagged_at = NULL,
               hold_final_flagged_at = NULL, hold_unknown_flagged_at = NULL, hold_lapsed_flagged_at = NULL, filing_approved_at = NULL,
-              replacement_attempts = 0, replacement_last_error = NULL, replacement_last_attempt_at = now(),
+              replacement_attempts = 0, replacement_last_error = NULL, replacement_last_attempt_at = now(), replacement_unknown_at = NULL, replacement_key_seq = 0,
               superseded_payment_intent_ids = $3::jsonb, superseded_open = superseded_open OR $5::boolean
         WHERE order_id = $1 AND stripe_payment_intent_id = $4 AND payment_status IN ('authorized', 'released')
           AND cancelled_at IS NULL AND proof_of_filing_at IS NULL`,
@@ -133,6 +285,7 @@ async function moveOrderToHold(
         emailTypes: ["hold_replaced"],
         paymentMode: "hold",
         dedupeKey: newHoldId,
+        details: { hold_ended: lapsed },
       });
     }
     await client.query("COMMIT");
@@ -145,97 +298,18 @@ async function moveOrderToHold(
   }
 }
 
-async function replaceClaimedHold(pool: Pool, orderId: string, deps: ReplaceDeps, customerAgreed: string | undefined): Promise<ReplaceOutcome> {
-  const { rows } = await pool.query<HoldRow>(
-    `SELECT order_id, filing_session_id, payment_status, stripe_payment_intent_id, total_cents, currency, line_items, cancelled_at,
-            proof_of_filing_at, superseded_payment_intent_ids, saved_card_authorized_at, saved_card_authorization_text, replacement_attempts, sunbiz_submitted_at, fulfillment_status, stripe_livemode
-     FROM orders WHERE order_id = $1`,
-    [orderId]
-  );
-  const order = rows[0];
-  if (!order) return { kind: "refused", code: "order_not_found", detail: "order not found" };
-  if (!hasDiyPackage(order.line_items ?? [])) return { kind: "refused", code: "not_a_diy_package", detail: "this is for DIY_PACKAGE orders" };
-  // A filing with Florida is covered by the saved card, unless it came back rejected.
-  const lapsed = order.payment_status === "released" && (!order.sunbiz_submitted_at || order.fulfillment_status === "rejected");
-  if (order.cancelled_at || order.proof_of_filing_at || (order.payment_status !== "authorized" && !lapsed) || !order.stripe_payment_intent_id) {
-    return { kind: "refused", code: "no_hold_to_replace", detail: `this order has no open hold to replace (${order.payment_status})` };
-  }
-  if (lapsed && !customerAgreed) {
-    return { kind: "refused", code: "customer_agreement_required", detail: "this hold has ended; say how the customer agreed to a new one in customer_agreed" };
-  }
-  if (!hasReplacementConsent(order)) {
-    return { kind: "refused", code: "no_replacement_consent", detail: "this order has no documented consent to a replacement hold" };
-  }
-  const attempts = order.replacement_attempts ?? 0;
-  // The limit stops unattended retries. With a lapsed hold, a person and the customer are acting.
-  if (attempts >= MAX_REPLACEMENT_ATTEMPTS && !lapsed) {
-    return { kind: "refused", code: "replacement_attempts_used", detail: `${attempts} replacement attempts have been made on this hold` };
-  }
-
-  const oldId = order.stripe_payment_intent_id;
-  // `definite` is false when we don't know why it failed. The customer hears
-  // that their bank said no only if it did, or once the tries have run out.
-  const fail = async (code: string, detail: string, definite = true): Promise<ReplaceOutcome> => {
-    const used = attempts + 1;
-    await pool.query(
-      `UPDATE orders SET replacement_attempts = $2, replacement_last_attempt_at = now(), replacement_last_error = $3 WHERE order_id = $1`,
-      [orderId, used, detail.slice(0, 500)]
-    );
-    await deps.alert("A replacement card hold failed", `Order ${orderId}, attempt ${used}. ${lapsed ? `Its hold ${oldId} has already ended.` : `The current hold ${oldId} still stands.`} ${detail}`);
-    if (definite || used >= MAX_REPLACEMENT_ATTEMPTS) {
-      // Once per hold, so a retry does not email the customer again.
-      await queueOrderEmail(pool, {
-        orderId,
-        filingSessionId: order.filing_session_id,
-        emailTypes: ["hold_replacement_failed"],
-        paymentMode: "hold",
-        dedupeKey: oldId,
-        details: { filing_submitted: Boolean(order.sunbiz_submitted_at) },
-      });
-    }
-    return { kind: "failed", code, detail, attempts: used };
-  };
-
-  const original = await retrievePaymentIntent(oldId);
-  const stillHeld = original.status === "requires_capture";
-  if ((!stillHeld && !lapsed) || !original.customer || !original.payment_method) {
-    return fail("hold_not_replaceable", `the hold is ${original.status}, or has no saved card`);
-  }
-
-  // Unable to see what exists, a new hold could be a second one.
-  let untracked: StripePaymentIntent[];
-  try {
-    untracked = await findUntrackedHolds(original.customer, order);
-  } catch (err) {
-    return fail("replacement_lookup_failed", `could not check Stripe for an earlier hold: ${describeError(err)}`, false);
-  }
-  if (untracked.length > 1) {
-    await deps.alert("More than one untracked card hold", `Order ${orderId}: ${untracked.map((pi) => pi.id).join(", ")}. The order is taking ${untracked[0].id}. Cancel the others in Stripe.`);
-  }
-
-  let replacement = untracked[0];
-  if (!replacement) {
-    try {
-      replacement = await placeReplacementHold({
-        customerId: original.customer,
-        paymentMethodId: original.payment_method,
-        amountCents: order.total_cents,
-        currency: order.currency || "usd",
-        idempotencyKey: `replace-${orderId}-${oldId}-${attempts + 1}`,
-        metadata: { order_id: orderId, kind: "replacement_hold", replaces: oldId },
-        receiptEmail: original.receipt_email,
-      });
-    } catch (err) {
-      // After a timeout a hold may exist. The next attempt finds it by its metadata.
-      return isCardDecline(err) ? fail("replacement_declined", describeError(err)) : fail("replacement_result_unknown", describeError(err), false);
-    }
-  }
-  if (replacement.status !== "requires_capture") {
-    // It holds nothing we can use, and must not sit open on the customer's card.
-    await cancelPaymentIntent(replacement.id, `cancel-replacement-${replacement.id}`).catch(() => undefined);
-    return fail("replacement_not_capturable", `the new hold came back ${replacement.status}`);
-  }
-
+/** The move, then the old hold goes. A capturable new hold is the caller's to prove. */
+async function moveToReplacement(
+  pool: Pool,
+  order: HoldRow,
+  replacement: StripePaymentIntent,
+  stillHeld: boolean,
+  lapsed: boolean,
+  customerAgreed: string | undefined,
+  deps: ReplaceDeps
+): Promise<ReplaceOutcome> {
+  const orderId = order.order_id;
+  const oldId = order.stripe_payment_intent_id as string;
   const { moved, emailQueued } = await moveOrderToHold(pool, order, replacement.id, stillHeld, lapsed, customerAgreed);
   if (!moved) {
     // Never cancel the hold the order now points at: a replayed key can hand
@@ -261,4 +335,131 @@ async function replaceClaimedHold(pool: Pool, orderId: string, deps: ReplaceDeps
     }
   }
   return { kind: "replaced", paymentIntentId: replacement.id, oldHoldStillOpen };
+}
+
+async function replaceClaimedHold(pool: Pool, orderId: string, deps: ReplaceDeps, customerAgreed: string | undefined, sweepAt: Date | undefined): Promise<ReplaceOutcome> {
+  const order = await readHold(pool, orderId);
+  if (!order) return { kind: "refused", code: "order_not_found", detail: "order not found" };
+  if (!hasDiyPackage(order.line_items ?? [])) return { kind: "refused", code: "not_a_diy_package", detail: "this is for DIY_PACKAGE orders" };
+  // A filing with Florida is covered by the saved card, unless it came back rejected.
+  const rejected = order.fulfillment_status === "rejected";
+  const lapsed = order.payment_status === "released" && (!order.sunbiz_submitted_at || rejected);
+  if (order.cancelled_at || order.proof_of_filing_at || (order.payment_status !== "authorized" && !lapsed) || !order.stripe_payment_intent_id) {
+    return { kind: "refused", code: "no_hold_to_replace", detail: `this order has no open hold to replace (${order.payment_status})` };
+  }
+  if (order.stray_capture_pi) {
+    return { kind: "refused", code: "stray_capture_unresolved", detail: `money landed on ${order.stray_capture_pi}, which this order does not use; refund it first` };
+  }
+  if (lapsed && !customerAgreed) {
+    return { kind: "refused", code: "customer_agreement_required", detail: "this hold has ended; say how the customer agreed to a new one in customer_agreed" };
+  }
+  if (!hasReplacementConsent(order)) {
+    return { kind: "refused", code: "no_replacement_consent", detail: "this order has no documented consent to a replacement hold" };
+  }
+  const attempts = order.replacement_attempts ?? 0;
+  // The limit stops unattended retries. With a lapsed hold, a person and the
+  // customer are acting. A lost answer must still be finished, and its repeat
+  // uses the same key, so the bank sees nothing new.
+  if (attempts >= MAX_REPLACEMENT_ATTEMPTS && !lapsed && !order.replacement_unknown_at) {
+    return { kind: "refused", code: "replacement_attempts_used", detail: `${attempts} replacement attempts have been made on this hold` };
+  }
+  if (sweepAt) {
+    const stop = sweepStopsHere(order, sweepAt);
+    if (stop) return { kind: "refused", code: "not_for_the_sweep", detail: stop };
+  }
+
+  const oldId = order.stripe_payment_intent_id;
+  const keySeq = order.replacement_key_seq ?? 0;
+  // The customer hears that their bank said no only if it did. Once the tries
+  // have run out they hear no new hold was placed, without blaming the bank.
+  // The attempt and the notice commit together, ahead of the alert, so a crash can't lose the notice.
+  const fail = async (code: string, detail: string, kind: FailureKind, stillHeld?: boolean): Promise<ReplaceOutcome> => {
+    const used = attempts + 1;
+    const client = await pool.connect();
+    let emailQueued = true;
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `UPDATE orders SET replacement_attempts = $2, replacement_last_attempt_at = now(), replacement_last_error = $3, replacement_key_seq = $4, replacement_unknown_at = $5 WHERE order_id = $1`,
+        [orderId, used, detail.slice(0, 500), keySeq + (kind === "declined" ? 1 : 0), kind === "declined" ? null : kind === "no_answer" ? new Date() : order.replacement_unknown_at]
+      );
+      if (kind === "declined" || used >= MAX_REPLACEMENT_ATTEMPTS) {
+        // Once per hold, so a retry does not email the customer again.
+        emailQueued = await enqueueCustomerEmails(client, {
+          orderId,
+          filingSessionId: order.filing_session_id,
+          emailTypes: ["hold_replacement_failed"],
+          paymentMode: "hold",
+          dedupeKey: oldId,
+          details: { filing_submitted: Boolean(order.sunbiz_submitted_at) && !rejected, bank_declined: kind === "declined" },
+        });
+      }
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+    if (!emailQueued) await alertEmailsNotQueued(orderId, "the failed renewal email");
+    const held = stillHeld === undefined ? (lapsed ? false : undefined) : stillHeld;
+    const holdNow = held === undefined ? `The current hold ${oldId} could not be read.` : held ? `The current hold ${oldId} still stands.` : `Its hold ${oldId} has ended.`;
+    const maybe = kind === "no_answer" ? " Stripe gave no answer, so a new hold may be on the card. The sweep looks for it on every pass, and takes it or cancels it. Cancelling or capturing this order cancels it too." : "";
+    await deps.alert("A replacement card hold failed", `Order ${orderId}, attempt ${used}. ${holdNow}${maybe} ${detail}`);
+    return { kind: "failed", code, detail, attempts: used };
+  };
+
+  let original: StripePaymentIntent;
+  try {
+    original = await retrievePaymentIntent(oldId);
+  } catch (err) {
+    return fail("replacement_lookup_failed", `could not read the current hold: ${describeError(err)}`, "nothing_placed");
+  }
+  const stillHeld = original.status === "requires_capture";
+  if ((!stillHeld && !lapsed) || !original.customer || !original.payment_method) {
+    return fail("hold_not_replaceable", `the hold is ${original.status}, or has no saved card`, "nothing_placed", stillHeld);
+  }
+
+  // Unable to see what exists, a new hold could be a second one.
+  let untracked: StripePaymentIntent[];
+  try {
+    untracked = await findUntrackedHolds(original.customer, order);
+  } catch (err) {
+    return fail("replacement_lookup_failed", `could not check Stripe for an earlier hold: ${describeError(err)}`, "nothing_placed", stillHeld);
+  }
+  if (untracked.length > 1) {
+    await deps.alert("More than one untracked card hold", `Order ${orderId}: ${untracked.map((pi) => pi.id).join(", ")}. The order is taking ${untracked[0].id}. Cancel the others in Stripe.`);
+  }
+
+  let replacement = untracked[0];
+  if (!replacement) {
+    await pool.query(`UPDATE orders SET replacement_unknown_at = now() WHERE order_id = $1`, [orderId]);
+    try {
+      replacement = await placeReplacementHold({
+        customerId: original.customer,
+        paymentMethodId: original.payment_method,
+        amountCents: order.total_cents,
+        currency: order.currency || "usd",
+        idempotencyKey: `replace-${orderId}-${oldId}-${keySeq + 1}`,
+        metadata: { order_id: orderId, kind: "replacement_hold", replaces: oldId },
+        receiptEmail: original.receipt_email,
+      });
+    } catch (err) {
+      // A repeat with this key can't place a second hold: Stripe replays the
+      // answer, or refuses while the first request is still running.
+      if (isCardDecline(err)) return fail("replacement_declined", describeError(err), "declined", stillHeld);
+      if (!stripeResultUnknown(err)) return fail("replacement_refused", describeError(err), "nothing_placed", stillHeld);
+      return fail("replacement_result_unknown", describeError(err), "no_answer", stillHeld);
+    }
+  }
+  if (replacement.status !== "requires_capture") {
+    // It holds nothing we can use, and must not sit open on the customer's card.
+    try {
+      await cancelPaymentIntent(replacement.id, `cancel-replacement-${replacement.id}`);
+    } catch {
+      return fail("replacement_not_capturable", `the new hold came back ${replacement.status}, and could not be cancelled`, "no_answer", stillHeld);
+    }
+    return fail("replacement_not_capturable", `the new hold came back ${replacement.status}`, "declined", stillHeld);
+  }
+  return moveToReplacement(pool, order, replacement, stillHeld, lapsed, customerAgreed, deps);
 }
