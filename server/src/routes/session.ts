@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isLiveTestSession, LIVE_TEST_SESSION_REFUSED } from "../offers/liveTestSeal.js";
 import { Router } from "express";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
@@ -122,6 +123,12 @@ sessionRouter.post("/api/session/stage", async (req, res) => {
 
     if (!sessionId || !sessionExists) {
       sessionId = sessionId ?? randomUUID();
+    }
+
+    if (sessionExists && (await isLiveTestSession(client, sessionId))) {
+      await client.query("ROLLBACK");
+      res.status(409).json(LIVE_TEST_SESSION_REFUSED);
+      return;
     }
 
     // MIR-321: this route replaces filing_data whole, so once a card is held

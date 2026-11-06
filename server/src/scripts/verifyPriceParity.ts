@@ -33,7 +33,14 @@ async function main() {
   const amounts = new Map<string, number>();
 
   for (const row of rows) {
-    const price = await retrievePrice(row.stripe_price_id);
+    let price;
+    try {
+      price = await retrievePrice(row.stripe_price_id);
+    } catch (err) {
+      console.log(`FAIL ${row.offer_code} ${row.offer_version}: Stripe cannot read ${row.stripe_price_id}: ${(err as Error).message}`);
+      failures.push(row.offer_code);
+      continue;
+    }
     const charged = price.unit_amount ?? -1;
     const ok = price.active && charged === row.unit_amount_cents;
     console.log(`${ok ? "OK  " : "FAIL"} ${row.offer_code} ${row.offer_version}: displayed ${row.unit_amount_cents}, Stripe ${charged}${price.active ? "" : " (INACTIVE price)"}`);

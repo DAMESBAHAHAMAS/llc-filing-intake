@@ -54,6 +54,8 @@ async function insertEmailJobs(client: QueryClient, input: EnqueueInput): Promis
       `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot)
        SELECT $1::uuid, $2::uuid, $3::text, $4::jsonb
        WHERE NOT EXISTS (
+         SELECT 1 FROM orders WHERE order_id = $2::uuid AND line_items @> '[{"offer_code":"LIVE_TEST_NO_FILING"}]'::jsonb
+       ) AND NOT EXISTS (
          SELECT 1 FROM crm_sync_queue
          WHERE order_id = $2::uuid AND sync_type = $3::text AND COALESCE(payload_snapshot->>'dedupe_key', '') = $5::text
        )`,

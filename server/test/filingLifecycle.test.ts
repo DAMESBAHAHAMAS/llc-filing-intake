@@ -493,7 +493,7 @@ describe("POST /api/orders/:id/payment-received", () => {
   const paid = (amount = 49900) => op("payment-received", { method: "wire", reference: "W-1", amount_cents: amount });
   const settle = async (status = "released") => {
     await submit();
-    await state.db.query(`UPDATE orders SET payment_status = $2, proof_of_filing_at = now(), proof_of_filing_ref = 'L26' WHERE order_id = $1`, [orderId, status]);
+    await state.db.query(`UPDATE orders SET payment_status = $2, proof_of_filing_at = now(), proof_of_filing_ref = 'L26000123456' WHERE order_id = $1`, [orderId, status]);
   };
 
   it("needs the operator key, a method and an amount", async () => {

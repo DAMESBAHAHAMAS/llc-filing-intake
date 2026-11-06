@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { isLiveTestSession, LIVE_TEST_SESSION_REFUSED } from "../offers/liveTestSeal.js";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { buildPdfContext } from "../pdf/context.js";
@@ -47,6 +48,10 @@ filingDocumentRouter.post("/api/filing-session/:filingSessionId/pdf", async (req
   }
 
   try {
+    if (await isLiveTestSession(pool, filingSessionId)) {
+      res.status(409).json(LIVE_TEST_SESSION_REFUSED);
+      return;
+    }
     const existing = await pool.query<{ byte_size: number; sha256: string }>(
       `SELECT byte_size, sha256 FROM filing_documents WHERE filing_session_id = $1 AND order_id IS NULL`,
       [filingSessionId]

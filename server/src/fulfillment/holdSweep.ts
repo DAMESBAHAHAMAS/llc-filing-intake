@@ -1,7 +1,7 @@
 import type { Pool } from "pg";
 import { describeError } from "../db/describeError.js";
 import { holdDetails, retrievePaymentIntent, type StripePaymentIntent } from "../stripe/restClient.js";
-import { ordersNeedingExpiryFlag, type HeldOrderRow } from "../payments/holdState.js";
+import { ordersNeedingExpiryFlag, ordersNeedingFinalFlag, type HeldOrderRow } from "../payments/holdState.js";
 import { sendOpsAlert } from "../ops/alerts.js";
 
 export interface HoldSweepDeps {
@@ -50,16 +50,30 @@ export async function runHoldSweepOnce(pool: Pool, deps: HoldSweepDeps = default
   }
 
   const held = await pool.query<HeldOrderRow>(
-    `SELECT order_id, capture_before, proof_of_filing_at, hold_expiry_flagged_at FROM orders
+    `SELECT order_id, capture_before, proof_of_filing_at, hold_expiry_flagged_at, hold_final_flagged_at FROM orders
      WHERE payment_status = 'authorized' AND capture_before IS NOT NULL`
   );
-  const flagged = ordersNeedingExpiryFlag(held.rows, deps.now());
-  for (const orderId of flagged) {
-    await pool.query(`UPDATE orders SET hold_expiry_flagged_at = now() WHERE order_id = $1`, [orderId]);
-    const row = held.rows.find((r) => r.order_id === orderId);
-    await deps.alert(
-      `Order ${orderId}: card hold expires ${row?.capture_before?.toISOString()} and there is no proof of filing yet.`
-    );
+  const expiring = (orderId: string) => held.rows.find((r) => r.order_id === orderId)?.capture_before?.toISOString();
+  // The alert goes first. If it fails, the flag stays unset and the next pass
+  // tries again, so a person is not left unaware.
+  const flagged: string[] = [];
+  for (const orderId of ordersNeedingExpiryFlag(held.rows, deps.now())) {
+    try {
+      await deps.alert(`Order ${orderId}: card hold expires ${expiring(orderId)} and there is no proof of filing yet.`);
+      await pool.query(`UPDATE orders SET hold_expiry_flagged_at = now() WHERE order_id = $1`, [orderId]);
+      flagged.push(orderId);
+    } catch (err) {
+      console.error(`[hold sweep] alert failed for order ${orderId}:`, describeError(err));
+    }
+  }
+  // One alert per order per pass: the next pass escalates.
+  for (const orderId of ordersNeedingFinalFlag(held.rows, deps.now()).filter((id) => !flagged.includes(id))) {
+    try {
+      await deps.alert(`Order ${orderId}: card hold ends within 24 hours (${expiring(orderId)}). Replace it now, or it will lapse.`);
+      await pool.query(`UPDATE orders SET hold_final_flagged_at = now() WHERE order_id = $1`, [orderId]);
+    } catch (err) {
+      console.error(`[hold sweep] alert failed for order ${orderId}:`, describeError(err));
+    }
   }
   return { recorded, flagged };
 }

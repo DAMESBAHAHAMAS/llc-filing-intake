@@ -202,6 +202,7 @@ export interface StripePrice {
   unit_amount: number | null;
   currency: string;
   product: string;
+  livemode?: boolean;
 }
 
 /** Read-only; used by scripts/verifyPriceParity.ts. */
@@ -266,6 +267,38 @@ export async function cancelPaymentIntent(paymentIntentId: string, idempotencyKe
     `/payment_intents/${encodeURIComponent(paymentIntentId)}/cancel`,
     { cancellation_reason: "requested_by_customer" },
     idempotencyKey
+  );
+}
+
+/**
+ * A new hold on the saved card, for an order whose hold is about to end and
+ * whose filing is not confirmed. Manual capture, so nothing is collected.
+ * The idempotency key names the hold it replaces, so a retry cannot place a
+ * second one. The bank can refuse or ask for the customer: the caller then
+ * keeps the old hold and raises it with a person.
+ */
+export async function placeReplacementHold(params: {
+  customerId: string;
+  paymentMethodId: string;
+  amountCents: number;
+  currency: string;
+  idempotencyKey: string;
+  metadata?: Record<string, string>;
+}): Promise<StripePaymentIntent> {
+  return stripeRequest<StripePaymentIntent>(
+    "POST",
+    "/payment_intents",
+    {
+      amount: params.amountCents,
+      currency: params.currency,
+      customer: params.customerId,
+      payment_method: params.paymentMethodId,
+      capture_method: "manual",
+      off_session: true,
+      confirm: true,
+      metadata: params.metadata,
+    },
+    params.idempotencyKey
   );
 }
 

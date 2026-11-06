@@ -263,7 +263,7 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
             processingResult = held ? "held_deal_enqueued" : "paid_deal_enqueued";
           }
 
-          shouldSendRegisteredAgentEmail = blockedOnRegisteredAgent;
+          shouldSendRegisteredAgentEmail = blockedOnRegisteredAgent && !liveTest;
           paidFilingSessionId = order.filing_session_id;
 
           // Welcome, order confirmation and intake summary. Queued here so
@@ -425,7 +425,7 @@ export async function handlePaymentLifecycleEvent(
   const uuidLike = /^[0-9a-f-]{36}$/i;
 
   const found = await client.query(
-    `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at, deferred_payment_intent_id, cancelled_at
+    `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at, stripe_payment_intent_id, deferred_payment_intent_id, cancelled_at
      FROM orders
      WHERE ($1::uuid IS NOT NULL AND order_id = $1::uuid) OR ($2::text IS NOT NULL AND stripe_payment_intent_id = $2::text)
      ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
@@ -441,6 +441,7 @@ export async function handlePaymentLifecycleEvent(
     proof_of_filing_at: Date | null;
     deferred_payment_intent_id?: string | null;
     cancelled_at?: Date | null;
+    stripe_payment_intent_id?: string | null;
   };
 
   // The separate charge for a service completed after the filing (EIN).
@@ -483,6 +484,10 @@ export async function handlePaymentLifecycleEvent(
   if (event.type === "payment_intent.canceled") {
     if (order.payment_status !== "authorized") {
       return { processingResult: "ignored_not_held", orderId: order.order_id };
+    }
+    // A replaced hold being cancelled is not this order's hold ending.
+    if (order.stripe_payment_intent_id && obj.id !== order.stripe_payment_intent_id) {
+      return { processingResult: "ignored_superseded_hold", orderId: order.order_id };
     }
     await client.query(
       `UPDATE orders SET payment_status = 'released', released_at = now(), fulfillment_status = $2

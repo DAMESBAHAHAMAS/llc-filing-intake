@@ -38,6 +38,7 @@ export async function runSavedCardCleanupOnce(pool: Pool, deps: SavedCardCleanup
          (payment_status = 'paid' AND (deferred_cents = 0 OR deferred_charged_at IS NOT NULL))
          OR payment_status = 'refunded'
          OR (cancelled_at IS NOT NULL AND payment_status <> 'authorized')
+         OR (payment_status = 'released' AND line_items @> '[{"offer_code":"LIVE_TEST_NO_FILING"}]'::jsonb)
        )
      ORDER BY authorized_at ASC LIMIT 20`
   );

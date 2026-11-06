@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Router } from "express";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
-import { DIY_PACKAGE_OFFER_CODE, DIY_PACKAGE_TOTAL_CENTS } from "../offers/diyPackage.js";
+import { DIY_PACKAGE_OFFER_CODE, DIY_PACKAGE_TOTAL_CENTS, livePriceProblems } from "../offers/diyPackage.js";
 import { LIVE_TEST_OFFER_CODE, liveTestEmail } from "../offers/liveTest.js";
 import { holdCheckoutText } from "../offers/payAfterFiling.js";
 import { createCheckoutSession, retrievePrice } from "../stripe/restClient.js";
@@ -38,7 +38,7 @@ liveTestRouter.post("/api/operator/live-test/checkout", async (req, res) => {
   try {
     const open = await pool.query<{ order_id: string }>(
       `SELECT order_id FROM orders
-        WHERE line_items @> $1::jsonb AND payment_status IN ('pending', 'authorized') AND cancelled_at IS NULL
+        WHERE line_items @> $1::jsonb AND payment_status IN ('pending', 'authorized', 'released') AND cancelled_at IS NULL
         LIMIT 1`,
       [JSON.stringify([{ offer_code: LIVE_TEST_OFFER_CODE }])]
     );
@@ -58,8 +58,9 @@ liveTestRouter.post("/api/operator/live-test/checkout", async (req, res) => {
     }
     const priceId = offer.rows[0].stripe_price_id;
     const price = await retrievePrice(priceId);
-    if (!price.active || price.unit_amount !== DIY_PACKAGE_TOTAL_CENTS || offer.rows[0].unit_amount_cents !== DIY_PACKAGE_TOTAL_CENTS) {
-      res.status(409).json({ error: "the Price is not an active $139 Price", stripe_unit_amount: price.unit_amount, active: price.active });
+    const problems = livePriceProblems(price);
+    if (problems.length || offer.rows[0].unit_amount_cents !== DIY_PACKAGE_TOTAL_CENTS) {
+      res.status(409).json({ error: "the Price is not an active live $139 Price", problems });
       return;
     }
 
@@ -111,6 +112,10 @@ liveTestRouter.post("/api/operator/live-test/checkout", async (req, res) => {
 
     res.status(201).json({ order_id: orderId, checkout_url: stripeSession.url, capture_mode: "hold" });
   } catch (err) {
+    if ((err as { code?: string }).code === "23505") {
+      res.status(409).json({ error: "a live test is already open" });
+      return;
+    }
     res.status(502).json({ error: "the live test could not start", detail: describeError(err) });
   }
 });

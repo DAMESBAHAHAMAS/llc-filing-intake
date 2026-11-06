@@ -109,7 +109,7 @@ describe("POST /api/orders/:orderId/proof-of-filing", () => {
     const r = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
     expect(r.status).toBe(200);
     expect(r.json.status).toBe("collection_requested");
-    expect(stripe.capture).toHaveBeenCalledWith("pi_hold", "capture-ord-1");
+    expect(stripe.capture).toHaveBeenCalledWith("pi_hold", "capture-ord-1-pi_hold");
     expect(stripe.charge).not.toHaveBeenCalled();
     // Proof is written before any money moves.
     expect(db.queries.find((q) => /^\s*UPDATE/.test(q))).toMatch(/proof_of_filing_ref/);
@@ -259,7 +259,7 @@ describe("services charged when complete (EIN with a formation order)", () => {
     stripe.capture.mockResolvedValue({ id: "pi_hold", status: "succeeded" });
     const r = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
     expect(r.status).toBe(200);
-    expect(stripe.capture).toHaveBeenCalledWith("pi_hold", "capture-ord-1", 49900);
+    expect(stripe.capture).toHaveBeenCalledWith("pi_hold", "capture-ord-1-pi_hold", 49900);
     expect(r.json.collected_cents).toBe(49900);
     expect(r.json.deferred_cents).toBe(29900);
   });

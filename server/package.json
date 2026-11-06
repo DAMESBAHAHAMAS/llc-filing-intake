@@ -14,6 +14,7 @@
     "migrate": "tsx src/db/migrate.ts",
     "test": "vitest run",
     "verify:prices": "tsx src/scripts/verifyPriceParity.ts",
+    "verify:live-price": "tsx src/scripts/verifyLivePrice.ts",
     "check:card-hold": "tsx src/scripts/cardHoldRoundTrip.ts"
   },
   "dependencies": {

@@ -135,6 +135,17 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
       return;
     }
 
+    if ((session.rows[0].filing_data as { live_test?: unknown } | null)?.live_test === true) {
+      res.status(409).json({ error: "this session belongs to an internal test", code: "live_test_session" });
+      return;
+    }
+
+    // One filing is one LLC: the Stripe text says "Your $139".
+    if (needsSunbizFiling(requestedItems) && requestedItems.some((i) => i.quantity !== 1)) {
+      res.status(422).json({ error: "a filing offer is sold one at a time", code: "quantity_not_allowed" });
+      return;
+    }
+
     const uniqueCodes = [...new Set(requestedItems.map((i) => i.offer_code))];
 
     // An LLC filing order needs the customer's authorization to file and

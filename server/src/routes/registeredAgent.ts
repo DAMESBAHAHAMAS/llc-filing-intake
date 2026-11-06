@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { isLiveTestSession, LIVE_TEST_SESSION_REFUSED } from "../offers/liveTestSeal.js";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
@@ -111,6 +112,10 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
 
   if (!filingSessionId || !agentChoice) {
     res.status(400).json({ error: "filing_session_id and agent_choice ('damian' or 'own') are required" });
+    return;
+  }
+  if (await isLiveTestSession(pool, filingSessionId)) {
+    res.status(409).json(LIVE_TEST_SESSION_REFUSED);
     return;
   }
 
@@ -244,6 +249,10 @@ registeredAgentRouter.post("/api/registered-agent/request-acceptance", async (re
 
   if (!filingSessionId || !registeredAgentName || !registeredAgentEmail) {
     res.status(400).json({ error: "filing_session_id, registered_agent_name, and registered_agent_email are required" });
+    return;
+  }
+  if (await isLiveTestSession(pool, filingSessionId)) {
+    res.status(409).json(LIVE_TEST_SESSION_REFUSED);
     return;
   }
 

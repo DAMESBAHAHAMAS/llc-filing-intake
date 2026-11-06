@@ -48,6 +48,7 @@ const SCHEMA = `
     cancelled_at timestamptz, cancellation_reason text,
     saved_card_detached_at timestamptz, saved_card_detach_error text,
     fulfillment_completed_at timestamptz,
+    filing_approved_at timestamptz, hold_final_flagged_at timestamptz, capture_before timestamptz, extended_authorization boolean, hold_expiry_flagged_at timestamptz, superseded_payment_intent_ids jsonb NOT NULL DEFAULT '[]',
     sunbiz_tracking_number text, sunbiz_submitted_at timestamptz, sunbiz_resubmitted_at timestamptz,
     sunbiz_rejected_at timestamptz, sunbiz_rejection_reason text, sunbiz_rejection_count integer NOT NULL DEFAULT 0,
     other_payment_at timestamptz, other_payment_method text, other_payment_reference text, other_payment_cents integer,

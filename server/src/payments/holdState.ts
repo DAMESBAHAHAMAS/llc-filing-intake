@@ -53,6 +53,7 @@ export interface HeldOrderRow {
   capture_before: Date | null;
   proof_of_filing_at: Date | null;
   hold_expiry_flagged_at: Date | null;
+  hold_final_flagged_at?: Date | null;
 }
 
 /** Holds within `windowHours` of expiry, with no proof of filing yet and not already flagged. */
@@ -60,6 +61,14 @@ export function ordersNeedingExpiryFlag(rows: HeldOrderRow[], now: Date, windowH
   const limit = now.getTime() + windowHours * 3600 * 1000;
   return rows
     .filter((r) => r.capture_before && !r.proof_of_filing_at && !r.hold_expiry_flagged_at && r.capture_before.getTime() <= limit)
+    .map((r) => r.order_id);
+}
+
+/** The second escalation, for holds that will lapse within a day. */
+export function ordersNeedingFinalFlag(rows: HeldOrderRow[], now: Date, windowHours = 24): string[] {
+  const limit = now.getTime() + windowHours * 3600 * 1000;
+  return rows
+    .filter((r) => r.capture_before && !r.proof_of_filing_at && !r.hold_final_flagged_at && r.capture_before.getTime() <= limit)
     .map((r) => r.order_id);
 }
 

@@ -243,7 +243,7 @@ function paymentTerms(ctx: OrderEmailContext): Block[] {
     ? `Holds last about 7 days. If your hold ends before Florida confirms your filing, we charge the card you authorized at checkout once, for ${whatIsCharged}, after Florida confirms it.`
     : "Holds last about 7 days. If your hold ends before your filing is complete, we charge the card you authorized at checkout once, for the order total, after it is complete.";
   return [
-    p(`We placed a hold of ${total} on your card. A hold is not a charge: the amount is reserved, not collected.`),
+    p(`We placed a hold of ${total} on your card. A hold is not a charge: the amount is reserved, not collected. Until it is charged or released, it can reduce the balance or credit available on your card.`),
     p(charged),
     p(lapse),
     ...later,

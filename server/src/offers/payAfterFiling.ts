@@ -1,4 +1,4 @@
-import { DIY_PACKAGE_BREAKDOWN_LINE, hasDiyPackage } from "./diyPackage.js";
+import { DIY_PACKAGE_BREAKDOWN_LINE, hasDiyPackage, HOLD_FUNDS_DISCLOSURE } from "./diyPackage.js";
 import { isLiveTestOrder } from "./liveTest.js";
 import { needsSunbizFiling } from "./sunbizFiling.js";
 
@@ -66,7 +66,7 @@ export function holdCheckoutText(lineItems: Array<{ offer_code?: string; unit_am
   if (isLiveTestOrder(lineItems)) return { submit: LIVE_TEST_CHECKOUT_MESSAGE };
   if (!needsSunbizFiling(lineItems)) return { submit: SAVED_CARD_AUTHORIZATION_EIN_ONLY };
   const later = deferredServiceCents(lineItems) > 0 ? ` ${LATER_SERVICES_LINE}` : "";
-  const breakdown = hasDiyPackage(lineItems) ? ` ${DIY_PACKAGE_BREAKDOWN_LINE}` : "";
+  const breakdown = hasDiyPackage(lineItems) ? ` ${DIY_PACKAGE_BREAKDOWN_LINE} ${HOLD_FUNDS_DISCLOSURE}` : "";
   return { submit: SAVED_CARD_AUTHORIZATION, afterSubmit: `${HOLD_CHECKOUT_MESSAGE}${later}${breakdown}` };
 }
 
