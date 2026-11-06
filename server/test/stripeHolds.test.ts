@@ -99,8 +99,10 @@ describe("collection calls", () => {
       currency: "usd",
       idempotencyKey: "fallback-ord_1",
       metadata: { order_id: "ord_1" },
+      description: "What this covers",
     });
     const body = decodeURIComponent(calls[0].init?.body as string);
+    expect(body).toContain("description=What+this+covers");
     expect(calls[0].url).toBe("https://api.stripe.com/v1/payment_intents");
     expect(body).toContain("amount=49900");
     expect(body).toContain("off_session=true");

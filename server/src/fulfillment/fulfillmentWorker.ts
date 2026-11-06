@@ -4,13 +4,20 @@ import { buildPdfContext } from "../pdf/context.js";
 import type { FilingSessionRecord } from "../pdf/types.js";
 import { generateArticlesOfOrganizationPdf } from "../pdf/serviceClient.js";
 import { sendOpsAlert } from "../ops/alerts.js";
+import { hasDiyPackage } from "../offers/diyPackage.js";
 
 const MAX_FULFILLMENT_ATTEMPTS = 6;
+const TEST_MODE_FILES = () => process.env.TEST_MODE_ORDERS_FILE === "true";
+
+/** Far longer than one PDF render, so an order this old has no worker left. */
+export const STALLED_AFTER_MS = 15 * 60 * 1000;
 
 export interface ClaimedOrder {
   order_id: string;
   filing_session_id: string;
   fulfillment_attempts: number;
+  payment_status?: string;
+  line_items?: Array<{ offer_code?: string }> | null;
 }
 
 /**
@@ -26,11 +33,14 @@ export async function claimNextReadyOrder(pool: Pool, lockedBy: string): Promise
     const picked = await client.query<{ order_id: string }>(
       `SELECT order_id FROM orders
        WHERE fulfillment_status = 'ready'
+         AND NOT (line_items @> '[{"offer_code":"LIVE_TEST_NO_FILING"}]'::jsonb)
+         AND (stripe_livemode IS NULL OR stripe_livemode = true OR $1::boolean)
          AND (payment_status IN ('authorized', 'paid') OR (payment_status = 'released' AND cancelled_at IS NULL))
          AND (fulfillment_run_after IS NULL OR fulfillment_run_after <= now())
        ORDER BY fulfillment_ready_at ASC
        LIMIT 1
-       FOR UPDATE SKIP LOCKED`
+       FOR UPDATE SKIP LOCKED`,
+      [TEST_MODE_FILES()]
     );
 
     if (picked.rowCount === 0) {
@@ -42,7 +52,7 @@ export async function claimNextReadyOrder(pool: Pool, lockedBy: string): Promise
       `UPDATE orders
        SET fulfillment_status = 'in_progress', fulfillment_started_at = now()
        WHERE order_id = $1
-       RETURNING order_id, filing_session_id, fulfillment_attempts`,
+       RETURNING order_id, filing_session_id, fulfillment_attempts, payment_status, line_items`,
       [picked.rows[0].order_id]
     );
 
@@ -73,6 +83,11 @@ export async function claimNextReadyOrder(pool: Pool, lockedBy: string): Promise
  * fulfillment_last_error — this is not a transient failure to retry on
  * a timer, it needs the customer/ops to actually supply the missing
  * data, so it is deliberately NOT re-queued via backoff.
+ *
+ * The render takes seconds to minutes, and the order can move on meanwhile: a
+ * filing recorded by hand, a cancel, a new registered agent. So every write
+ * below applies only while the order is still in_progress, and the worker says
+ * nothing if it isn't. A filing Florida holds must never read as unfiled.
  */
 export async function processClaimedOrder(pool: Pool, order: ClaimedOrder): Promise<void> {
   const sessionRes = await pool.query<{ filing_data: Partial<FilingSessionRecord> | null; registered_agent_status: string | null }>(
@@ -85,13 +100,14 @@ export async function processClaimedOrder(pool: Pool, order: ClaimedOrder): Prom
 
   const contextResult = buildPdfContext(filingData, registeredAgentStatus);
   if (!contextResult.ok) {
-    await pool.query(
+    const { rowCount } = await pool.query(
       `UPDATE orders
        SET fulfillment_status = 'requires_review',
            fulfillment_last_error = $2
-       WHERE order_id = $1`,
+       WHERE order_id = $1 AND fulfillment_status = 'in_progress'`,
       [order.order_id, `Filing data incomplete: ${contextResult.missingFields.join(", ")}`]
     );
+    if (!rowCount) return;
     await sendOpsAlert("Filing needs review: details missing", `Order ${order.order_id} cannot be filed. Missing: ${contextResult.missingFields.join(", ")}.`);
     return;
   }
@@ -101,10 +117,11 @@ export async function processClaimedOrder(pool: Pool, order: ClaimedOrder): Prom
   if (!pdfResult.ok) {
     const newAttempts = order.fulfillment_attempts + 1;
     if (isDeadLetter(newAttempts, MAX_FULFILLMENT_ATTEMPTS)) {
-      await pool.query(
-        `UPDATE orders SET fulfillment_status = 'failed', fulfillment_attempts = $2, fulfillment_last_error = $3 WHERE order_id = $1`,
+      const { rowCount } = await pool.query(
+        `UPDATE orders SET fulfillment_status = 'failed', fulfillment_attempts = $2, fulfillment_last_error = $3 WHERE order_id = $1 AND fulfillment_status = 'in_progress'`,
         [order.order_id, newAttempts, pdfResult.error]
       );
+      if (!rowCount) return;
       await sendOpsAlert("Articles could not be generated", `Order ${order.order_id}: PDF generation gave up after ${newAttempts} attempts. ${pdfResult.error}`);
     } else {
       const waitMs = backoffForAttempt(newAttempts);
@@ -114,7 +131,7 @@ export async function processClaimedOrder(pool: Pool, order: ClaimedOrder): Prom
              fulfillment_attempts = $2,
              fulfillment_run_after = now() + ($3 || ' milliseconds')::interval,
              fulfillment_last_error = $4
-         WHERE order_id = $1`,
+         WHERE order_id = $1 AND fulfillment_status = 'in_progress'`,
         [order.order_id, newAttempts, String(waitMs), pdfResult.error]
       );
     }
@@ -124,16 +141,20 @@ export async function processClaimedOrder(pool: Pool, order: ClaimedOrder): Prom
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    const moved = await client.query(
+      `UPDATE orders
+       SET fulfillment_status = 'requires_review', fulfillment_last_error = NULL
+       WHERE order_id = $1 AND fulfillment_status = 'in_progress'`,
+      [order.order_id]
+    );
+    if (!moved.rowCount) {
+      await client.query("ROLLBACK");
+      return;
+    }
     await client.query(
       `INSERT INTO filing_documents (filing_session_id, order_id, byte_size, sha256, pdf_bytes)
        VALUES ($1, $2, $3, $4, $5)`,
       [order.filing_session_id, order.order_id, pdfResult.pdfBytes.length, pdfResult.sha256, pdfResult.pdfBytes]
-    );
-    await client.query(
-      `UPDATE orders
-       SET fulfillment_status = 'requires_review', fulfillment_last_error = NULL
-       WHERE order_id = $1`,
-      [order.order_id]
     );
     await client.query("COMMIT");
   } catch (err) {
@@ -142,7 +163,44 @@ export async function processClaimedOrder(pool: Pool, order: ClaimedOrder): Prom
   } finally {
     client.release();
   }
-  await sendOpsAlert("Filing ready for review", `Order ${order.order_id}: the Articles are generated. Review them, file at Sunbiz, then record the submission.`);
+  await sendOpsAlert("Filing ready for review", readyForReview(order));
+}
+
+function readyForReview(order: ClaimedOrder): string {
+  const generated = `Order ${order.order_id}: the Articles are generated.`;
+  if (!hasDiyPackage(order.line_items ?? [])) return `${generated} Review them, file at Sunbiz, then record the submission.`;
+  if (order.payment_status === "released") {
+    return `${generated} Its card hold has ended, so it can't file. If the customer agrees to a new hold, use replace-authorization with customer_agreed. Otherwise use /cancel. Do not pay Florida until approve-filing succeeds.`;
+  }
+  return `${generated} Review them, then call approve-filing, the last check before Florida is paid. If it refuses, do not file. If it approves, file at Sunbiz at once, then record the submission.`;
+}
+
+/**
+ * Puts orders back whose worker died mid-render, which only a deploy or a
+ * thrown database error can do. They count as a failed attempt, so an order
+ * that kills its worker every time stops at 'failed' instead of looping.
+ */
+export async function reapStalledOrders(pool: Pool, now: Date): Promise<number> {
+  const { rows } = await pool.query<{ order_id: string; fulfillment_attempts: number }>(
+    `SELECT order_id, fulfillment_attempts FROM orders WHERE fulfillment_status = 'in_progress' AND fulfillment_started_at < $1`,
+    [new Date(now.getTime() - STALLED_AFTER_MS)]
+  );
+  for (const row of rows) {
+    const attempts = row.fulfillment_attempts + 1;
+    const gaveUp = isDeadLetter(attempts, MAX_FULFILLMENT_ATTEMPTS);
+    const { rowCount } = await pool.query(
+      `UPDATE orders SET fulfillment_status = $2, fulfillment_attempts = $3, fulfillment_last_error = 'the worker stopped before finishing this order'
+        WHERE order_id = $1 AND fulfillment_status = 'in_progress'`,
+      [row.order_id, gaveUp ? "failed" : "ready", attempts]
+    );
+    if (rowCount) {
+      await sendOpsAlert(
+        gaveUp ? "Articles could not be generated" : "A stalled filing was restarted",
+        `Order ${row.order_id}: the worker stopped while generating its Articles, attempt ${attempts}. ${gaveUp ? "It will not retry by itself. Fix the cause, then use retry-articles, or /cancel it." : "It has gone back in the queue."}`
+      );
+    }
+  }
+  return rows.length;
 }
 
 export async function processOne(pool: Pool, lockedBy: string): Promise<boolean> {

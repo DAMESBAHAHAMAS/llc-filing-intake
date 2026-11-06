@@ -1,12 +1,16 @@
 import { Router } from "express";
+import { sendOpsAlert } from "../ops/alerts.js";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { notifyOrderEvent } from "../ops/alerts.js";
 import { verifyStripeSignature, WebhookSignatureError } from "../stripe/webhookSignature.js";
+import { isLiveTestOrder } from "../offers/liveTest.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
 import { alertEmailsNotQueued, CHECKOUT_EMAIL_TYPES, enqueueCustomerEmails } from "../orderEmails/worker.js";
 import { enqueueDealUpdate, type TxClient } from "../payments/dealUpdates.js";
+import { SAVED_CARD_CHARGE_REASON } from "../payments/savedCard.js";
+import { dropStrays, recordStray } from "../payments/strayCapture.js";
 import {
   classifyCheckoutCompletion,
   fulfillmentAfterPaymentEnds,
@@ -20,6 +24,8 @@ interface MinimalStripeEvent {
   type: string;
   /** false on a test-mode event. Absent is treated as live. */
   livemode?: boolean;
+  /** When Stripe created the event, in Unix seconds. Delivery can be much later. */
+  created?: number;
   data: { object: Record<string, unknown> };
 }
 
@@ -150,7 +156,7 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
           const registeredAgentPath = sessionForGate.rows[0]?.filing_data?.registered_agent_path;
           const registeredAgentStatus = sessionForGate.rows[0]?.registered_agent_status ?? null;
           const blockedOnRegisteredAgent = registeredAgentPath === "customer" && registeredAgentStatus !== "accepted";
-          const fulfillmentReady = requiresFiling && !blockedOnRegisteredAgent;
+          const fulfillmentReady = requiresFiling && !blockedOnRegisteredAgent && !(event.livemode === false && process.env.TEST_MODE_ORDERS_FILE !== "true");
 
           await client.query(
             held
@@ -165,12 +171,14 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
 
           // Stripe records no acceptance for custom_text. What it does give
           // is the exact text this session showed, so the order keeps that
-          // with the moment the customer completed checkout.
+          // with the moment the customer completed checkout, which is Stripe's
+          // time on the event: a delivery after an outage can be hours later.
           const authorizationShown = session.custom_text?.submit?.message;
           if (held && authorizationShown) {
-            await client.query(`UPDATE orders SET saved_card_authorized_at = now(), saved_card_authorization_text = $2 WHERE order_id = $1`, [
+            await client.query(`UPDATE orders SET saved_card_authorized_at = $3, saved_card_authorization_text = $2 WHERE order_id = $1`, [
               orderId,
               authorizationShown,
+              event.created ? new Date(event.created * 1000) : new Date(),
             ]);
           }
 
@@ -190,12 +198,20 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
           // crm_deal_id (known here via Stripe metadata — routes/checkout.ts
           // sets it, read back from this already-signature-verified event
           // body), updating that Deal instead of creating a second one.
+          // A Stripe test-mode order never reaches the CRM or Florida. Its email
+          // is already held back by blockedByTestMode, which lets a reserved
+          // test address through for QA.
+          const liveTest = isLiveTestOrder(order.line_items);
+          const stripeTestOrder = event.livemode === false && process.env.TEST_MODE_ORDERS_FILE !== "true";
           const crmDealId = session.metadata?.crm_deal_id;
           const targetStage = held
             ? process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED"
             : process.env.ZOHO_DEAL_STAGE_ON_PAYMENT;
           const expectedEmail = sessionRow.rows[0]?.email;
-          if (crmDealId) {
+          if (liveTest || stripeTestOrder) {
+            // A payment test is not a customer: no Deal, no customer email.
+            processingResult = held ? "live_test_held" : "live_test_paid";
+          } else if (crmDealId) {
             await client.query(`UPDATE orders SET crm_deal_id = $2 WHERE order_id = $1`, [orderId, crmDealId]);
             if (targetStage && expectedEmail) {
               // expected_email is what zoho/client.ts's updateDealStage
@@ -258,17 +274,19 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
             processingResult = held ? "held_deal_enqueued" : "paid_deal_enqueued";
           }
 
-          shouldSendRegisteredAgentEmail = blockedOnRegisteredAgent;
+          shouldSendRegisteredAgentEmail = blockedOnRegisteredAgent && !liveTest;
           paidFilingSessionId = order.filing_session_id;
 
           // Welcome, order confirmation and intake summary. Queued here so
           // they commit with the hold; orderEmails/worker.ts sends them.
-          customerEmailsNotQueued = !(await enqueueCustomerEmails(client, {
-            orderId: order.order_id,
-            filingSessionId: order.filing_session_id,
-            emailTypes: CHECKOUT_EMAIL_TYPES,
-            paymentMode: held ? "hold" : "paid",
-          }));
+          if (!liveTest) {
+            customerEmailsNotQueued = !(await enqueueCustomerEmails(client, {
+              orderId: order.order_id,
+              filingSessionId: order.filing_session_id,
+              emailTypes: CHECKOUT_EMAIL_TYPES,
+              paymentMode: held ? "hold" : "paid",
+            }));
+          }
         } else {
           processingResult = "payment_status_not_paid_or_already_paid";
         }
@@ -289,8 +307,9 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
         product: string;
         total_cents: number;
         payment_status: string;
+        line_items: Array<{ offer_code?: string }> | null;
       }>(
-        `SELECT order_id, filing_session_id, product, total_cents, payment_status
+        `SELECT order_id, filing_session_id, product, total_cents, payment_status, line_items
          FROM orders WHERE stripe_checkout_session_id = $1 FOR UPDATE`,
         [session.id]
       );
@@ -309,33 +328,39 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
             failureReason,
           ]);
 
-          const sessionRow = await client.query(
-            `SELECT email, full_name, phone, entity_name_primary, crm_lead_id FROM filing_sessions WHERE filing_session_id = $1`,
-            [order.filing_session_id]
-          );
+          if (isLiveTestOrder(order.line_items)) {
+            processingResult = "live_test_expired";
+          } else if (event.livemode === false && process.env.TEST_MODE_ORDERS_FILE !== "true") {
+            processingResult = "test_mode_expired";
+          } else {
+            const sessionRow = await client.query(
+              `SELECT email, full_name, phone, entity_name_primary, crm_lead_id FROM filing_sessions WHERE filing_session_id = $1`,
+              [order.filing_session_id]
+            );
 
-          await client.query(
-            `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot)
-             VALUES ($1, $2, 'abandoned_cart', $3)`,
-            [
-              order.filing_session_id,
-              orderId,
-              JSON.stringify({
-                kind: "abandoned_cart",
-                order: {
-                  order_id: orderId,
-                  filing_session_id: order.filing_session_id,
-                  product: order.product,
-                  crm_intent: order.product,
-                  total_cents: order.total_cents,
-                  failure_reason: failureReason,
-                },
-                filing_session: sessionRow.rows[0] ?? {},
-              }),
-            ]
-          );
+            await client.query(
+              `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot)
+               VALUES ($1, $2, 'abandoned_cart', $3)`,
+              [
+                order.filing_session_id,
+                orderId,
+                JSON.stringify({
+                  kind: "abandoned_cart",
+                  order: {
+                    order_id: orderId,
+                    filing_session_id: order.filing_session_id,
+                    product: order.product,
+                    crm_intent: order.product,
+                    total_cents: order.total_cents,
+                    failure_reason: failureReason,
+                  },
+                  filing_session: sessionRow.rows[0] ?? {},
+                }),
+              ]
+            );
 
-          processingResult = "abandoned_cart_enqueued";
+            processingResult = "abandoned_cart_enqueued";
+          }
         } else {
           // Already paid or held (e.g. a late/duplicate expired event racing
           // a completed one) — never overwrite a secured order as failed.
@@ -405,6 +430,7 @@ export async function handlePaymentLifecycleEvent(
     id: string;
     payment_intent?: string | null;
     refunded?: boolean;
+    captured?: boolean;
     metadata?: Record<string, string> | null;
     cancellation_reason?: string | null;
   };
@@ -413,11 +439,13 @@ export async function handlePaymentLifecycleEvent(
   const uuidLike = /^[0-9a-f-]{36}$/i;
 
   const found = await client.query(
-    `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at, deferred_payment_intent_id, cancelled_at
+    `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at, stripe_payment_intent_id, superseded_payment_intent_ids, deferred_payment_intent_id, cancelled_at,
+            saved_card_payment_intent_id, other_payment_at, stray_capture_pi, more_stray_capture_pis
      FROM orders
      WHERE ($1::uuid IS NOT NULL AND order_id = $1::uuid) OR ($2::text IS NOT NULL AND stripe_payment_intent_id = $2::text)
+        OR ($2::text IS NOT NULL AND superseded_payment_intent_ids @> $3::jsonb)
      ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
-    [metadataOrderId && uuidLike.test(metadataOrderId) ? metadataOrderId : null, paymentIntentId]
+    [metadataOrderId && uuidLike.test(metadataOrderId) ? metadataOrderId : null, paymentIntentId, JSON.stringify([paymentIntentId])]
   );
   if (!found.rowCount) return { processingResult: "order_not_found", orderId: null };
   const order = found.rows[0] as {
@@ -429,7 +457,31 @@ export async function handlePaymentLifecycleEvent(
     proof_of_filing_at: Date | null;
     deferred_payment_intent_id?: string | null;
     cancelled_at?: Date | null;
+    stripe_payment_intent_id?: string | null;
+    superseded_payment_intent_ids?: string[] | null;
+    saved_card_payment_intent_id?: string | null;
+    other_payment_at?: Date | null;
+    stray_capture_pi?: string | null;
+    more_stray_capture_pis?: string[] | null;
   };
+
+  // Before the Basil API version, cancelling a hold also reports charge.refunded.
+  // Nothing was captured, so nothing was refunded.
+  if (event.type === "charge.refunded" && obj.captured === false) {
+    return { processingResult: "ignored_uncaptured_charge", orderId: order.order_id };
+  }
+
+  // The refund that clears money landed on a hold the order does not use.
+  if (event.type === "charge.refunded" && obj.refunded && paymentIntentId && [order.stray_capture_pi, ...(order.more_stray_capture_pis ?? [])].includes(paymentIntentId)) {
+    const left = await dropStrays(client, order.order_id, [paymentIntentId]);
+    await sendOpsAlert(
+      "The stray hold was refunded",
+      left.length
+        ? `Order ${order.order_id}: ${paymentIntentId} was refunded, but money still sits on ${left.join(", ")}. Refund that too. The order collects nothing more until then.`
+        : `Order ${order.order_id}: ${paymentIntentId} was refunded, so the order can go on. Its own hold ${order.stripe_payment_intent_id} is unchanged.`
+    );
+    return { processingResult: "stray_capture_refunded", orderId: order.order_id };
+  }
 
   // The separate charge for a service completed after the filing (EIN).
   // It never changes the order's own payment state.
@@ -449,14 +501,44 @@ export async function handlePaymentLifecycleEvent(
     return { processingResult: `deferred_service_${event.type.replace(/\./g, "_")}_stripe_only`, orderId: order.order_id };
   }
 
+  // Money on a replaced hold is an operator's mistake, not this order's payment.
+  // The order remembers it, or the normal path would collect a second $139.
+  if (event.type === "payment_intent.succeeded" && (order.superseded_payment_intent_ids ?? []).includes(obj.id)) {
+    await recordStray(client, order.order_id, obj.id);
+    await sendOpsAlert("A replaced card hold was captured", `Order ${order.order_id}: ${obj.id} was captured, and the current hold ${order.stripe_payment_intent_id} is still open. Refund ${obj.id}. Do not release the current hold: the order collects nothing more until that refund lands.`);
+    return { processingResult: "superseded_hold_captured", orderId: order.order_id };
+  }
+
+  // The same for a refund: that money was never this order's payment.
+  if (event.type === "charge.refunded" && paymentIntentId && (order.superseded_payment_intent_ids ?? []).includes(paymentIntentId)) {
+    await sendOpsAlert("A replaced card hold was refunded", `Order ${order.order_id}: ${paymentIntentId} was refunded. The order's own hold ${order.stripe_payment_intent_id} is unchanged. Check it in Stripe.`);
+    return { processingResult: "superseded_hold_refunded", orderId: order.order_id };
+  }
+
   if (event.type === "payment_intent.succeeded") {
+    const expected = obj.id === order.stripe_payment_intent_id || obj.id === order.saved_card_payment_intent_id || obj.metadata?.reason === SAVED_CARD_CHARGE_REASON;
+    if (order.cancelled_at) {
+      await sendOpsAlert("Money landed on a cancelled order", `Order ${order.order_id}: ${obj.id} was collected, and the customer was told they pay nothing. Refund it.`);
+      return { processingResult: "collected_on_cancelled_order", orderId: order.order_id };
+    }
     if (!shouldMarkPaidOnPaymentIntentSucceeded(order.payment_status)) {
+      if (["paid", "refunded"].includes(order.payment_status) && (!expected || order.other_payment_at)) {
+        await sendOpsAlert("A second payment landed on this order", `Order ${order.order_id}: ${obj.id} was collected on an order already ${order.payment_status}${order.other_payment_at ? ", recorded as paid outside Stripe" : ""}. The customer has paid twice. Refund ${obj.id}, and leave the payment that paid the order.`);
+        return { processingResult: "second_payment_on_order", orderId: order.order_id };
+      }
       return { processingResult: "ignored_not_awaiting_collection", orderId: order.order_id };
     }
+    if (!expected) {
+      await recordStray(client, order.order_id, obj.id);
+      await sendOpsAlert("A hold this order does not use was captured", `Order ${order.order_id}: ${obj.id} was collected, and the order's own hold ${order.stripe_payment_intent_id} is still open. Refund ${obj.id}. The order collects nothing more until that refund lands.`);
+      return { processingResult: "untracked_hold_captured", orderId: order.order_id };
+    }
+    // A saved-card charge that lands after its answer was lost is on the order only from here.
     await client.query(
-      `UPDATE orders SET payment_status = 'paid', paid_at = COALESCE(paid_at, now()), captured_at = COALESCE(captured_at, now()), capture_error = NULL
+      `UPDATE orders SET payment_status = 'paid', paid_at = COALESCE(paid_at, now()), captured_at = COALESCE(captured_at, now()), capture_error = NULL, collection_unknown_at = NULL,
+              saved_card_payment_intent_id = COALESCE(saved_card_payment_intent_id, $2::text)
        WHERE order_id = $1`,
-      [order.order_id]
+      [order.order_id, obj.id === order.stripe_payment_intent_id ? null : obj.id]
     );
     const enqueued = await enqueueDealUpdate(client, order, {
       target_stage: process.env.ZOHO_DEAL_STAGE_ON_CAPTURE || process.env.ZOHO_DEAL_STAGE_ON_PAYMENT || "Closed Won",
@@ -465,12 +547,18 @@ export async function handlePaymentLifecycleEvent(
         ...(order.proof_of_filing_at ? { Proof_of_Filing_Date: new Date(order.proof_of_filing_at).toISOString().slice(0, 10) } : {}),
       },
     });
+    // Only the proof route captures. Anything else is a person in the Dashboard.
+    if (!order.proof_of_filing_at) return { processingResult: "collected_no_proof", orderId: order.order_id };
     return { processingResult: enqueued ? "collected_deal_update_enqueued" : "collected", orderId: order.order_id };
   }
 
   if (event.type === "payment_intent.canceled") {
     if (order.payment_status !== "authorized") {
       return { processingResult: "ignored_not_held", orderId: order.order_id };
+    }
+    // A replaced hold being cancelled is not this order's hold ending.
+    if (order.stripe_payment_intent_id && obj.id !== order.stripe_payment_intent_id) {
+      return { processingResult: "ignored_superseded_hold", orderId: order.order_id };
     }
     await client.query(
       `UPDATE orders SET payment_status = 'released', released_at = now(), fulfillment_status = $2
@@ -493,6 +581,13 @@ export async function handlePaymentLifecycleEvent(
   // charge.refunded
   if (!obj.refunded) return { processingResult: "partial_refund_recorded_in_stripe_only", orderId: order.order_id };
   if (order.payment_status !== "paid") return { processingResult: "ignored_not_paid", orderId: order.order_id };
+  // Only the payment that paid the order ends it. Refunding a second payment
+  // is what the alert asked for, and the first still stands.
+  const paidWith = order.saved_card_payment_intent_id ?? order.stripe_payment_intent_id;
+  if (order.other_payment_at || (paidWith && paymentIntentId !== paidWith)) {
+    await sendOpsAlert("A second payment was refunded", `Order ${order.order_id}: ${paymentIntentId} was refunded. ${order.other_payment_at ? "The payment recorded outside Stripe" : `${paidWith}, which paid the order,`} still stands, so the order stays paid.`);
+    return { processingResult: "second_payment_refunded", orderId: order.order_id };
+  }
   await client.query(`UPDATE orders SET payment_status = 'refunded', fulfillment_status = $2 WHERE order_id = $1`, [
     order.order_id,
     fulfillmentAfterPaymentEnds(order.fulfillment_status),

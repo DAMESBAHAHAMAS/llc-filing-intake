@@ -1,4 +1,5 @@
 import { Resend } from "resend";
+import { isLiveTestOrder } from "../offers/liveTest.js";
 import type { Pool } from "pg";
 import { describeError } from "../db/describeError.js";
 
@@ -63,6 +64,8 @@ export function orderAlertTitle(processingResult: string): string | null {
     case "collected":
     case "collected_deal_update_enqueued":
       return "Payment collected after filing";
+    case "collected_no_proof":
+      return "Money collected with no proof of filing";
     case "hold_released":
       return "Card hold released — check the order";
     case "refunded":
@@ -78,14 +81,14 @@ export async function notifyOrderEvent(pool: Pool, processingResult: string, ord
   if (!title || !orderId) return;
   try {
     const { rows } = await pool.query(
-      `SELECT o.order_id, o.product, o.total_cents, o.payment_status, o.fulfillment_status, fs.email, fs.entity_name_primary
+      `SELECT o.order_id, o.line_items, o.product, o.total_cents, o.payment_status, o.fulfillment_status, fs.email, fs.entity_name_primary
        FROM orders o LEFT JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id
        WHERE o.order_id = $1`,
       [orderId]
     );
     const o = rows[0];
     const email: string = o?.email ?? "";
-    const test = /\+test|test@|launch-test|\.invalid$/i.test(email);
+    const test = /\+test|test@|launch-test|\.invalid$/i.test(email) || isLiveTestOrder(o?.line_items);
     const body = o
       ? [
           `Order ${o.order_id}`,

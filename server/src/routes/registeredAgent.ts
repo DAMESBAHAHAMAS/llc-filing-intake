@@ -1,8 +1,9 @@
 import { Router } from "express";
+import { isLiveTestSession, LIVE_TEST_SESSION_REFUSED } from "../offers/liveTestSeal.js";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
-import { notifyAgentProblem, openFilingOrders } from "../registeredAgent/customerNotice.js";
+import { articlesMustBeRedone, notifyAgentProblem, openFilingOrders, reevaluateFulfillmentAfterAcceptance } from "../registeredAgent/customerNotice.js";
 import { sendOpsAlert } from "../ops/alerts.js";
 import { looksLikePoBox } from "../registeredAgent/poBox.js";
 
@@ -44,12 +45,14 @@ async function mergeIntoFilingData(filingSessionId: string, patch: Record<string
   }
 }
 
-/** The agent is on the Articles Florida already holds. A rejected filing is
- *  the exception, because it comes back to be corrected. */
+/** The agent is on the Articles Florida holds, or is about to, because an
+ *  approval means Florida may have been paid with nothing recorded yet. A
+ *  rejected filing is the exception, because it comes back to be corrected. */
 async function filingAtFlorida(filingSessionId: string): Promise<boolean> {
   const { rowCount } = await pool.query(
     `SELECT 1 FROM orders
-     WHERE filing_session_id = $1 AND cancelled_at IS NULL AND sunbiz_submitted_at IS NOT NULL AND fulfillment_status <> 'rejected'
+     WHERE filing_session_id = $1 AND cancelled_at IS NULL
+       AND ((sunbiz_submitted_at IS NOT NULL AND fulfillment_status <> 'rejected') OR approved_unrecorded_at IS NOT NULL)
      LIMIT 1`,
     [filingSessionId]
   );
@@ -57,38 +60,9 @@ async function filingAtFlorida(filingSessionId: string): Promise<boolean> {
 }
 
 const FILING_AT_FLORIDA = {
-  error: "this filing has been submitted to Florida, so its registered agent can no longer be changed here",
+  error: "this filing has been approved or submitted to Florida, so its registered agent can no longer be changed here",
   code: "filing_submitted",
 };
-
-/**
- * Starts filing on any order that was waiting for its registered agent,
- * after registered_agent_status changes to 'accepted' — the other half of
- * the gate routes/webhooksStripe.ts applies at payment time (see that
- * file's own registered-agent-gate comment). Most orders are held, not
- * paid, by this point: the card is charged only after Florida confirms.
- *
- * A released hold still files. The agent can take the full 7 days a hold
- * lasts, and the customer authorized the saved card for exactly that case;
- * it is charged after Florida confirms (routes/orders.ts). Ops hears about
- * it, because Damian is paying Sunbiz with no hold behind the order. A
- * cancelled order never files.
- */
-async function reevaluateFulfillmentAfterAcceptance(filingSessionId: string): Promise<void> {
-  for (const order of await openFilingOrders(pool, filingSessionId)) {
-    const started = await pool.query(
-      `UPDATE orders SET fulfillment_status = 'ready', fulfillment_ready_at = now()
-       WHERE order_id = $1 AND fulfillment_status = 'not_ready' AND cancelled_at IS NULL`,
-      [order.order_id]
-    );
-    if (started.rowCount && order.payment_status === "released") {
-      await sendOpsAlert(
-        "Filing started with no hold in place",
-        `Order ${order.order_id}: the registered agent accepted after the card hold ended. Filing is starting. The saved card is charged after Florida confirms, and it can still decline.`
-      );
-    }
-  }
-}
 
 /**
  * POST /registered-agent/select
@@ -111,6 +85,10 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
 
   if (!filingSessionId || !agentChoice) {
     res.status(400).json({ error: "filing_session_id and agent_choice ('damian' or 'own') are required" });
+    return;
+  }
+  if (await isLiveTestSession(pool, filingSessionId)) {
+    res.status(409).json(LIVE_TEST_SESSION_REFUSED);
     return;
   }
 
@@ -155,11 +133,12 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
       await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'accepted' WHERE filing_session_id = $1`, [
         filingSessionId,
       ]);
+      await articlesMustBeRedone(pool, filingSessionId);
       // Covers switching an already-paid order from "own" to "damian"
       // (e.g. an outside agent declined and the customer switched) —
       // otherwise an order blocked on outside-agent acceptance would
       // stay not_ready forever even though the new choice needs none.
-      await reevaluateFulfillmentAfterAcceptance(filingSessionId);
+      await reevaluateFulfillmentAfterAcceptance(pool, filingSessionId);
       res.status(200).json({ status: "accepted" });
       return;
     }
@@ -183,6 +162,12 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
     if (!state) errors.push("registered agent state is required");
     if (!zip) errors.push("registered agent ZIP is required");
 
+    // An unusable answer changes nothing, or it would wipe the agent on file.
+    if (errors.length) {
+      res.status(200).json({ status: "pending", validationErrors: errors });
+      return;
+    }
+
     await mergeIntoFilingData(filingSessionId, {
       registered_agent_path: "customer",
       registered_agent_name: name,
@@ -196,6 +181,7 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
     await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'pending' WHERE filing_session_id = $1`, [
       filingSessionId,
     ]);
+    await articlesMustBeRedone(pool, filingSessionId);
 
     const llcNameRow = await pool.query<{ filing_data: { llc_name?: string } | null }>(
       `SELECT filing_data FROM filing_sessions WHERE filing_session_id = $1`,
@@ -246,6 +232,10 @@ registeredAgentRouter.post("/api/registered-agent/request-acceptance", async (re
     res.status(400).json({ error: "filing_session_id, registered_agent_name, and registered_agent_email are required" });
     return;
   }
+  if (await isLiveTestSession(pool, filingSessionId)) {
+    res.status(409).json(LIVE_TEST_SESSION_REFUSED);
+    return;
+  }
 
   try {
     const sessionExists = await pool.query("SELECT 1 FROM filing_sessions WHERE filing_session_id = $1", [filingSessionId]);
@@ -282,6 +272,7 @@ registeredAgentRouter.post("/api/registered-agent/request-acceptance", async (re
       registered_agent_florida_address: address,
       registered_agent_email: registeredAgentEmail,
     });
+    await articlesMustBeRedone(pool, filingSessionId);
 
     const result = await dispatchAcceptanceEmail(pool, filingSessionId);
     if (!result.ok) {
@@ -424,10 +415,9 @@ registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
 
     // Best-effort, post-commit-equivalent: the acceptance itself is
     // already durable regardless of what happens here. A failure just
-    // means an order stays not_ready a little longer than it should —
-    // nothing is lost.
+    // means an order waits for the next agent sweep, which repeats this.
     try {
-      await reevaluateFulfillmentAfterAcceptance(resolved.row.filing_session_id);
+      await reevaluateFulfillmentAfterAcceptance(pool, resolved.row.filing_session_id);
     } catch (err) {
       console.error(`Fulfillment re-evaluation failed for filing_session_id=${resolved.row.filing_session_id}:`, err);
     }

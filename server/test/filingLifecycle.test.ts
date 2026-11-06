@@ -26,7 +26,7 @@ vi.mock("resend", () => ({
 }));
 const alerts = vi.hoisted(() => ({ send: vi.fn(async () => ({ channel: "log", ok: true })) }));
 vi.mock("../src/ops/alerts.js", () => ({ sendOpsAlert: alerts.send, notifyOrderEvent: vi.fn(async () => undefined) }));
-const stripe = vi.hoisted(() => ({ capture: vi.fn(), cancel: vi.fn(), charge: vi.fn(), retrieve: vi.fn(), detach: vi.fn() }));
+const stripe = vi.hoisted(() => ({ capture: vi.fn(), cancel: vi.fn(), charge: vi.fn(), retrieve: vi.fn(), detach: vi.fn(), list: vi.fn() }));
 vi.mock("../src/stripe/restClient.js", async (orig) => ({
   ...(await orig<typeof import("../src/stripe/restClient.js")>()),
   capturePaymentIntent: stripe.capture,
@@ -34,6 +34,7 @@ vi.mock("../src/stripe/restClient.js", async (orig) => ({
   chargeSavedCard: stripe.charge,
   retrievePaymentIntent: stripe.retrieve,
   detachPaymentMethod: stripe.detach,
+  listPaymentIntents: stripe.list,
 }));
 const pdf = vi.hoisted(() => ({ generate: vi.fn() }));
 vi.mock("../src/pdf/serviceClient.js", () => ({ generateArticlesOfOrganizationPdf: pdf.generate }));
@@ -134,6 +135,7 @@ beforeEach(async () => {
   stripe.cancel.mockResolvedValue({ id: "pi", status: "canceled" });
   stripe.retrieve.mockResolvedValue({ id: "pi", status: "requires_capture", customer: "cus_1", payment_method: "pm_1" });
   stripe.detach.mockResolvedValue({ id: "pm_1" });
+  stripe.list.mockResolvedValue([]);
   pdf.generate.mockReset();
   pdf.generate.mockResolvedValue({ ok: true, pdfBytes: Buffer.from("%PDF-corrected"), sha256: "def" });
   await makeSession();
@@ -340,7 +342,7 @@ describe("a rejected filing", () => {
     it("closes the order, releases the hold, detaches the card and emails 'you pay nothing'", async () => {
       const r = await op("cancel", { reason: "customer will not correct" });
       expect(r.status).toBe(200);
-      expect(stripe.cancel).toHaveBeenCalledWith(`pi_${orderId}`, `release-${orderId}`);
+      expect(stripe.cancel).toHaveBeenCalledWith(`pi_${orderId}`, `release-${orderId}-pi_${orderId}`);
       const row = await orderRow();
       expect(row.cancelled_at).toBeTruthy();
       expect(row.fulfillment_status).toBe("not_ready");
@@ -384,26 +386,31 @@ describe("the proof of filing gates", () => {
     expect(stripe.capture).not.toHaveBeenCalled();
   });
 
-  it("refuses when the customer's agent has not accepted", async () => {
+  // Florida has been paid by now, so a gap before filing is raised, not a dead end.
+  const raised = () => alerts.send.mock.calls.map((call) => String((call as unknown[])[1])).join("\n");
+
+  it("collects on a filing whose customer agent never accepted, and raises it", async () => {
     await submit();
     await state.db.query(`UPDATE filing_sessions SET filing_data = $1, registered_agent_status = 'pending'`, [JSON.stringify({ ...FILING, registered_agent_path: "customer" })]);
-    const r = await proof();
-    expect(r.json.code).toBe("registered_agent_not_accepted");
-    expect(stripe.capture).not.toHaveBeenCalled();
+    expect((await proof()).status).toBe(200);
+    expect(stripe.capture).toHaveBeenCalledTimes(1);
+    expect(raised()).toContain("registered agent has not accepted");
   });
 
-  it("refuses when the PDF is missing, even if the state says submitted", async () => {
+  it("collects on a filing with no Articles here, and raises it", async () => {
     await submit();
     await state.db.query(`DELETE FROM filing_documents`);
-    expect((await proof()).json.code).toBe("articles_pdf_missing");
-    expect(stripe.capture).not.toHaveBeenCalled();
+    expect((await proof()).status).toBe(200);
+    expect(stripe.capture).toHaveBeenCalledTimes(1);
+    expect(raised()).toContain("does not exist yet");
   });
 
-  it("does not count a pre-payment PDF", async () => {
+  it("does not count a pre-payment PDF as this order's Articles", async () => {
     await submit();
     await state.db.query(`DELETE FROM filing_documents`);
     await state.db.query(`INSERT INTO filing_documents (filing_session_id, order_id, byte_size, sha256, pdf_bytes) VALUES ($1, NULL, 4, 'abc', $2)`, [filingSessionId, Buffer.from("%PDF")]);
-    expect((await proof()).json.code).toBe("articles_pdf_missing");
+    await proof();
+    expect(raised()).toContain("does not exist yet");
   });
 
   it("delivers before it collects, when every gate passes", async () => {
@@ -450,11 +457,21 @@ describe("a failed charge after filing", () => {
     expect(subjects()).toContain("We could not charge your card");
   });
 
-  it("emails the customer on a Stripe error that is not a decline", async () => {
-    stripe.capture.mockRejectedValue(new StripeApiError("api_error", 500, {}));
+  it("emails the customer on a Stripe refusal that is not a decline", async () => {
+    stripe.capture.mockRejectedValue(new StripeApiError("invalid_request", 400, {}));
     expect((await proof()).json.customer_emailed).toBe(true);
     await runEmails(state.db, realOrderEmailSender);
     expect(subjects()).toContain("We could not charge your card");
+  });
+
+  it("does not tell anyone the card wasn't charged when Stripe gave no clear answer", async () => {
+    stripe.capture.mockRejectedValue(new StripeApiError("api_error", 500, {}));
+    expect((await proof()).json.customer_emailed).toBe(false);
+    await runEmails(state.db, realOrderEmailSender);
+    expect(subjects()).not.toContain("We could not charge your card");
+    const said = alerts.send.mock.calls.map((call) => (call as unknown[]).join(": ")).join("\n");
+    expect(said).toContain("may have been charged");
+    expect(said).not.toContain("the card was not charged");
   });
 
   it("emails on a saved-card failure that is not a 402, and when no saved card exists", async () => {
@@ -466,7 +483,7 @@ describe("a failed charge after filing", () => {
   });
 
   it("emails only once across retries", async () => {
-    stripe.capture.mockRejectedValue(new StripeApiError("api_error", 500, {}));
+    stripe.capture.mockRejectedValue(new StripeApiError("invalid_request", 400, {}));
     await proof();
     await proof();
     await runEmails(state.db, realOrderEmailSender);
@@ -493,7 +510,7 @@ describe("POST /api/orders/:id/payment-received", () => {
   const paid = (amount = 49900) => op("payment-received", { method: "wire", reference: "W-1", amount_cents: amount });
   const settle = async (status = "released") => {
     await submit();
-    await state.db.query(`UPDATE orders SET payment_status = $2, proof_of_filing_at = now(), proof_of_filing_ref = 'L26' WHERE order_id = $1`, [orderId, status]);
+    await state.db.query(`UPDATE orders SET payment_status = $2, proof_of_filing_at = now(), proof_of_filing_ref = 'L26000123456' WHERE order_id = $1`, [orderId, status]);
   };
 
   it("needs the operator key, a method and an amount", async () => {

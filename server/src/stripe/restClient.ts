@@ -16,6 +16,13 @@
 
 const STRIPE_API_BASE = "https://api.stripe.com/v1";
 
+/**
+ * Well inside the 3 minute claim on an order (payments/holdLock.ts), so a
+ * stalled call can't outlive it. A timeout says nothing about what Stripe did:
+ * callers treat it as an unknown result, never as a refusal.
+ */
+export const STRIPE_TIMEOUT_MS = 20_000;
+
 function getSecretKey(): string {
   const key = process.env.STRIPE_SECRET_KEY;
   if (!key) throw new Error("STRIPE_SECRET_KEY is not set. See .env.example.");
@@ -80,6 +87,7 @@ async function stripeRequest<T>(
       ...(method === "POST" && idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
     },
     body: method === "POST" && params ? toFormBody(params).toString() : undefined,
+    signal: AbortSignal.timeout(STRIPE_TIMEOUT_MS),
   });
 
   const body = (await res.json()) as unknown;
@@ -120,6 +128,8 @@ export interface CreateCheckoutSessionParams {
   /** Written onto the PaymentIntent so payment_intent.* webhook events
    *  map back to the order without another Stripe call. */
   paymentIntentMetadata?: Record<string, string>;
+  /** Where Stripe sends the receipt when the money is collected. */
+  receiptEmail?: string;
   /** Shown above Stripe's pay button (custom_text.submit.message). */
   submitMessage?: string;
   /** Shown below Stripe's pay button (custom_text.after_submit.message). */
@@ -170,6 +180,7 @@ export async function createCheckoutSession(params: CreateCheckoutSessionParams)
             capture_method: "manual",
             setup_future_usage: "off_session",
             metadata: params.paymentIntentMetadata,
+            ...(params.receiptEmail ? { receipt_email: params.receiptEmail } : {}),
           },
           // Extended holds (up to 30 days) are opt-in: Stripe rejected the
           // request on this account on 30 Sep 2026 ("This account is not
@@ -202,6 +213,7 @@ export interface StripePrice {
   unit_amount: number | null;
   currency: string;
   product: string;
+  livemode?: boolean;
 }
 
 /** Read-only; used by scripts/verifyPriceParity.ts. */
@@ -218,12 +230,15 @@ export interface StripePaymentIntent {
   currency: string;
   customer: string | null;
   payment_method: string | null;
+  receipt_email?: string | null;
   metadata?: Record<string, string>;
   latest_charge?:
     | string
     | {
         id: string;
         captured?: boolean;
+        /** True only once the whole charge is refunded. */
+        refunded?: boolean;
         payment_method_details?: {
           card?: {
             capture_before?: number | null;
@@ -240,6 +255,24 @@ export async function retrievePaymentIntent(paymentIntentId: string): Promise<St
   return stripeRequest<StripePaymentIntent>("GET", `/payment_intents/${encodeURIComponent(paymentIntentId)}`, {
     expand: ["latest_charge"],
   });
+}
+
+/** A Customer's PaymentIntents, newest first. Checkout makes a Customer per
+ *  order, so the first page holds all of them. Charges are expanded because a
+ *  refund shows only there. */
+export async function listPaymentIntents(customerId: string): Promise<StripePaymentIntent[]> {
+  const page = await stripeRequest<{ data: StripePaymentIntent[] }>("GET", "/payment_intents", { customer: customerId, limit: 100, expand: ["data.latest_charge"] });
+  return page.data;
+}
+
+/**
+ * A refund leaves a PaymentIntent at succeeded, so only its Charge shows the
+ * money went back. `undefined` means the Charge doesn't say, and callers
+ * must not read that as either answer.
+ */
+export function refundState(pi: Pick<StripePaymentIntent, "latest_charge">): boolean | undefined {
+  const charge = pi.latest_charge;
+  return typeof charge === "object" && charge !== null && typeof charge.refunded === "boolean" ? charge.refunded : undefined;
 }
 
 /** Collects a held payment. The idempotency key makes a repeat call
@@ -270,6 +303,44 @@ export async function cancelPaymentIntent(paymentIntentId: string, idempotencyKe
 }
 
 /**
+ * A new hold on the saved card, for an order whose hold is about to end and
+ * whose filing is not confirmed. Manual capture, so nothing is collected.
+ * The idempotency key names the hold it replaces, and the caller moves it only
+ * after a definite answer, so a retry cannot place a second one. Metadata ties
+ * the hold to its order, so one whose response was lost can be found again. The bank can refuse or ask for the customer: the caller then
+ * keeps the old hold and raises it with a person.
+ */
+export async function placeReplacementHold(params: {
+  customerId: string;
+  paymentMethodId: string;
+  amountCents: number;
+  currency: string;
+  idempotencyKey: string;
+  metadata?: Record<string, string>;
+  receiptEmail?: string | null;
+  /** What the money covers. A payment made here has no Checkout line items to say so. */
+  description?: string;
+}): Promise<StripePaymentIntent> {
+  return stripeRequest<StripePaymentIntent>(
+    "POST",
+    "/payment_intents",
+    {
+      amount: params.amountCents,
+      currency: params.currency,
+      customer: params.customerId,
+      payment_method: params.paymentMethodId,
+      capture_method: "manual",
+      off_session: true,
+      confirm: true,
+      metadata: params.metadata,
+      ...(params.description ? { description: params.description } : {}),
+      ...(params.receiptEmail ? { receipt_email: params.receiptEmail } : {}),
+    },
+    params.idempotencyKey
+  );
+}
+
+/**
  * Fallback when a hold expired before proof of filing existed: charges the
  * card saved at checkout, off-session, for the same amount. Only ever
  * called after proof of filing is recorded, so the pay-after-filing rule
@@ -282,6 +353,9 @@ export async function chargeSavedCard(params: {
   currency: string;
   idempotencyKey: string;
   metadata?: Record<string, string>;
+  receiptEmail?: string | null;
+  /** What the money covers. A payment made here has no Checkout line items to say so. */
+  description?: string;
 }): Promise<StripePaymentIntent> {
   return stripeRequest<StripePaymentIntent>(
     "POST",
@@ -294,6 +368,8 @@ export async function chargeSavedCard(params: {
       off_session: true,
       confirm: true,
       metadata: params.metadata,
+      ...(params.description ? { description: params.description } : {}),
+      ...(params.receiptEmail ? { receipt_email: params.receiptEmail } : {}),
     },
     params.idempotencyKey
   );

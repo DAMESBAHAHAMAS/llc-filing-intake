@@ -1,3 +1,4 @@
+import { hasDiyPackage } from "../offers/diyPackage.js";
 import { LATER_SERVICES_LINE, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { HOUSE_REGISTERED_AGENT } from "../pdf/types.js";
@@ -23,7 +24,9 @@ export type OrderEmailType =
   | "payment_problem"
   | "agent_action_needed"
   | "filing_rejected"
-  | "order_cancelled";
+  | "order_cancelled"
+  | "hold_replaced"
+  | "hold_replacement_failed";
 
 /** "hold": a card hold, collected after filing. "paid": collected at
  *  checkout. "collected": a hold or saved card that has since been charged. */
@@ -38,6 +41,12 @@ export interface OrderEmailExtras {
   agentProblem?: AgentProblem;
   /** Why Florida rejected the filing (filing_rejected). */
   rejectionReason?: string;
+  /** Whether the filing was already with Florida (hold_replacement_failed). */
+  filingSubmitted?: boolean;
+  /** False when no bank answered, so the notice can't say one refused (hold_replacement_failed). */
+  bankDeclined?: boolean;
+  /** The hold had already ended, and the customer agreed to a new one separately (hold_replaced). */
+  holdEnded?: boolean;
 }
 
 export const DISCLAIMER = "Damian Knowles is a Business Developer, not a law firm or attorney, and does not provide legal advice.";
@@ -70,6 +79,8 @@ interface OrderEmailContext {
   orderId: string;
   paymentMode: PaymentMode;
   sunbizFiling: boolean;
+  /** The $139 order, whose hold can be renewed. */
+  diyPackage: boolean;
   /** Any filing at all, state or federal. Registered Agent or Credentials Kit orders have none. */
   anyFiling: boolean;
   /** An EIN on a formation order, charged when it is complete. */
@@ -120,6 +131,7 @@ function buildContext(row: OrderEmailRow, paymentMode: PaymentMode): OrderEmailC
     orderId: row.order_id,
     paymentMode,
     sunbizFiling: needsSunbizFiling(lineItems),
+    diyPackage: hasDiyPackage(lineItems),
     anyFiling: requiresPayAfterFiling(lineItems),
     laterService: Number(row.deferred_cents ?? 0) > 0,
     items: lineItems.map((li) => ({
@@ -239,11 +251,13 @@ function paymentTerms(ctx: OrderEmailContext): Block[] {
   const charged = ctx.sunbizFiling
     ? `We charge ${whatIsCharged} only after the Florida Division of Corporations confirms that your LLC has been filed, and we send you your filing confirmation.`
     : "We charge your card only after your filing is complete. We email you when it is.";
-  const lapse = ctx.sunbizFiling
-    ? `Holds last about 7 days. If your hold ends before Florida confirms your filing, we charge the card you authorized at checkout once, for ${whatIsCharged}, after Florida confirms it.`
-    : "Holds last about 7 days. If your hold ends before your filing is complete, we charge the card you authorized at checkout once, for the order total, after it is complete.";
+  const lapse = ctx.diyPackage
+    ? `Holds last about 7 days. If your hold is about to end before Florida confirms your filing, we may place a new temporary hold on the same card for the same amount, and we will email you when we do. If no hold is in place when Florida confirms your filing, we charge the card you authorized at checkout once, for ${whatIsCharged}.`
+    : ctx.sunbizFiling
+      ? `Holds last about 7 days. If your hold ends before Florida confirms your filing, we charge the card you authorized at checkout once, for ${whatIsCharged}, after Florida confirms it.`
+      : "Holds last about 7 days. If your hold ends before your filing is complete, we charge the card you authorized at checkout once, for the order total, after it is complete.";
   return [
-    p(`We placed a hold of ${total} on your card. A hold is not a charge: the amount is reserved, not collected.`),
+    p(`We placed a hold of ${total} on your card. A hold is not a charge: the amount is reserved, not collected. Until it is charged or released, it can reduce the balance or credit available on your card.`),
     p(charged),
     p(lapse),
     ...later,
@@ -399,6 +413,43 @@ function orderCancelled(ctx: OrderEmailContext): RenderedEmail {
   ]);
 }
 
+function holdReplaced(ctx: OrderEmailContext, extras: OrderEmailExtras): RenderedEmail {
+  const body = extras.holdEnded
+    ? [
+        p(`Your card hold had ended before Florida confirmed your filing. As you agreed with us, we placed a new temporary hold of ${money(ctx.totalCents)} on the same card.`),
+        p("A hold is not a charge. It can reduce the balance or credit available on your card. You pay only once, after Florida confirms your filing."),
+      ]
+    : [
+        p(`Your card hold was about to end before Florida confirmed your filing. As you authorized at checkout, we placed a new temporary hold of ${money(ctx.totalCents)} on the same card and are releasing the old one.`),
+        p("A hold is not a charge. Your bank may show both holds as pending for a few days until the old one clears. It can reduce the balance or credit available on your card. You pay only once, after Florida confirms your filing."),
+      ];
+  return render("We renewed the temporary hold on your card", [
+    greeting(ctx),
+    ...body,
+    rows([["Order number", ctx.orderId]]),
+    p(REPLY_LINE),
+  ]);
+}
+
+function holdReplacementFailed(ctx: OrderEmailContext, extras: OrderEmailExtras): RenderedEmail {
+  const next = extras.filingSubmitted
+    ? [
+        p("You have not been charged, and your filing is with Florida, so you don't need to do anything to keep it moving."),
+        p(`If no hold is in place when Florida confirms your filing, we charge the card you authorized at checkout once, for ${money(ctx.totalCents)}. If that card has changed, reply to this email.`),
+      ]
+    : [
+        p("You have not been charged. We can't send your filing to Florida until a valid hold is in place, so your filing is waiting."),
+        p("Reply to this email and we'll try the same card again. To use a different card, cancel this order and place a new one. If you cancel, you pay nothing."),
+      ];
+  return render("We could not renew the hold on your card", [
+    greeting(ctx),
+    p(extras.bankDeclined === false ? "The temporary hold on your card is ending, and we could not place a new one." : "The temporary hold on your card is ending, and your bank did not approve a new one."),
+    ...next,
+    rows([["Order number", ctx.orderId]]),
+    p(REPLY_LINE),
+  ]);
+}
+
 export function buildOrderEmail(type: OrderEmailType, row: OrderEmailRow, paymentMode: PaymentMode, extras: OrderEmailExtras = {}): RenderedEmail {
   const ctx = buildContext(row, paymentMode);
   switch (type) {
@@ -418,5 +469,9 @@ export function buildOrderEmail(type: OrderEmailType, row: OrderEmailRow, paymen
       return filingRejected(ctx, extras);
     case "order_cancelled":
       return orderCancelled(ctx);
+    case "hold_replaced":
+      return holdReplaced(ctx, extras);
+    case "hold_replacement_failed":
+      return holdReplacementFailed(ctx, extras);
   }
 }

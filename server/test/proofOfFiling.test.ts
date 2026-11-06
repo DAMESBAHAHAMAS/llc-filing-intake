@@ -109,7 +109,7 @@ describe("POST /api/orders/:orderId/proof-of-filing", () => {
     const r = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
     expect(r.status).toBe(200);
     expect(r.json.status).toBe("collection_requested");
-    expect(stripe.capture).toHaveBeenCalledWith("pi_hold", "capture-ord-1");
+    expect(stripe.capture).toHaveBeenCalledWith("pi_hold", "capture-ord-1-pi_hold");
     expect(stripe.charge).not.toHaveBeenCalled();
     // Proof is written before any money moves.
     expect(db.queries.find((q) => /^\s*UPDATE/.test(q))).toMatch(/proof_of_filing_ref/);
@@ -259,7 +259,7 @@ describe("services charged when complete (EIN with a formation order)", () => {
     stripe.capture.mockResolvedValue({ id: "pi_hold", status: "succeeded" });
     const r = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
     expect(r.status).toBe(200);
-    expect(stripe.capture).toHaveBeenCalledWith("pi_hold", "capture-ord-1", 49900);
+    expect(stripe.capture).toHaveBeenCalledWith("pi_hold", "capture-ord-1-pi_hold", 49900);
     expect(r.json.collected_cents).toBe(49900);
     expect(r.json.deferred_cents).toBe(29900);
   });
@@ -343,9 +343,10 @@ describe("a saved card that fails after filing", () => {
     stripe.charge.mockRejectedValue(new Error("socket hang up"));
     expect((await fileProof()).status).toBe(502);
     expect(db.queries.some((q) => /saved_card_attempts \+ 1/.test(q))).toBe(false);
-    // The promise holds whatever Stripe answered, so the customer still hears.
-    expect(db.queries.some((q) => /INSERT INTO crm_sync_queue/.test(q))).toBe(true);
-    expect(delivery.alert).toHaveBeenCalledWith("Payment could not be collected", expect.any(String));
+    // The charge may have gone through, so the customer is not asked to pay
+    // another way until the retry below settles it.
+    expect(db.queries.some((q) => /INSERT INTO crm_sync_queue/.test(q))).toBe(false);
+    expect(delivery.alert).toHaveBeenCalledWith("Payment result unknown", expect.any(String));
     await fileProof();
     expect(stripe.charge.mock.calls.map(([params]) => params.idempotencyKey)).toEqual(["fallback-ord-1-1", "fallback-ord-1-1"]);
   });
@@ -379,7 +380,7 @@ describe("POST /api/orders/:orderId/cancel", () => {
     stripe.cancel.mockResolvedValue({ id: "pi_hold", status: "canceled" });
     const r = await cancel();
     expect(r.json).toMatchObject({ status: "cancelled" });
-    expect(stripe.cancel).toHaveBeenCalledWith("pi_hold", "release-ord-1");
+    expect(stripe.cancel).toHaveBeenCalledWith("pi_hold", "release-ord-1-pi_hold");
     const sql = db.queries.join("\n");
     expect(sql).toMatch(/cancelled_at = now\(\)/);
     expect(sql).toMatch(/fulfillment_status = 'not_ready'/);
@@ -433,8 +434,16 @@ describe("POST /api/orders/:orderId/cancel", () => {
 describe("POST /api/orders/:orderId/release-hold", () => {
   it("cancels a hold", async () => {
     stripe.cancel.mockResolvedValue({ id: "pi_hold", status: "canceled" });
+    db.order = { ...db.order, fulfillment_status: "requires_review" };
     const r = await post("/api/orders/ord-1/release-hold", {});
     expect(r.status).toBe(200);
-    expect(stripe.cancel).toHaveBeenCalledWith("pi_hold", "release-ord-1");
+    expect(stripe.cancel).toHaveBeenCalledWith("pi_hold", "release-ord-1-pi_hold");
+  });
+
+  it("keeps the hold behind a filing Florida has been paid for", async () => {
+    const r = await post("/api/orders/ord-1/release-hold", {});
+    expect(r.status).toBe(409);
+    expect(r.json.code).toBe("filing_submitted");
+    expect(stripe.cancel).not.toHaveBeenCalled();
   });
 });

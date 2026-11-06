@@ -57,6 +57,15 @@ describe("deliverProofToCustomer", () => {
     expect(writes[0].params).toEqual(["ord-1", "msg_1"]);
   });
 
+  it("treats a send that takes too long as not delivered, and keeps the key for the retry", async () => {
+    const { pool, writes } = fakePool(row);
+    const stalled: OrderEmailSender = { send: () => new Promise(() => undefined) };
+    const result = await deliverProofToCustomer(pool, "ord-1", stalled, 5);
+    expect(result.ok).toBe(false);
+    expect(writes.some((w) => /proof_delivered_at = now\(\)/.test(w.sql))).toBe(false);
+    expect(writes.some((w) => /proof_delivery_error/.test(w.sql))).toBe(true);
+  });
+
   it("does not send twice", async () => {
     const { pool, writes } = fakePool({ ...row, proof_delivered_at: new Date() });
     const { sender, sent } = recordingSender();

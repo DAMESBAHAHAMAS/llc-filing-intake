@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createCheckoutSession, retrieveCheckoutSession, StripeApiError } from "../src/stripe/restClient.js";
+import { capturePaymentIntent, createCheckoutSession, listPaymentIntents, retrieveCheckoutSession, retrievePaymentIntent, STRIPE_TIMEOUT_MS, StripeApiError } from "../src/stripe/restClient.js";
 
 /**
  * Proves the hand-rolled Stripe REST client (no `stripe` SDK — see
@@ -101,5 +101,51 @@ describe("retrieveCheckoutSession", () => {
     expect(result.payment_status).toBe("paid");
     expect(capturedUrl).toBe("https://api.stripe.com/v1/checkout/sessions/cs_test_123");
     expect(capturedMethod).toBe("GET");
+  });
+});
+
+describe("every Stripe call", () => {
+  const answering = (body: unknown) => vi.fn(async () => new Response(JSON.stringify(body), { status: 200 })) as unknown as typeof fetch;
+
+  it("gives up well inside the 3 minute claim on an order", async () => {
+    process.env.STRIPE_SECRET_KEY = "sk_test_fake";
+    expect(STRIPE_TIMEOUT_MS).toBeLessThanOrEqual(20_000);
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    global.fetch = answering({ id: "pi_1", data: [] });
+    await retrievePaymentIntent("pi_1");
+    await capturePaymentIntent("pi_1", "key");
+    await listPaymentIntents("cus_1");
+    expect(timeout).toHaveBeenCalledTimes(3);
+    expect(timeout).toHaveBeenCalledWith(STRIPE_TIMEOUT_MS);
+    for (const [, init] of (global.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls) {
+      expect((init as RequestInit).signal).toBeInstanceOf(AbortSignal);
+    }
+    timeout.mockRestore();
+  });
+
+  it("rejects when Stripe stalls, and says nothing Stripe said", async () => {
+    process.env.STRIPE_SECRET_KEY = "sk_test_fake";
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => AbortSignal.abort(new DOMException("timed out", "TimeoutError")));
+    global.fetch = vi.fn((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
+      if (init?.signal?.aborted) reject(init.signal.reason);
+    })) as unknown as typeof fetch;
+    const failure = await capturePaymentIntent("pi_1", "key").catch((err) => err);
+    expect(failure).not.toBeInstanceOf(StripeApiError);
+    expect((failure as Error).name).toBe("TimeoutError");
+    timeout.mockRestore();
+  });
+});
+
+describe("listPaymentIntents", () => {
+  it("asks for one customer's PaymentIntents", async () => {
+    process.env.STRIPE_SECRET_KEY = "sk_test_fake";
+    let capturedUrl = "";
+    global.fetch = vi.fn(async (url: string) => {
+      capturedUrl = url;
+      return new Response(JSON.stringify({ data: [{ id: "pi_1", status: "requires_capture", metadata: { order_id: "o" } }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const found = await listPaymentIntents("cus_1");
+    expect(capturedUrl).toBe("https://api.stripe.com/v1/payment_intents?customer=cus_1&limit=100&expand%5B0%5D=data.latest_charge");
+    expect(found.map((pi) => pi.id)).toEqual(["pi_1"]);
   });
 });

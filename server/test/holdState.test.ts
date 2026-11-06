@@ -49,7 +49,7 @@ describe("fulfillmentAfterPaymentEnds", () => {
 describe("ordersNeedingExpiryFlag", () => {
   const now = new Date("2026-10-01T12:00:00Z");
   const h = (hours: number) => new Date(now.getTime() + hours * 3600_000);
-  it("flags holds within 48h with no proof and no earlier flag", () => {
+  it("flags holds within 48h with no earlier flag, even after proof: that money isn't collected yet", () => {
     const flagged = ordersNeedingExpiryFlag(
       [
         { order_id: "soon", capture_before: h(24), proof_of_filing_at: null, hold_expiry_flagged_at: null },
@@ -61,7 +61,7 @@ describe("ordersNeedingExpiryFlag", () => {
       ],
       now
     );
-    expect(flagged).toEqual(["soon", "past"]);
+    expect(flagged).toEqual(["soon", "filed", "past"]);
   });
 });
 

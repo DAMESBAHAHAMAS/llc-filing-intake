@@ -1,12 +1,13 @@
 import { Router } from "express";
 import { closedCodesIn } from "../offers/closedOffers.js";
+import { DIY_PACKAGE_BREAKDOWN, DIY_PACKAGE_OFFER_CODE } from "../offers/diyPackage.js";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { resolveActiveOffers } from "../offers/catalog.js";
 import { createCheckoutSession, expireCheckoutSession, retrieveCheckoutSession, StripeApiError } from "../stripe/restClient.js";
 import { getEinExpressAvailability } from "../ein/capacity.js";
 import { houseAgentLineMissing } from "../offers/houseAgentRule.js";
-import { deferredServiceCents, holdCheckoutText, holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
+import { deferredServiceCents, holdCheckoutText, holdsEnabled, immediateChargeForbidden, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { articlesBlockers } from "../pdf/context.js";
 import type { FilingSessionRecord } from "../pdf/types.js";
@@ -134,6 +135,19 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
       return;
     }
 
+    if ((session.rows[0].filing_data as { live_test?: unknown } | null)?.live_test === true) {
+      res.status(409).json({ error: "this session belongs to an internal test", code: "live_test_session" });
+      return;
+    }
+
+    // One filing is one LLC: the Stripe text says "Your $139". A repeated line
+    // is a quantity of two by another name.
+    const filingCodes = requestedItems.filter((i) => needsSunbizFiling([i])).map((i) => i.offer_code);
+    if (needsSunbizFiling(requestedItems) && (requestedItems.some((i) => i.quantity !== 1) || new Set(filingCodes).size !== filingCodes.length)) {
+      res.status(422).json({ error: "a filing offer is sold one at a time", code: "quantity_not_allowed" });
+      return;
+    }
+
     const uniqueCodes = [...new Set(requestedItems.map((i) => i.offer_code))];
 
     // An LLC filing order needs the customer's authorization to file and
@@ -229,11 +243,17 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         stripe_price_id: offer.stripe_price_id,
         unit_amount_cents: offer.unit_amount_cents,
         quantity: item.quantity,
+        ...(offer.offer_code === DIY_PACKAGE_OFFER_CODE ? { breakdown: DIY_PACKAGE_BREAKDOWN } : {}),
       };
     });
 
     const totalCents = lineItemSnapshots.reduce((sum, li) => sum + li.unit_amount_cents * li.quantity, 0);
     const primaryOffer = resolvedByCode.get(requestedItems[0].offer_code)!;
+
+    if (immediateChargeForbidden(lineItemSnapshots)) {
+      res.status(503).json({ error: "checkout is closed: filing orders must use a card hold", code: "hold_required" });
+      return;
+    }
 
     // Pay-after-filing: filing orders place a card hold that is collected
     // only when proof of filing is recorded (routes/orders.ts).
@@ -285,6 +305,7 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         // Stripe Checkout would have landed on the 404 page.
         cancelUrl: `${frontendBaseUrl}/checkout/cancel?filing_session_id=${encodeURIComponent(filingSessionId)}&order_id=${encodeURIComponent(orderId)}`,
         customerEmail: session.rows[0].email ?? undefined,
+        receiptEmail: session.rows[0].email ?? undefined,
         // Carries a session's existing Deal id, if it has one
         // (filing_sessions.crm_deal_id, see routes/session.ts's
         // POST /api/session/stage), through to the webhook, so it can

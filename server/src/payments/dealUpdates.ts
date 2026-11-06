@@ -12,6 +12,11 @@ export async function enqueueDealUpdate(
   update: { target_stage: string; extra_fields: Record<string, unknown> }
 ): Promise<boolean> {
   if (!order.crm_deal_id) return false;
+  // A Stripe test-mode order never reaches the CRM. An older one can still carry a Deal.
+  if (process.env.TEST_MODE_ORDERS_FILE !== "true") {
+    const mode = await client.query(`SELECT stripe_livemode FROM orders WHERE order_id = $1`, [order.order_id]);
+    if (mode.rows[0]?.stripe_livemode === false) return false;
+  }
   const own = await client.query(
     `SELECT 1 FROM crm_sync_queue WHERE order_id = $1 AND sync_type = 'order_deal' AND status = 'synced' LIMIT 1`,
     [order.order_id]
