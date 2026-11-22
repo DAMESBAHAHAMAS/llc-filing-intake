@@ -6,6 +6,8 @@ import { resolveActiveOffers } from "../offers/catalog.js";
 import { createCheckoutSession, StripeApiError } from "../stripe/restClient.js";
 import { getEinExpressAvailability } from "../ein/capacity.js";
 import { houseAgentLineMissing } from "../offers/houseAgentRule.js";
+import { einLineIssue } from "../offers/einBundleRule.js";
+import { getEinUpsell, orderedOfferCodes } from "../offers/einUpsell.js";
 import { holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 
 export const checkoutRouter = Router();
@@ -108,6 +110,16 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         });
         return;
       }
+    }
+    // EIN billing rule (2026-11-22): the EIN is an add-on to File It only. Bank-Ready
+    // and Premium include it, so selling it again would charge the customer twice.
+    const einIssue = einLineIssue(uniqueCodes, await orderedOfferCodes(pool, filingSessionId));
+    if (einIssue) {
+      res.status(422).json({
+        error: "EIN is already included in this order or a previous one; it cannot be purchased again",
+        reason: einIssue,
+      });
+      return;
     }
     const resolved = await resolveActiveOffers(pool, uniqueCodes);
     const resolvedByCode = new Map(resolved.map((o) => [o.offer_code, o]));
@@ -224,7 +236,15 @@ checkoutRouter.get("/api/checkout/order/:orderId", async (req, res) => {
       res.status(404).json({ error: "order not found" });
       return;
     }
-    res.status(200).json(rows[0]);
+    // The post-payment EIN upsell is decided here, not in the browser. A failure to work it
+    // out must never break payment confirmation, so it degrades to no offer.
+    let einUpsell = null;
+    try {
+      einUpsell = await getEinUpsell(pool, rows[0]);
+    } catch (upsellErr) {
+      console.error("[checkout] EIN upsell eligibility failed:", describeError(upsellErr));
+    }
+    res.status(200).json({ ...rows[0], ein_upsell: einUpsell });
   } catch (err) {
     res.status(500).json({ error: "order lookup failed", detail: describeError(err) });
   }
