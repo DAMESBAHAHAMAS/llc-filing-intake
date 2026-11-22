@@ -17,7 +17,7 @@ import { retrievePrice } from "../stripe/restClient.js";
 export const DECIDED_TOTALS_CENTS = {
   DIY: 13_900,
   FASTTRACK: 49_900,
-  PREMIUM: 99_900,
+  PREMIUM: 99_700,
   REGISTERED_AGENT_3YR: 9_800,
   EIN_FILING: 29_900,
   CREDENTIALS_KIT: 8_900,
