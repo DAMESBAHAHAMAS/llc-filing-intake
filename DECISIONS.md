@@ -1092,3 +1092,30 @@ add-on); the EIN and Credentials Kit exclusions are gone.
 
 **Supersedes:** the FASTTRACK and PREMIUM amounts and inclusions in
 "2026-09-17 — Package pricing" (Premium $999 → $997).
+
+---
+
+## 2026-11-22 — The EIN is an add-on to File It only; the server decides the post-payment EIN upsell
+
+**Decision (Damian, chat 2026-11-22):** the $299 EIN add-on is offered to File It
+(DIY) customers only, because Bank-Ready and Premium already include it. File It
+buyers who skipped it before checkout get a one-click offer on `/checkout/success`.
+
+**Implementation:**
+- `offers/einBundleRule.ts` is the double-charge guard. `POST /api/checkout/create` now
+  refuses (422, with a `reason`) an EIN in a cart with Bank-Ready/Premium, two different
+  EIN offers in one cart, or an EIN on a session that already has a paid or held
+  Bank-Ready/Premium/EIN order. Only `authorized` and `paid` orders count, so abandoned,
+  failed, released or refunded orders never block a customer.
+- `GET /api/checkout/order/:orderId` now returns `ein_upsell`: `null`, or the catalog
+  offer (`offer_code`, `display_name`, `unit_amount_cents`, `currency`; never a Stripe
+  id). The server decides eligibility, and the price comes from the Offer Master.
+  A failure computing it degrades to `null`; it never breaks payment confirmation.
+- The upsell is a normal `POST /api/checkout/create` for `EIN_FILING` against the same
+  filing session, so it follows the existing pay-after-filing hold (`payAfterFiling.ts`).
+
+**Not decided here:** the SS-4 Third-Party Designee authorization the customer must give
+so the team can file on their behalf. The upsell page states the compliance copy rule but
+does not collect that consent; it needs counsel-approved wording and a place to record it.
+
+**Supersedes:** —
