@@ -1058,3 +1058,37 @@ widget created in Damian's Cloudflare account and the frontend sending
 its token, released together; the secret alone would block every customer.
 
 **Supersedes:** —
+
+---
+
+## 2026-11-22 — Bank-Ready is $499 all-inclusive; Premium is $997; every tier includes the $125 state fee
+
+**Decision (Damian, chat 2026-11-22):** all three tiers are flat, out-the-door prices
+and the $125 Florida state filing fee is already included in each.
+- **File It (DIY) $139** — $125 state fee + $5 Certificate of Status + $9 service fee.
+  Does not include EIN, Operating Agreement or the Credentials Kit. Unchanged.
+- **Bank-Ready $499** — explicitly includes the state fee, Federal EIN registration,
+  Custom Operating Agreement & Banking Resolution, Florida commercial mailing
+  address and the hardbound Company Credentials Kit. Replaces FastTrack's
+  exclusions of EIN and the Kit.
+- **Premium $997** (was $999) — consultation-first; closed to direct checkout.
+
+**Implementation:** migration `0029_offer_master_bank_ready_premium_997` adds
+`FASTTRACK` v2 (display name Bank-Ready) and `PREMIUM` v2, retiring the v1 rows.
+The internal code `FASTTRACK` is kept (CRM intent, `sunbizFiling.ts`,
+`zoho/client.ts`). New Stripe objects, test mode only: product
+`prod_Vg1H8gZwPtJBWj` with price `price_1UefEhDo01bXdbWSei7ja3gV` ($499), and price
+`price_1UefElDo01bXdbWSTnb5H2yX` ($997) on the existing Premium product.
+
+**Drift found:** the PREMIUM v1 Stripe Price (`price_1U8agA…`) was $1,499 while this
+table said $999. Stripe charges, so it would have billed $1,499 if Premium had ever
+been opened. `npm run verify:prices` would have caught it; run it after every
+offers or Stripe price change. Every other active offer matched its Stripe price.
+
+**Follow-on rules:** EIN is offered as an add-on to File It only. Bank-Ready and
+Premium already include it, so offering it again would double-charge. The
+Bank-Ready exclusion list now holds only the registered-agent line (a separate
+add-on); the EIN and Credentials Kit exclusions are gone.
+
+**Supersedes:** the FASTTRACK and PREMIUM amounts and inclusions in
+"2026-09-17 — Package pricing" (Premium $999 → $997).
