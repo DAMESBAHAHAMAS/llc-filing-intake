@@ -1,5 +1,6 @@
 import hmac
 import os
+import re
 
 from flask import Flask, Response, jsonify, request
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, TemplateNotFound, UndefinedError
@@ -43,6 +44,11 @@ def _is_authorized(req) -> bool:
     return hmac.compare_digest(supplied, _PDF_SERVICE_API_KEY)
 
 
+# Sunbiz Fax Audit Number (see server/src/pdf/faxAudit.ts, which validates first). It is printed
+# inside a CSS string in the template, so it is checked again here against the same pattern.
+_FAX_AUDIT_NUMBER = re.compile(r"[A-Z][0-9]{11} [0-9]")
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
@@ -62,6 +68,12 @@ def generate_pdf():
 
     if not template_name:
         return jsonify({"error": "'template' is required"}), 400
+
+    fax_audit_number = context.get("fax_audit_number")
+    if fax_audit_number not in (None, "") and not (
+        isinstance(fax_audit_number, str) and _FAX_AUDIT_NUMBER.fullmatch(fax_audit_number)
+    ):
+        return jsonify({"error": "fax_audit_number must be a letter, eleven digits, a space and a check digit"}), 422
 
     try:
         template = jinja_env.get_template(f"{template_name}.html.j2")

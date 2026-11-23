@@ -42,8 +42,15 @@
   }
 
   @page {
-    size: 210mm 297mm;
+    /* US Letter, the size Florida accepts by fax. Owner decision 23 Nov 2026 (was A4). */
+    size: 8.5in 11in;
     margin: 25mm 20mm 20mm 20mm;
+    {% if fax_audit_number is defined and fax_audit_number %}
+    /* Sunbiz fax filings: the Fax Audit Number goes on the top and bottom of every page.
+       render_pdf.py validates the value before it reaches this CSS string. */
+    @top-center { content: "(((" "{{ fax_audit_number }}" ")))"; font-family: "DM Mono", monospace; font-size: 11pt; }
+    @bottom-center { content: "(((" "{{ fax_audit_number }}" ")))"; font-family: "DM Mono", monospace; font-size: 11pt; }
+    {% endif %}
   }
 
   * {

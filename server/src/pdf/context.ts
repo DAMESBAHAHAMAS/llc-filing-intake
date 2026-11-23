@@ -1,3 +1,4 @@
+import { isValidFaxAuditNumber } from "./faxAudit.js";
 import { HOUSE_REGISTERED_AGENT, type FilingSessionRecord } from "./types.js";
 
 export type PdfContextResult =
@@ -30,9 +31,15 @@ function isNonEmptyString(v: unknown): v is string {
  */
 export function buildPdfContext(
   filingData: Partial<FilingSessionRecord>,
-  registeredAgentAcceptanceStatus: string | null
+  registeredAgentAcceptanceStatus: string | null,
+  /** Fax filings only: the Sunbiz Fax Audit Number, printed top and bottom of every page. */
+  options: { faxAuditNumber?: string } = {}
 ): PdfContextResult {
   const missing: string[] = [];
+
+  if (options.faxAuditNumber !== undefined && !isValidFaxAuditNumber(options.faxAuditNumber)) {
+    missing.push("faxAuditNumber (a letter, eleven digits, a space and a check digit, as on the Sunbiz cover sheet)");
+  }
 
   if (!isNonEmptyString(filingData.llc_name)) missing.push("llc_name");
   if (!isNonEmptyString(filingData.principal_address)) missing.push("principal_address");
@@ -97,6 +104,7 @@ export function buildPdfContext(
       effective_date: filingData.effective_date ?? "",
       annual_report_due_date: filingData.annual_report_due_date ?? "",
       other_provisions: filingData.other_provisions ?? "",
+      ...(options.faxAuditNumber ? { fax_audit_number: options.faxAuditNumber } : {}),
     },
   };
 }
