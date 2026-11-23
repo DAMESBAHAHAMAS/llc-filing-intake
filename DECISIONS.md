@@ -1061,3 +1061,9 @@ before customer delivery.
 
 **Supersedes:** the wording source and banner text in the 2026-10-01
 Operating Agreement entry.
+
+## 2026-11-23 — Bank-Ready ($499) formation packages include the Operating Agreement
+
+**Rationale:** The Offer Master (migration 0029) and /pricing sell Bank-Ready with a custom Operating Agreement and Banking Resolution, but the formation package builder added an Operating Agreement only for Premium, so a Bank-Ready cover letter would have omitted a document the customer paid for. Found while rendering the Appendix C specimen package on 22 Nov 2026; Damian decided the fix on 23 Nov 2026. `includesOperatingAgreement` is now true for `fasttrack` and `premium`; File It (`diy`) still carries none. `orderPackageParts` refuses a Bank-Ready package without the agreement.
+
+**Supersedes:** The "Premium only" rule in the formation package header comment and `includesOperatingAgreement` (same file, earlier revision). No earlier DECISIONS entry.
