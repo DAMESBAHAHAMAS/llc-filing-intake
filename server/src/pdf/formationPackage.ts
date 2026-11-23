@@ -9,7 +9,7 @@ import { formatLegalDate, type FiledArticles } from "./operatingAgreementContext
  *   1. Cover letter            (rendered: formation_cover_letter)
  *   2. Articles of Organization (the PDF already generated for filing)
  *   3. State filing confirmation (the document received from Sunbiz)
- *   4. Operating Agreement      (rendered, Premium only)
+ *   4. Operating Agreement      (rendered, Bank-Ready and Premium)
  *   5. Next steps               (rendered: formation_next_steps)
  *
  * Same rules as the other documents: a missing value is a named gap,
@@ -43,8 +43,13 @@ export function formatUsd(cents: number): string {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(cents / 100);
 }
 
+/**
+ * Bank-Ready ("fasttrack" in the Offer Master) is sold with a custom Operating
+ * Agreement and Banking Resolution, and Premium includes one too. Only the $139
+ * File It package does not. The Offer Master and /pricing say so; this must match.
+ */
 export function includesOperatingAgreement(tier: PackageTier): boolean {
-  return tier === "premium";
+  return tier === "premium" || tier === "fasttrack";
 }
 
 export function buildCoverLetterContext(
@@ -131,7 +136,7 @@ export interface FormationPackageParts {
 
 /**
  * Puts the parts in package order and refuses an incomplete package:
- * Premium needs the Operating Agreement, the others must not carry one.
+ * Bank-Ready and Premium need the Operating Agreement; File It must not carry one.
  */
 export function orderPackageParts(
   tier: PackageTier,
@@ -142,7 +147,7 @@ export function orderPackageParts(
   if (!parts.articles) missing.push("articles");
   if (!parts.filingConfirmation) missing.push("filingConfirmation (the state's filing confirmation)");
   if (!parts.nextSteps) missing.push("nextSteps");
-  if (includesOperatingAgreement(tier) && !parts.operatingAgreement) missing.push("operatingAgreement (Premium)");
+  if (includesOperatingAgreement(tier) && !parts.operatingAgreement) missing.push("operatingAgreement (Bank-Ready or Premium)");
   if (!includesOperatingAgreement(tier) && parts.operatingAgreement) {
     missing.push(`operatingAgreement given for a ${tier} order, which doesn't include one`);
   }

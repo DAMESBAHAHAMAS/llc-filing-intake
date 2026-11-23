@@ -58,9 +58,14 @@ describe("buildCoverLetterContext", () => {
     );
   });
 
-  it("only promises an Operating Agreement on Premium", () => {
+  it("does not promise an Operating Agreement on File It", () => {
     const r = buildCoverLetterContext(filing, filed, { ...order, package: "diy", order_total_cents: 13900 });
     expect(r.ok && r.context.includes_operating_agreement).toBe(false);
+  });
+
+  it("promises the Operating Agreement on Bank-Ready, which is sold with one", () => {
+    const r = buildCoverLetterContext(filing, filed, { ...order, package: "fasttrack", order_total_cents: 49900 });
+    expect(r.ok && r.context.includes_operating_agreement).toBe(true);
   });
 
   it("uses the chosen effective date when it wasn't the filing date", () => {
@@ -77,8 +82,10 @@ describe("buildCoverLetterContext", () => {
 describe("buildNextStepsContext", () => {
   it("reflects the package and the EIN order", () => {
     const r = buildNextStepsContext({ package: "fasttrack", ein_ordered: false });
-    expect(r.ok && r.context.includes_operating_agreement).toBe(false);
+    expect(r.ok && r.context.includes_operating_agreement).toBe(true);
     expect(r.ok && r.context.ein_ordered).toBe(false);
+    const diy = buildNextStepsContext({ package: "diy", ein_ordered: true });
+    expect(diy.ok && diy.context.includes_operating_agreement).toBe(false);
   });
 });
 
@@ -96,10 +103,19 @@ describe("orderPackageParts", () => {
     expect(r.ok && r.parts.map(String)).toEqual(["1", "2", "3", "4", "5"]);
   });
 
+  it("orders a Bank-Ready package with its Operating Agreement, and refuses one without", () => {
+    const parts = { coverLetter: b("1"), articles: b("2"), filingConfirmation: b("3"), nextSteps: b("5") };
+    const ok = orderPackageParts("fasttrack", { ...parts, operatingAgreement: b("4") });
+    expect(ok.ok && ok.parts.map(String)).toEqual(["1", "2", "3", "4", "5"]);
+    const missing = orderPackageParts("fasttrack", parts);
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) expect(missing.missingFields).toContain("operatingAgreement (Bank-Ready or Premium)");
+  });
+
   it("refuses a Premium package without the Operating Agreement", () => {
     const r = orderPackageParts("premium", { coverLetter: b("1"), articles: b("2"), filingConfirmation: b("3"), nextSteps: b("5") });
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.missingFields).toContain("operatingAgreement (Premium)");
+    if (!r.ok) expect(r.missingFields).toContain("operatingAgreement (Bank-Ready or Premium)");
   });
 
   it("refuses an Operating Agreement on a package that doesn't include one", () => {
@@ -114,7 +130,7 @@ describe("orderPackageParts", () => {
   });
 
   it("refuses a package without the state's filing confirmation", () => {
-    const r = orderPackageParts("fasttrack", { coverLetter: b("1"), articles: b("2"), nextSteps: b("5") });
+    const r = orderPackageParts("diy", { coverLetter: b("1"), articles: b("2"), nextSteps: b("5") });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.missingFields).toContain("filingConfirmation (the state's filing confirmation)");
   });
