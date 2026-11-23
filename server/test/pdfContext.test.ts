@@ -96,4 +96,21 @@ describe("buildPdfContext", () => {
     const result = buildPdfContext(future, null);
     expect(result.ok).toBe(true);
   });
+
+  describe("Sunbiz Fax Audit Number", () => {
+    it("adds fax_audit_number to the context only when one is given", () => {
+      const plain = buildPdfContext(validHouseRaRecord, null);
+      expect(plain.ok && "fax_audit_number" in plain.context).toBe(false);
+      const stamped = buildPdfContext(validHouseRaRecord, null, { faxAuditNumber: "H26000099999 3" });
+      expect(stamped.ok && stamped.context.fax_audit_number).toBe("H26000099999 3");
+    });
+
+    it("refuses a malformed number rather than putting it in a CSS string", () => {
+      for (const bad of ['H26000099999 3")}', "h26000099999 3", "H2600009999 3", "H26000099999", "", " H26000099999 3"]) {
+        const r = buildPdfContext(validHouseRaRecord, null, { faxAuditNumber: bad });
+        expect(r.ok, bad).toBe(false);
+        if (!r.ok) expect(r.missingFields.join()).toContain("faxAuditNumber");
+      }
+    });
+  });
 });

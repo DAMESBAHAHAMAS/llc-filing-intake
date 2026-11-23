@@ -1119,3 +1119,9 @@ so the team can file on their behalf. The upsell page states the compliance copy
 does not collect that consent; it needs counsel-approved wording and a place to record it.
 
 **Supersedes:** —
+
+## 2026-11-23 — Articles of Organization print on US Letter, with an optional Sunbiz Fax Audit Number in the margins
+
+**Rationale:** The Articles template was A4 (210 x 297 mm); Florida's fax filing uses US Letter, so Damian decided on 23 Nov 2026 to print it at 8.5 x 11 in. Sunbiz's electronic filing cover sheet instructs the filer to type the Fax Audit Number on the top and bottom of all pages, so the template now prints `(((<number>)))` in the top and bottom margin of every page when a `fax_audit_number` is in the context. The number exists only after the portal creates the filing, so the Articles are rendered a second time with it. It is validated in `server/src/pdf/faxAudit.ts` and again in `render_pdf.py` (letter, eleven digits, space, check digit) because it lands inside a CSS string. Nothing sends a fax yet; fax transmission (Telnyx) is a separate, unbuilt step.
+
+**Supersedes:** The A4 `@page` size in `templates/articles_of_organization.html.j2`. No earlier DECISIONS entry.
