@@ -363,7 +363,7 @@ export const realZohoClient: ZohoClient = {
         { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
       );
       if (dealRes.status === 401) {
-        return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal ownership lookup" };
+        return { ok: false, httpStatus: 401, error: `Zoho returned 401 on Deal ownership lookup: ${await zohoErrorDetail(dealRes)}` };
       }
       if (dealRes.status === 404) {
         return { ok: false, httpStatus: 404, permanent: true, error: `Deal ${payload.crm_deal_id} does not exist — ownership cannot be verified` };
@@ -387,7 +387,7 @@ export const realZohoClient: ZohoClient = {
         headers: { Authorization: `Zoho-oauthtoken ${token}` },
       });
       if (contactRes.status === 401) {
-        return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Contact ownership lookup" };
+        return { ok: false, httpStatus: 401, error: `Zoho returned 401 on Contact ownership lookup: ${await zohoErrorDetail(contactRes)}` };
       }
       if (!contactRes.ok) {
         const body = await contactRes.text().catch(() => "");
@@ -413,6 +413,20 @@ export const realZohoClient: ZohoClient = {
   },
 };
 
+/**
+ * Zoho's own error code for a failed call, e.g. OAUTH_SCOPE_MISMATCH or
+ * INVALID_TOKEN, so a 401 says why it happened. Zoho error bodies carry a
+ * code and a message, never the token; capped at 300 characters.
+ */
+async function zohoErrorDetail(res: Response): Promise<string> {
+  const text = await res.text().catch(() => "");
+  try {
+    const j = JSON.parse(text) as { code?: unknown; message?: unknown };
+    if (j && (j.code || j.message)) return `${String(j.code ?? "")} ${String(j.message ?? "")}`.trim().slice(0, 300);
+  } catch { /* not JSON */ }
+  return text.slice(0, 300) || "(no body)";
+}
+
 async function putDealUpdate(token: string, payload: DealStageUpdatePayload): Promise<ZohoSyncResult> {
   const updateRes = await fetch(`https://www.zohoapis.com/crm/v2/Deals/${encodeURIComponent(payload.crm_deal_id)}`, {
     method: "PUT",
@@ -421,7 +435,7 @@ async function putDealUpdate(token: string, payload: DealStageUpdatePayload): Pr
   });
 
   if (updateRes.status === 401) {
-    return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal stage update" };
+    return { ok: false, httpStatus: 401, error: `Zoho returned 401 on Deal stage update: ${await zohoErrorDetail(updateRes)}` };
   }
   if (!updateRes.ok) {
     const body = await updateRes.text().catch(() => "");
