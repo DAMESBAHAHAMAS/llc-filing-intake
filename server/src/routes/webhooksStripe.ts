@@ -5,6 +5,7 @@ import { notifyOrderEvent } from "../ops/alerts.js";
 import { verifyStripeSignature, WebhookSignatureError } from "../stripe/webhookSignature.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
+import { alertEmailsNotQueued, CHECKOUT_EMAIL_TYPES, enqueueCustomerEmails } from "../orderEmails/worker.js";
 import {
   classifyCheckoutCompletion,
   fulfillmentAfterPaymentEnds,
@@ -73,6 +74,7 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
   const client = await pool.connect();
   let shouldSendRegisteredAgentEmail = false;
   let paidFilingSessionId: string | null = null;
+  let customerEmailsNotQueued = false;
   try {
     await client.query("BEGIN");
 
@@ -242,6 +244,15 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
 
           shouldSendRegisteredAgentEmail = blockedOnRegisteredAgent;
           paidFilingSessionId = order.filing_session_id;
+
+          // Welcome, order confirmation and intake summary. Queued here so
+          // they commit with the hold; orderEmails/worker.ts sends them.
+          customerEmailsNotQueued = !(await enqueueCustomerEmails(client, {
+            orderId: order.order_id,
+            filingSessionId: order.filing_session_id,
+            emailTypes: CHECKOUT_EMAIL_TYPES,
+            paymentMode: held ? "hold" : "paid",
+          }));
         } else {
           processingResult = "payment_status_not_paid_or_already_paid";
         }
@@ -339,6 +350,9 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
     // New orders and money events reach a person (Cliq, email, or logs).
     // After COMMIT and never awaited into the response path's failure.
     await notifyOrderEvent(pool, processingResult, orderId);
+    if (customerEmailsNotQueued && orderId) {
+      await alertEmailsNotQueued(orderId, "the welcome, order confirmation and intake summary emails");
+    }
 
     if (shouldSendRegisteredAgentEmail && paidFilingSessionId) {
       try {

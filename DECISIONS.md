@@ -1125,3 +1125,31 @@ does not collect that consent; it needs counsel-approved wording and a place to 
 **Rationale:** The Articles template was A4 (210 x 297 mm); Florida's fax filing uses US Letter, so Damian decided on 23 Nov 2026 to print it at 8.5 x 11 in. Sunbiz's electronic filing cover sheet instructs the filer to type the Fax Audit Number on the top and bottom of all pages, so the template now prints `(((<number>)))` in the top and bottom margin of every page when a `fax_audit_number` is in the context. The number exists only after the portal creates the filing, so the Articles are rendered a second time with it. It is validated in `server/src/pdf/faxAudit.ts` and again in `render_pdf.py` (letter, eleven digits, space, check digit) because it lands inside a CSS string. Nothing sends a fax yet; fax transmission (Telnyx) is a separate, unbuilt step.
 
 **Supersedes:** The A4 `@page` size in `templates/articles_of_organization.html.j2`. No earlier DECISIONS entry.
+
+## 2026-11-04 — Customer order emails run through crm_sync_queue, sent by their own worker
+
+**What exists now (branch `claude/customer-order-emails`):** four
+transactional emails in `server/src/orderEmails/`. Welcome, order
+confirmation and intake summary are queued by the Stripe webhook when
+checkout completes. The filing confirmation is queued with proof of filing.
+Before this, a paying customer received nothing from this service: the only
+Resend senders were the registered-agent acceptance email, ops alerts and
+the Scorecard.
+
+**Rationale:** the frozen rule keeps email out of the webhook handler, and
+the rule for the queue is that a job commits with the state it follows.
+`crm_sync_queue` already has backoff and dead letters, so no migration was
+needed. Jobs use `sync_type` `customer_email_<type>`; `sync/worker.ts` skips
+them, so a mail failure never changes `crm_sync_status`. One email per order
+is enforced by `NOT EXISTS` under the order's row lock, plus a Resend
+idempotency key for a retry after a lost response. Queueing sits behind a
+savepoint, so it cannot abort the payment transaction.
+
+**Wording:** payment lines follow the published Terms
+(`PaymentCancellationRefunds` in florida-business-launchpad). Disclaimer as
+approved under R #231. The filing confirmation is queued before collection
+is requested, so it does not depend on the capture succeeding, and its wording
+says payment is being collected, not that it was. An EIN-only order records the
+EIN as its proof; that number is not emailed.
+
+**Supersedes:** —

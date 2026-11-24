@@ -71,7 +71,7 @@ Service: `llc-data-spine` → Environment.
 | `PDF_SERVICE_URL` | `https://llc-pdf-generator.onrender.com` | Fulfillment can't render; order parks at `requires_review` |
 | `PDF_SERVICE_API_KEY` | (PDF service key) | Same as above |
 | `SUNBIZ_PROXY_URL` | `https://sunbiz-proxy.onrender.com/api/sunbiz/check` | Server-side name check unavailable |
-| `RESEND_API_KEY` | (Resend dashboard → API Keys) | `registeredAgent/emailSender.ts` fails clearly, RA acceptance email not sent (CP11) |
+| `RESEND_API_KEY` | (Resend dashboard → API Keys) | `registeredAgent/emailSender.ts` fails clearly, RA acceptance email not sent (CP11); customer order emails fail, retry and alert (`orderEmails/`) |
 | `RESEND_FROM_EMAIL` | an address on a domain verified in Resend | Same as above |
 | `ZOHO_DEAL_STAGE_ON_PAYMENT` | a Stage value confirmed against this org's live Deals picklist | No `deal_stage_update` job is enqueued at all (deliberately — see zoho/client.ts's comment); `orders.crm_deal_id` still gets set, just no stage change |
 
