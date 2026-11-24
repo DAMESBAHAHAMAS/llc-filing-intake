@@ -97,7 +97,7 @@ export function buildRegisteredAgentAcceptanceEmail(input: RegisteredAgentAccept
   return { subject, text, html };
 }
 
-function escapeHtml(s: string): string {
+export function escapeHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -110,7 +110,7 @@ let resendSingleton: Resend | null = null;
 /** Lazy singleton, same rationale as stripe/restClient.ts's
  *  getSecretKey(): fails clearly when actually called without a key,
  *  rather than crashing the whole process at import time. */
-function getResend(): Resend {
+export function getResend(): Resend {
   if (resendSingleton) return resendSingleton;
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) {

@@ -11,6 +11,7 @@ import {
 } from "../stripe/restClient.js";
 import { holdNoLongerCapturable } from "../payments/holdState.js";
 import { sendOpsAlert } from "../ops/alerts.js";
+import { alertEmailsNotQueued, enqueueCustomerEmails, listOrderEmails } from "../orderEmails/worker.js";
 
 export const ordersRouter = Router();
 
@@ -28,6 +29,53 @@ function operatorAuthorized(req: Request): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+interface ProofOrder {
+  order_id: string;
+  filing_session_id: string;
+  payment_status: string;
+  stripe_payment_intent_id: string | null;
+  total_cents: number;
+  currency: string;
+}
+
+/** Records the proof and queues the filing confirmation in one transaction.
+ *  The UPDATE's row lock is what enqueueCustomerEmails relies on. Orders
+ *  with nothing paid or held get no email. */
+async function recordProofAndQueueConfirmation(orderId: string, documentNumber: string): Promise<ProofOrder | null> {
+  const client = await pool.connect();
+  let order: ProofOrder | null = null;
+  let emailQueued = true;
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query<ProofOrder>(
+      `UPDATE orders
+       SET proof_of_filing_ref = COALESCE(proof_of_filing_ref, $2), proof_of_filing_at = COALESCE(proof_of_filing_at, now())
+       WHERE order_id = $1
+       RETURNING order_id, filing_session_id, payment_status, stripe_payment_intent_id, total_cents, currency`,
+      [orderId, documentNumber]
+    );
+    order = rows[0] ?? null;
+    if (order && ["authorized", "released", "paid"].includes(order.payment_status)) {
+      emailQueued = await enqueueCustomerEmails(client, {
+        orderId: order.order_id,
+        filingSessionId: order.filing_session_id,
+        emailTypes: ["filing_confirmation"],
+        paymentMode: order.payment_status === "paid" ? "paid" : "hold",
+      });
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+  if (!emailQueued) {
+    await alertEmailsNotQueued(orderId, "the filing confirmation email");
+  }
+  return order;
+}
+
 /**
  * POST /api/orders/:orderId/proof-of-filing
  * Body: { document_number: string }
@@ -41,6 +89,10 @@ function operatorAuthorized(req: Request): boolean {
  * the card saved at checkout is charged instead. Either way the order
  * becomes "paid" only when Stripe's own payment_intent.succeeded webhook
  * arrives — this route never marks an order paid itself.
+ *
+ * The customer's filing confirmation is queued with the proof, before
+ * collection is requested, so a collection problem cannot hold back the
+ * news that the LLC is filed. A repeat call does not queue it again.
  */
 ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
   if (!operatorAuthorized(req)) {
@@ -54,26 +106,14 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
   }
 
   const orderId = req.params.orderId;
-  let order: {
-    order_id: string;
-    payment_status: string;
-    stripe_payment_intent_id: string | null;
-    total_cents: number;
-    currency: string;
-  };
+  let order: ProofOrder;
   try {
-    const { rows } = await pool.query(
-      `UPDATE orders
-       SET proof_of_filing_ref = COALESCE(proof_of_filing_ref, $2), proof_of_filing_at = COALESCE(proof_of_filing_at, now())
-       WHERE order_id = $1
-       RETURNING order_id, payment_status, stripe_payment_intent_id, total_cents, currency`,
-      [orderId, documentNumber]
-    );
-    if (!rows.length) {
+    const recorded = await recordProofAndQueueConfirmation(orderId, documentNumber);
+    if (!recorded) {
       res.status(404).json({ error: "order not found" });
       return;
     }
-    order = rows[0];
+    order = recorded;
   } catch (err) {
     res.status(500).json({ error: "could not record proof of filing", detail: describeError(err) });
     return;
@@ -147,6 +187,19 @@ ordersRouter.post("/api/orders/:orderId/release-hold", async (req, res) => {
     res.status(200).json({ order_id: order.order_id, status: "release_requested", payment_intent_status: cancelled.status });
   } catch (err) {
     res.status(502).json({ error: "release failed", detail: describeError(err) });
+  }
+});
+
+/** GET /api/orders/:orderId/emails — what was sent to the customer, what failed and why. */
+ordersRouter.get("/api/orders/:orderId/emails", async (req, res) => {
+  if (!operatorAuthorized(req)) {
+    res.status(401).json({ error: "operator key required" });
+    return;
+  }
+  try {
+    res.status(200).json({ order_id: req.params.orderId, emails: await listOrderEmails(pool, req.params.orderId) });
+  } catch (err) {
+    res.status(500).json({ error: "email lookup failed", detail: describeError(err) });
   }
 });
 
