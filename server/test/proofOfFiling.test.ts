@@ -105,16 +105,14 @@ describe("POST /api/orders/:orderId/proof-of-filing", () => {
     expect(db.queries.join("\n")).not.toMatch(/payment_status = 'paid'/);
   });
 
-  it("charges the saved card when the hold has expired", async () => {
+  it("charges nothing and asks for fresh consent when the hold has expired (G5, ST16-3)", async () => {
     stripe.capture.mockRejectedValue(new StripeApiError("expired", 400, { code: "charge_expired_for_capture" }));
-    stripe.retrieve.mockResolvedValue({ id: "pi_hold", customer: "cus_1", payment_method: "pm_1" });
-    stripe.charge.mockResolvedValue({ id: "pi_fallback", status: "succeeded" });
     const r = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
-    expect(r.status).toBe(200);
-    expect(r.json.status).toBe("saved_card_charged");
-    expect(stripe.charge).toHaveBeenCalledWith(
-      expect.objectContaining({ customerId: "cus_1", paymentMethodId: "pm_1", amountCents: 49900, idempotencyKey: "fallback-ord-1" })
-    );
+    expect(r.status).toBe(409);
+    expect(r.json.status).toBe("fresh_consent_required");
+    expect(r.json.reason).toBe("hold_expired");
+    expect(stripe.charge).not.toHaveBeenCalled();
+    expect(db.queries.some((q) => /capture_error/.test(q))).toBe(true);
   });
 
   it("does not fall back on an ordinary capture error", async () => {
@@ -125,13 +123,14 @@ describe("POST /api/orders/:orderId/proof-of-filing", () => {
     expect(db.queries.some((q) => /capture_error/.test(q))).toBe(true);
   });
 
-  it("goes straight to the saved card for an order whose hold was already released", async () => {
+  it("charges nothing for an order whose hold was already released", async () => {
     db.order = { ...db.order, payment_status: "released" };
-    stripe.retrieve.mockResolvedValue({ id: "pi_hold", customer: "cus_1", payment_method: "pm_1" });
-    stripe.charge.mockResolvedValue({ id: "pi_fallback", status: "succeeded" });
     const r = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
-    expect(r.json.status).toBe("saved_card_charged");
+    expect(r.status).toBe(409);
+    expect(r.json.status).toBe("fresh_consent_required");
+    expect(r.json.reason).toBe("hold_released");
     expect(stripe.capture).not.toHaveBeenCalled();
+    expect(stripe.charge).not.toHaveBeenCalled();
   });
 
   it("does nothing for an order already paid or with nothing held", async () => {

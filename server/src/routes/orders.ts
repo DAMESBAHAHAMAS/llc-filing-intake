@@ -5,8 +5,6 @@ import { describeError } from "../db/describeError.js";
 import {
   cancelPaymentIntent,
   capturePaymentIntent,
-  chargeSavedCard,
-  retrievePaymentIntent,
   StripeApiError,
 } from "../stripe/restClient.js";
 import { holdNoLongerCapturable } from "../payments/holdState.js";
@@ -38,9 +36,10 @@ function operatorAuthorized(req: Request): boolean {
  * charged until proof of filing is delivered.
  *
  * If the hold can no longer be collected (it expired or was released),
- * the card saved at checkout is charged instead. Either way the order
- * becomes "paid" only when Stripe's own payment_intent.succeeded webhook
- * arrives — this route never marks an order paid itself.
+ * nothing is charged: the route answers 409 fresh_consent_required and
+ * alerts Damian (manual G5). The order becomes "paid" only when Stripe's
+ * own payment_intent.succeeded webhook arrives — this route never marks an
+ * order paid itself.
  */
 ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
   if (!operatorAuthorized(req)) {
@@ -100,29 +99,37 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
         res.status(502).json({ error: "collection failed", detail: describeError(err), order_id: order.order_id });
         return;
       }
-      // Hold expired or released — fall through to the saved card.
+      // Hold expired or released — fall through: fresh consent is required.
     }
   }
 
-  try {
-    const original = await retrievePaymentIntent(order.stripe_payment_intent_id);
-    if (!original.customer || !original.payment_method) {
-      throw new Error("no saved card on the original payment");
-    }
-    const charged = await chargeSavedCard({
-      customerId: original.customer,
-      paymentMethodId: original.payment_method,
-      amountCents: order.total_cents,
-      currency: order.currency || "usd",
-      idempotencyKey: `fallback-${order.order_id}`,
-      metadata: { order_id: order.order_id, reason: "hold_expired_before_proof_of_filing" },
-    });
-    res.status(200).json({ order_id: order.order_id, status: "saved_card_charged", payment_intent_status: charged.status });
-  } catch (err) {
-    await recordCaptureError(order.order_id, err);
-    res.status(502).json({ error: "saved-card charge failed", detail: describeError(err), order_id: order.order_id });
-  }
+  // G5 / ST16-3 (manual, Damian 22 Nov 2026): "If the window expires first,
+  // request a new authorization with new consent. Capture after expiry
+  // fails." An expired or released hold therefore charges nothing here —
+  // the earlier off-session charge of the saved card is removed. The order
+  // is flagged and Damian is alerted so the customer can be asked to approve
+  // a new hold.
+  const reason = order.payment_status === "released" ? "hold_released" : "hold_expired";
+  await flagFreshConsentRequired(order.order_id, reason);
+  res.status(409).json({
+    order_id: order.order_id,
+    status: "fresh_consent_required",
+    reason,
+    detail: "The card hold can no longer be collected. Nothing was charged. Ask the customer to approve a new card hold.",
+  });
 });
+
+async function flagFreshConsentRequired(orderId: string, reason: string): Promise<void> {
+  try {
+    await pool.query(`UPDATE orders SET capture_error = $2 WHERE order_id = $1`, [orderId, `fresh_consent_required:${reason}`]);
+  } catch (e) {
+    console.error(`[payments] could not flag fresh consent for ${orderId}:`, describeError(e));
+  }
+  await sendOpsAlert(
+    "New card hold needed",
+    `Order ${orderId}: proof of filing is recorded but the card hold is ${reason === "hold_released" ? "released" : "expired"}. Nothing was charged. Ask the customer to approve a new card hold.`
+  );
+}
 
 /** POST /api/orders/:orderId/release-hold — cancels a hold without collecting. */
 ordersRouter.post("/api/orders/:orderId/release-hold", async (req, res) => {
