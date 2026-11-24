@@ -19,6 +19,8 @@ export type PaymentMode = "hold" | "paid";
 
 export const DISCLAIMER = "Damian Knowles is a Business Developer, not a law firm or attorney, and does not provide legal advice.";
 const REPLY_LINE = "Questions? Reply to this email.";
+/** The published payment and cancellation terms (PaymentCancellationRefunds). */
+const PAYMENT_PROTECTION_URL = "https://damianknowles.com/refund-policy";
 
 /** One order and its filing session, read when the email is sent. */
 export interface OrderEmailRow {
@@ -133,13 +135,39 @@ function buildContext(row: OrderEmailRow, paymentMode: PaymentMode): OrderEmailC
   };
 }
 
+/** Inline text: plain, bold, or a link. Bold is dropped in the text version;
+ *  a link becomes "label (url)". */
+type Span = string | { bold: string } | { link: string; href: string };
+
 type Block =
   | { kind: "p"; text: string }
+  | { kind: "rich"; spans: Span[] }
+  | { kind: "bullets"; items: Span[][] }
   | { kind: "heading"; text: string }
+  | { kind: "footer"; text: string }
   | { kind: "steps"; items: string[] }
   | { kind: "rows"; rows: Array<[string, string]> };
 
 const p = (text: string): Block => ({ kind: "p", text });
+const rich = (...spans: Span[]): Block => ({ kind: "rich", spans });
+const bullets = (...items: Span[][]): Block => ({ kind: "bullets", items });
+const b = (text: string): Span => ({ bold: text });
+
+function spansText(spans: Span[]): string {
+  return spans.map((sp) => (typeof sp === "string" ? sp : "bold" in sp ? sp.bold : `${sp.link} (${sp.href})`)).join("");
+}
+
+function spansHtml(spans: Span[]): string {
+  return spans
+    .map((sp) =>
+      typeof sp === "string"
+        ? escapeHtml(sp)
+        : "bold" in sp
+          ? `<strong>${escapeHtml(sp.bold)}</strong>`
+          : `<a href="${escapeHtml(sp.href)}" style="color: #1a5fb4;">${escapeHtml(sp.link)}</a>`
+    )
+    .join("");
+}
 const heading = (text: string): Block => ({ kind: "heading", text });
 const steps = (items: string[]): Block => ({ kind: "steps", items });
 /** Rows with nothing in them are left out, so an empty intake field shows no label. */
@@ -148,6 +176,9 @@ const rows = (entries: Array<[string, string]>): Block => ({ kind: "rows", rows:
 function renderText(blocks: Block[]): string {
   const parts = blocks.flatMap((b) => {
     if (b.kind === "p" || b.kind === "heading") return [b.text];
+    if (b.kind === "rich") return [spansText(b.spans)];
+    if (b.kind === "footer") return [`---\n${b.text}`];
+    if (b.kind === "bullets") return [b.items.map((item) => `- ${spansText(item)}`).join("\n")];
     if (b.kind === "steps") return [b.items.map((item, i) => `${i + 1}. ${item}`).join("\n")];
     return b.rows.length ? [b.rows.map(([label, value]) => `${label}: ${value}`).join("\n")] : [];
   });
@@ -157,6 +188,10 @@ function renderText(blocks: Block[]): string {
 function renderHtml(blocks: Block[]): string {
   const parts = blocks.map((b) => {
     if (b.kind === "p") return `<p>${escapeHtml(b.text)}</p>`;
+    if (b.kind === "rich") return `<p>${spansHtml(b.spans)}</p>`;
+    if (b.kind === "footer")
+      return `<hr style="border: none; border-top: 1px solid #ddd; margin: 24px 0 12px;"><p style="font-style: italic; color: #666;">${escapeHtml(b.text)}</p>`;
+    if (b.kind === "bullets") return `<ul>${b.items.map((item) => `<li>${spansHtml(item)}</li>`).join("")}</ul>`;
     if (b.kind === "heading") return `<h3 style="margin-bottom: 4px;">${escapeHtml(b.text)}</h3>`;
     if (b.kind === "steps") return `<ol>${b.items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ol>`;
     if (!b.rows.length) return "";
@@ -171,8 +206,8 @@ function renderHtml(blocks: Block[]): string {
   return `<div style="font-family: sans-serif; line-height: 1.5; color: #333;">${parts.join("")}</div>`;
 }
 
-function render(subject: string, blocks: Block[]): RenderedEmail {
-  const all = [...blocks, p(DISCLAIMER)];
+function render(subject: string, blocks: Block[], opts: { separateFooter?: boolean } = {}): RenderedEmail {
+  const all = [...blocks, opts.separateFooter ? ({ kind: "footer", text: DISCLAIMER } as Block) : p(DISCLAIMER)];
   return { subject: subject.replace(/[\r\n]+/g, " "), text: renderText(all), html: renderHtml(all) };
 }
 
@@ -211,17 +246,26 @@ function paymentTerms(ctx: OrderEmailContext): Block[] {
   if (ctx.paymentMode === "paid") {
     return [p(`We charged ${total} to your card at checkout.`), p(REPLY_LINE)];
   }
-  const charged = ctx.sunbizFiling
-    ? "We charge your card only after the Florida Division of Corporations has filed your Articles of Organization. We email your filing confirmation when we do."
-    : "We charge your card only after your filing is complete. We email you when it is.";
-  const lapse = ctx.sunbizFiling
-    ? "A card hold lasts about 7 days. If your filing is not complete by then, the hold drops off and we charge the same card once your LLC is filed."
-    : "A card hold lasts about 7 days. If your filing is not complete by then, the hold drops off and we charge the same card once it is complete.";
+  // Hold wording: Damian's revision, 24 Nov 2026.
+  const filed = ctx.sunbizFiling
+    ? "the Florida Division of Corporations officially files your Articles of Organization"
+    : "your filing is complete";
+  const afterFiling = ctx.sunbizFiling
+    ? "As soon as your LLC is filed, we will email your filing confirmation and process the payment."
+    : "As soon as it is complete, we will email you and process the payment.";
+  const chargeLater = ctx.sunbizFiling ? "once your LLC is officially filed" : "once your filing is complete";
   return [
-    p(`We placed a hold of ${total} on your card. A hold is not a charge: no money leaves your account.`),
-    p(charged),
-    p(lapse),
-    p("You can cancel any time before we submit your filing. We release the hold and you are not charged. To cancel, reply to this email."),
+    rich("We placed a temporary hold of ", b(total), " on your card. ", b("A hold is not a charge"), "\u2014no money leaves your account."),
+    heading("When You Are Actually Charged"),
+    rich("We charge your card ", b("only after"), ` ${filed}. ${afterFiling}`),
+    heading("How the Card Hold Works"),
+    bullets(
+      [b("Duration:"), " A card hold ", b("may last up to 7 days"), "."],
+      [b("If Filing Takes Longer:"), ` If your filing is not complete within 7 days, the temporary hold automatically drops off. We will simply charge the same card ${chargeLater}.`]
+    ),
+    heading("Easy Cancellation"),
+    p("You can cancel at any time before we submit your filing\u2014we will release the hold, and you will not be charged. To cancel, simply reply to this email."),
+    rich("For complete peace of mind, review our ", { link: "Payment Protection Promise", href: PAYMENT_PROTECTION_URL }, "."),
   ];
 }
 
@@ -239,7 +283,7 @@ function orderConfirmation(ctx: OrderEmailContext): RenderedEmail {
     ]),
     heading("Payment"),
     ...paymentTerms(ctx),
-  ]);
+  ], { separateFooter: true });
 }
 
 function intakeSummary(ctx: OrderEmailContext): RenderedEmail {
