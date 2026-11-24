@@ -29,7 +29,7 @@
  * POST /lead            → Name check lead capture → Zoho CRM
  * POST /contact         → Contact page form → Zoho CRM Lead
  * POST /guide-lead      → Formation Guide lead → Zoho CRM
- * POST /intake          → LLC intake form → Zoho CRM Contact (Deal is created only after verified payment)
+ * POST /intake          → LLC intake form → Zoho CRM Contact + Deal (no amount or package until payment)
  *
  * CRON
  * Every 10 minutes       → keepRenderWarm() — Render keep-alive
@@ -419,8 +419,16 @@ async function handleGuideLead(request, env) {
    ROUTE: POST /intake
    LLC Intake Form → Zoho CRM Contact (no Deal — see below)
 
-   UPDATED 2026-10-23: intake no longer creates a Deal. Deals are
-   created only after verified Stripe payment (data spine webhook).
+   UPDATED 2026-11-24: intake creates the Deal again (Damian's choice,
+   24 Nov 2026), but with no amount and no package. The package is
+   chosen after intake, at checkout, so this worker cannot know the
+   price and must not guess one. At payment the data spine writes
+   Deal_Name, Amount and Package from the order checkout created
+   (server/src/zoho/client.ts orderDealFields, Offer Master prices).
+   This replaces the old hard-coded list that wrote "Standard ($349)"
+   on every Deal.
+
+   UPDATED 2026-10-23: intake stopped creating a Deal (superseded above).
 
    UPDATED 2026-07-01:
    - Branches on body.lead_type so partial captures and
@@ -435,6 +443,26 @@ async function handleGuideLead(request, env) {
      behavior without cluttering the pipeline with phantom
      $349 Deals.
 ══════════════════════════════════════════════════════════ */
+/* The Contact's open intake Deal for this LLC (Stage "Intake Received",
+   same Deal_Name), or null. Any lookup failure returns null, so intake
+   still creates a Deal as before. */
+async function findOpenIntakeDeal(token, contactId, dealName) {
+  try {
+    const res = await fetch(
+      `https://www.zohoapis.com/crm/v2/Contacts/${encodeURIComponent(contactId)}/Deals?fields=Deal_Name,Stage`,
+      { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
+    );
+    if (res.status !== 200) return null;
+    const data = await res.json();
+    const match = (data.data || []).find(
+      (d) => d && d.Stage === "Intake Received" && d.Deal_Name === dealName
+    );
+    return match ? match.id : null;
+  } catch {
+    return null;
+  }
+}
+
 async function handleIntake(request, env) {
   const body = await request.json();
   const leadType = body.lead_type || "intake_complete";
@@ -516,7 +544,7 @@ async function handleIntake(request, env) {
       `Effective Date: ${body.effective_date_type || "immediate"}${body.effective_date ? " — " + body.effective_date : ""}`,
       `Management: ${body.management_type || "member-managed"}`,
       `Multi-member: ${body.multi_member ? "Yes" : "No"}`,
-      `Package: ${body.package || "not specified"}`,
+      `Package: chosen at checkout`,
     ]
       .filter(Boolean)
       .join("\n");
@@ -575,18 +603,53 @@ async function handleIntake(request, env) {
     const contactData = await contactRes.json();
     const contactId = contactData.data?.[0]?.details?.id || null;
 
-    /* ── No Deal here (frozen architecture rule) ──
-       A Zoho CRM Deal is created only after a verified Stripe payment
-       (webhook -> data spine order_deal sync job), one per paid session.
-       Intake completion only creates/updates the Contact. */
-    const pkg = body.package || "standard";
+    /* ── Step 2: Create the Deal, linked to the Contact ──
+       No Amount and no Package: the customer has not chosen a package
+       yet. The data spine sets both, and the final Deal_Name, from the
+       order at payment. Never put a price here. */
+    const dealName = `${body.llc_name.trim()} — package not chosen yet`.slice(0, 120);
+    const dealBody = {
+      Deal_Name: dealName,
+      Stage: "Intake Received",
+      Lead_Source: "LLC Intake Form",
+      Account_Name: { name: body.llc_name.trim() },
+      Description: summary,
+      Closing_Date: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+        .toISOString()
+        .split("T")[0],
+      Manual_Review_Required: Boolean(body.manual_review_required),
+    };
+    if (contactId) {
+      dealBody.Contact_Name = { id: contactId };
+    }
+
+    /* Completing the interview again (after going back to fix an
+       answer) reuses this Contact's open intake Deal for the same LLC
+       instead of leaving a second, orphan Deal. */
+    const existingDealId = contactId ? await findOpenIntakeDeal(token, contactId, dealName) : null;
+
+    const dealRes = await fetch(
+      existingDealId
+        ? `https://www.zohoapis.com/crm/v2/Deals/${encodeURIComponent(existingDealId)}`
+        : "https://www.zohoapis.com/crm/v2/Deals",
+      {
+        method: existingDealId ? "PUT" : "POST",
+        headers: {
+          Authorization: `Zoho-oauthtoken ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ data: [dealBody] }),
+      }
+    );
+    const dealData = await dealRes.json();
+    const dealId = existingDealId || dealData.data?.[0]?.details?.id || null;
 
     return json({
       success: true,
       contact_id: contactId,
-      deal_id: null,
+      deal_id: dealId,
       llc_name: body.llc_name,
-      package: pkg,
+      package: null,
     });
   } catch (err) {
     return errorJson("Intake submission failed: " + err.message);

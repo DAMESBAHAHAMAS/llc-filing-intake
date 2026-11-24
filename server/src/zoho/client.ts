@@ -94,6 +94,8 @@ export interface OrderSyncPayload {
     product: string;
     crm_intent: string;
     total_cents: number;
+    /** The order's line-item snapshot from checkout (Offer Master prices). */
+    line_items?: OrderLineItem[] | null;
     failure_reason?: string | null;
     stripe_payment_intent_id?: string | null;
   };
@@ -106,6 +108,80 @@ export interface OrderSyncPayload {
     utm_source?: string | null;
     utm_medium?: string | null;
     utm_campaign?: string | null;
+  };
+}
+
+/** One line of an order's checkout snapshot (routes/checkout.ts). */
+export interface OrderLineItem {
+  offer_code?: string;
+  unit_amount_cents?: number;
+  quantity?: number;
+}
+
+/** An order as far as its Deal fields are concerned. */
+export interface OrderForDeal {
+  product: string;
+  total_cents: number | null | undefined;
+  /** Checkout's line-item snapshot. Missing only in sync jobs queued
+   *  before line items were added to the payload (24 Nov 2026). */
+  line_items?: OrderLineItem[] | null;
+}
+
+/**
+ * The order's checkout total in cents, or null when it cannot be trusted:
+ * missing, not a positive whole number, or different from the sum of its
+ * line items.
+ */
+function checkedTotalCents(order: OrderForDeal): number | null {
+  const total = order.total_cents;
+  if (typeof total !== "number" || !Number.isInteger(total) || total <= 0) return null;
+  if (order.line_items === undefined || order.line_items === null) return total;
+  if (!Array.isArray(order.line_items) || order.line_items.length === 0) return null;
+  const sum = order.line_items.reduce(
+    (acc, li) => acc + (Number.isInteger(li.unit_amount_cents) ? (li.unit_amount_cents as number) : NaN) * (li.quantity ?? 1),
+    0
+  );
+  return sum === total ? total : null;
+}
+
+/**
+ * Deal_Name, Amount and Package for a Deal, taken from the orders that
+ * checkout created for it: total_cents and the line-item snapshot, both
+ * resolved from the Offer Master (offers table) in routes/checkout.ts.
+ * There is no price list here and no default price.
+ *
+ * Pass every paid or held order on the Deal, oldest first: a follow-up
+ * order on the same filing (the EIN upsell) adds to the amount instead of
+ * replacing it, and Package stays the first order's package.
+ *
+ * If any order's total cannot be trusted (see checkedTotalCents), no
+ * amount is written and the Deal is flagged Manual_Review_Required. A
+ * first order with no CRM Package value is flagged too.
+ */
+export function orderDealFields(
+  entityName: string | null | undefined,
+  orderOrOrders: OrderForDeal | OrderForDeal[]
+): Record<string, unknown> {
+  const orders = Array.isArray(orderOrOrders) ? orderOrOrders : [orderOrOrders];
+  const name = (entityName ?? "").trim() || "Unnamed LLC";
+  const dealName = (label: string) => `${name} — ${label}`.slice(0, 120);
+  const labels = orders.map((o) => packageLabel(o.product));
+  const pkg = labels[0];
+  const totals = orders.map(checkedTotalCents);
+
+  if (orders.length === 0 || totals.some((t) => t === null)) {
+    return {
+      Deal_Name: dealName("price not found, needs review"),
+      Manual_Review_Required: true,
+      ...(pkg ? { Package: pkg } : {}),
+    };
+  }
+  const amount = (totals as number[]).reduce((a, b) => a + b, 0) / 100;
+  const what = [...new Set(orders.map((o, i) => labels[i] ?? o.product))].join(" + ");
+  return {
+    Deal_Name: dealName(`${what} ($${amount.toFixed(2)})`),
+    Amount: amount,
+    ...(pkg ? { Package: pkg } : { Manual_Review_Required: true }),
   };
 }
 
@@ -140,13 +216,11 @@ export function buildDealRecord(payload: OrderSyncPayload): Record<string, unkno
     ? process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED"
     : process.env.ZOHO_DEAL_STAGE_ON_PAYMENT || "Closed Won";
   const record: Record<string, unknown> = {
-    Deal_Name: `${payload.filing_session.entity_name_primary || email} — ${payload.order.product}`,
+    ...orderDealFields(payload.filing_session.entity_name_primary || email, payload.order),
     Stage: stage,
-    Amount: payload.order.total_cents / 100,
     Lead_Source: "LLC Filing Intake",
     filing_session_id: payload.order.filing_session_id,
     Payment_Status: held ? "Hold Placed" : "Payment Collected",
-    Package: packageLabel(payload.order.product),
     Stripe_Payment_Intent: payload.order.stripe_payment_intent_id ?? undefined,
     UTM_Source: payload.filing_session.utm_source ?? undefined,
     UTM_Medium: payload.filing_session.utm_medium ?? undefined,
