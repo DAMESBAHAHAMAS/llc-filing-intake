@@ -3,6 +3,7 @@ import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { notifyOrderEvent } from "../ops/alerts.js";
 import { verifyStripeSignature, WebhookSignatureError } from "../stripe/webhookSignature.js";
+import { orderDealFields } from "../zoho/client.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
 import { alertEmailsNotQueued, CHECKOUT_EMAIL_TYPES, enqueueCustomerEmails } from "../orderEmails/worker.js";
@@ -105,7 +106,7 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
         filing_session_id: string;
         product: string;
         total_cents: number;
-        line_items: Array<{ offer_code?: string }>;
+        line_items: Array<{ offer_code?: string; unit_amount_cents?: number; quantity?: number }>;
         payment_status: string;
       }>(
         `SELECT order_id, filing_session_id, product, total_cents, line_items, payment_status
@@ -177,10 +178,19 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
           const crmDealId = session.metadata?.crm_deal_id;
           const targetStage = held
             ? process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED"
-            : process.env.ZOHO_DEAL_STAGE_ON_PAYMENT;
+            : process.env.ZOHO_DEAL_STAGE_ON_PAYMENT || "Closed Won";
           const expectedEmail = sessionRow.rows[0]?.email;
           if (crmDealId) {
             await client.query(`UPDATE orders SET crm_deal_id = $2 WHERE order_id = $1`, [orderId, crmDealId]);
+            // Earlier paid or held orders on the same Deal (e.g. the
+            // filing, before an EIN upsell): the Deal's amount covers them
+            // all, and its package stays the first order's.
+            const earlierOrders = await client.query<{ product: string; total_cents: number; line_items: Array<{ offer_code?: string; unit_amount_cents?: number; quantity?: number }> }>(
+              `SELECT product, total_cents, line_items FROM orders
+               WHERE crm_deal_id = $1 AND order_id <> $2 AND payment_status IN ('paid', 'authorized')
+               ORDER BY COALESCE(authorized_at, paid_at) ASC`,
+              [crmDealId, orderId]
+            );
             if (targetStage && expectedEmail) {
               // expected_email is what zoho/client.ts's updateDealStage
               // verifies the Deal's linked Contact against before ever
@@ -198,6 +208,9 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
                     target_stage: targetStage,
                     expected_email: expectedEmail,
                     extra_fields: {
+                      // Name, amount and package from this order's checkout
+                      // snapshot, replacing whatever the intake Deal held.
+                      ...orderDealFields(sessionRow.rows[0]?.entity_name_primary, [...earlierOrders.rows, order]),
                       Payment_Status: held ? "Hold Placed" : "Payment Collected",
                       ...(session.payment_intent ? { Stripe_Payment_Intent: session.payment_intent } : {}),
                     },
@@ -233,6 +246,7 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
                     product: order.product,
                     crm_intent: order.product,
                     total_cents: order.total_cents,
+                    line_items: order.line_items ?? [],
                     stripe_payment_intent_id: session.payment_intent ?? null,
                   },
                   filing_session: sessionRow.rows[0] ?? {},

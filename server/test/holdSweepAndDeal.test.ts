@@ -37,7 +37,7 @@ describe("Deal record", () => {
   const payload = (kind: "held_deal" | "paid_deal", email = "founder@example.com"): OrderSyncPayload =>
     ({
       kind,
-      order: { order_id: "ord-1", filing_session_id: "fs-1", product: "FASTTRACK", total_cents: 49900, stripe_payment_intent_id: "pi_1" },
+      order: { order_id: "ord-1", filing_session_id: "fs-1", product: "FASTTRACK", total_cents: 49900, line_items: [{ offer_code: "FASTTRACK", unit_amount_cents: 49900, quantity: 1 }], stripe_payment_intent_id: "pi_1" },
       filing_session: { email, entity_name_primary: "Sunshine Ventures LLC", utm_source: "facebook", utm_medium: "paid", utm_campaign: "scorecard" },
     }) as unknown as OrderSyncPayload;
 
@@ -57,6 +57,14 @@ describe("Deal record", () => {
     const r = buildDealRecord(payload("paid_deal"));
     expect(r.Stage).toBe("Closed Won");
     expect(r.Payment_Status).toBe("Payment Collected");
+  });
+
+  it("keeps the amount for a job queued before line items were in the payload", () => {
+    const p = payload("held_deal");
+    delete (p.order as { line_items?: unknown }).line_items;
+    const r = buildDealRecord(p);
+    expect(r.Amount).toBe(499);
+    expect(r.Manual_Review_Required).toBeUndefined();
   });
 
   it("marks test orders", () => {
