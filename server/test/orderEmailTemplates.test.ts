@@ -35,7 +35,10 @@ describe("every order email", () => {
     const email = buildOrderEmail(type, row(), "hold");
     expect(email.text).toContain(DISCLAIMER);
     expect(email.html).toContain("not a law firm or attorney");
-    expect(`${email.text} ${email.html}`).not.toMatch(/unsubscribe|https?:\/\/|% off|upgrade|special offer/i);
+    // The one link allowed: the published payment terms (order confirmation,
+    // Damian's hold wording of 24 Nov 2026). No other link of any kind.
+    const body = `${email.text} ${email.html}`.split("https://damianknowles.com/refund-policy").join("");
+    expect(body).not.toMatch(/unsubscribe|https?:\/\/|% off|upgrade|special offer/i);
   });
 
   it.each(ALL)("%s never carries a tax ID, card number or secret", (type) => {
@@ -90,14 +93,34 @@ describe("welcome", () => {
 
 describe("order confirmation", () => {
   it("says a hold is not a charge and repeats the published payment terms", () => {
-    const { subject, text } = buildOrderEmail("order_confirmation", row(), "hold");
+    const { subject, text, html } = buildOrderEmail("order_confirmation", row(), "hold");
     expect(subject).toBe("Order confirmation for Sol Ventures LLC");
-    expect(text).toContain("We placed a hold of $249.00 on your card. A hold is not a charge: no money leaves your account.");
-    expect(text).toContain("after the Florida Division of Corporations has filed your Articles of Organization");
-    expect(text).toContain("A card hold lasts about 7 days.");
-    expect(text).toContain("To cancel, reply to this email.");
+    expect(text).toContain("We placed a temporary hold of $249.00 on your card. A hold is not a charge\u2014no money leaves your account.");
+    expect(text).toContain("When You Are Actually Charged");
+    expect(text).toContain(
+      "We charge your card only after the Florida Division of Corporations officially files your Articles of Organization. As soon as your LLC is filed, we will email your filing confirmation and process the payment."
+    );
+    expect(text).toContain("- Duration: A card hold may last up to 7 days.");
+    expect(text).toContain(
+      "- If Filing Takes Longer: If your filing is not complete within 7 days, the temporary hold automatically drops off. We will simply charge the same card once your LLC is officially filed."
+    );
+    expect(text).toContain("To cancel, simply reply to this email.");
+    expect(text).toContain("review our Payment Protection Promise (https://damianknowles.com/refund-policy).");
     expect(text).toContain("FastTrack LLC Filing: $199.00");
     expect(text).toContain("Total: $249.00");
+    expect(text).toContain("---\nDamian Knowles is a Business Developer");
+
+    expect(html).toContain("<strong>A hold is not a charge</strong>");
+    expect(html).toContain("<strong>only after</strong>");
+    expect(html).toContain("<li><strong>Duration:</strong> A card hold <strong>may last up to 7 days</strong>.</li>");
+    expect(html).toContain('<a href="https://damianknowles.com/refund-policy" style="color: #1a5fb4;">Payment Protection Promise</a>');
+    expect(html).toMatch(/<hr [^>]*><p style="font-style: italic; color: #666;">Damian Knowles is a Business Developer/);
+  });
+
+  it("keeps the plain footer on the other emails", () => {
+    const { html } = buildOrderEmail("welcome", row(), "hold");
+    expect(html).not.toContain("<hr");
+    expect(html).toContain("<p>Damian Knowles is a Business Developer");
   });
 
   it("states a charge, not a hold, when the card was charged at checkout", () => {
@@ -112,8 +135,10 @@ describe("order confirmation", () => {
       row({ line_items: [{ offer_code: "EIN_FILING", display_name: "EIN Filing", unit_amount_cents: 7500, quantity: 1 }], total_cents: 7500 }),
       "hold"
     );
-    expect(text).toContain("We charge your card only after your filing is complete.");
+    expect(text).toContain("We charge your card only after your filing is complete. As soon as it is complete, we will email you and process the payment.");
+    expect(text).toContain("We will simply charge the same card once your filing is complete.");
     expect(text).not.toContain("Division of Corporations");
+    expect(text).not.toContain("LLC is");
   });
 });
 
