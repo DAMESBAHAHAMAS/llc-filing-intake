@@ -1,4 +1,5 @@
 import { isValidFaxAuditNumber } from "./faxAudit.js";
+import { floridaLongDate } from "../filing/esignature.js";
 import { HOUSE_REGISTERED_AGENT, type FilingSessionRecord } from "./types.js";
 
 export type PdfContextResult =
@@ -29,6 +30,18 @@ function isNonEmptyString(v: unknown): v is string {
  * (decision boundary #3, DECISIONS.md) — this validator's answer to "can
  * we file with zero authorized persons" is no, independent of that.
  */
+const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+/** "2026-12-10" -> "December 10, 2026"; anything that is not a real YYYY-MM-DD date is returned unchanged. */
+export function longEffectiveDate(value: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+  if (!m) return value;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return value;
+  return `${MONTHS[mo - 1]} ${d}, ${y}`;
+}
+
 export function buildPdfContext(
   filingData: Partial<FilingSessionRecord>,
   registeredAgentAcceptanceStatus: string | null,
@@ -91,19 +104,39 @@ export function buildPdfContext(
     return { ok: false, missingFields: missing };
   }
 
+  // T144 D9: the typed e-signature, printed on the signature line. The audit
+  // details (IP, user agent, consent wording) stay in filing_data: the
+  // Articles become a public record. Without a record the Zoho Sign anchors
+  // print as before.
+  const sig = filingData.esignature;
+  const sigTime = sig?.server_received_at ?? sig?.signed_at;
+  const esignature =
+    sig && isNonEmptyString(sig.signer_name) && isNonEmptyString(sigTime) && !Number.isNaN(Date.parse(sigTime))
+      ? {
+          signer_name: sig.signer_name.trim(),
+          signer_title: typeof sig.signer_title === "string" ? sig.signer_title.trim() : "",
+          signed_date: floridaLongDate(sigTime),
+        }
+      : null;
+
   return {
     ok: true,
     context: {
-      llc_name: filingData.llc_name,
+      // Sunbiz records LLC names in ALL CAPS. The website already sends them
+      // that way; this guards older sessions and hand-made requests (T144 D9).
+      llc_name: (filingData.llc_name as string).trim().toUpperCase(),
       principal_address: filingData.principal_address,
       mailing_address: filingData.mailing_address,
       registered_agent_name: registeredAgentName,
       registered_agent_florida_address: registeredAgentAddress,
       authorized_persons: persons,
       effective_date_option: effectiveDateOption,
-      effective_date: filingData.effective_date ?? "",
+      // T144 D9: "December 10, 2026", matching the annual report line below it
+      // (the website stores YYYY-MM-DD). Any other stored form prints as-is.
+      effective_date: longEffectiveDate(filingData.effective_date ?? ""),
       annual_report_due_date: filingData.annual_report_due_date ?? "",
       other_provisions: filingData.other_provisions ?? "",
+      esignature,
       ...(options.faxAuditNumber ? { fax_audit_number: options.faxAuditNumber } : {}),
     },
   };
