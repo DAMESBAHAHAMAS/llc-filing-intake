@@ -41,13 +41,15 @@ export interface EinPortalConfig {
   portalUrl: string;
   /** Zoho portal user type (user group) id for the customers' group. Empty: no invites. */
   portalUserTypeId: string;
-  /** Deal field API names. Only docsReceivedField exists in Zoho today. */
+  /** Deal field API names (created in Zoho 25 Nov 2026; overridable by env). */
   docsReceivedField: string;
   docsReceivedAtField: string;
   passportField: string;
   einIssuedDateField: string;
-  /** Deal stages that count as cancelled for the purge (Zoho Stage values). */
+  /** Deal Stage values that count as cancelled for the purge. */
   purgeStages: string[];
+  /** Deal Payment_Status values that count as refunded for the purge. */
+  purgePaymentStatuses: string[];
   /** Days after EIN issue, or after cancellation/refund, before the passport is cleared. */
   purgeDays: number;
   /** Only orders held or paid within this many days are invited (no old-order backfill). */
@@ -71,6 +73,13 @@ export function safeHttpsUrl(value: string | undefined): string {
   }
 }
 
+function list(value: string | undefined, fallback: string): string[] {
+  return (value ?? fallback)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 /** A Zoho field API name, or "" (letters, digits, underscores only). */
 function apiName(value: string | undefined, fallback = ""): string {
   const v = (value ?? fallback).trim();
@@ -84,13 +93,11 @@ export function einPortalConfig(env: NodeJS.ProcessEnv = process.env): EinPortal
     portalUrl: safeHttpsUrl(env.EIN_PORTAL_URL),
     portalUserTypeId: /^\d+$/.test(userType) ? userType : "",
     docsReceivedField: apiName(env.EIN_DOCS_RECEIVED_FIELD, "EIN_Docs_Received"),
-    docsReceivedAtField: apiName(env.EIN_DOCS_RECEIVED_AT_FIELD),
-    passportField: apiName(env.EIN_PASSPORT_FIELD),
-    einIssuedDateField: apiName(env.EIN_ISSUED_DATE_FIELD),
-    purgeStages: (env.EIN_PURGE_STAGES ?? "Cancelled")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
+    docsReceivedAtField: apiName(env.EIN_DOCS_RECEIVED_AT_FIELD, "EIN_Docs_Received_At"),
+    passportField: apiName(env.EIN_PASSPORT_FIELD, "Passport_Photo_Page"),
+    einIssuedDateField: apiName(env.EIN_ISSUED_DATE_FIELD, "EIN_Issued_Date"),
+    purgeStages: list(env.EIN_PURGE_STAGES, "Cancelled"),
+    purgePaymentStatuses: list(env.EIN_PURGE_PAYMENT_STATUSES, "Refunded"),
     purgeDays: positiveInt(env.EIN_PASSPORT_PURGE_DAYS, 30),
     inviteLookbackDays: positiveInt(env.EIN_PORTAL_INVITE_LOOKBACK_DAYS, 30),
   };
