@@ -11,6 +11,7 @@ import {
   RA_STATUS_ACCEPTED,
   RA_STATUS_AWAITING,
   raDealPayloadNow,
+  raDealStatusField,
   signatureMatchesAgent,
   tokenRef,
   type StoredAcceptance,
@@ -150,8 +151,8 @@ describe("Articles and statement read only the server-side row", () => {
   });
 });
 
-describe("Zoho Deal status: verified Deal, current status, switched off by default", () => {
-  const env = { RA_DEAL_STATUS_FIELD: "Registered_Agent_Status", RA_DEAL_ACCEPTED_AT_FIELD: "Registered_Agent_Accepted_At" };
+describe("Zoho Deal status: verified Deal, current status", () => {
+  const env = { RA_DEAL_ACCEPTED_AT_FIELD: "Registered_Agent_Accepted_At" };
 
   it("never uses the client-supplied crm_deal_id, and queues nothing without a verified Deal", async () => {
     const pool = await db();
@@ -159,9 +160,13 @@ describe("Zoho Deal status: verified Deal, current status, switched off by defau
     expect(await raDealPayloadNow(pool, S1, env)).toMatchObject({ ok: false });
   });
 
-  it("is off until RA_DEAL_STATUS_FIELD is set", async () => {
+  it("writes RA_Acceptance_Status by default, and can be switched off", async () => {
+    expect(raDealStatusField({})).toBe("RA_Acceptance_Status");
+    expect(raDealStatusField({ RA_DEAL_STATUS_FIELD: "Other_Field" })).toBe("Other_Field");
+    expect(raDealStatusField({ RA_DEAL_STATUS_FIELD: "off" })).toBe("");
+    expect(raDealStatusField({ RA_DEAL_STATUS_FIELD: "bad name!" })).toBe("");
     const pool = await db();
-    expect(await queueRaDealStatus(pool, S1, {})).toMatchObject({ queued: false, reason: "RA_DEAL_STATUS_FIELD not set" });
+    expect(await queueRaDealStatus(pool, S1, { RA_DEAL_STATUS_FIELD: "off" })).toMatchObject({ queued: false });
   });
 
   it("sends the verified Deal and the status as it is when the job runs", async () => {
@@ -176,12 +181,12 @@ describe("Zoho Deal status: verified Deal, current status, switched off by defau
 
     let built = await raDealPayloadNow(pool, S1, env);
     expect(built).toEqual({ ok: true, payload: { crm_deal_id: "verified-deal", expected_email: "", server_created: true,
-      extra_fields: { Registered_Agent_Status: RA_STATUS_AWAITING } } });
+      extra_fields: { RA_Acceptance_Status: RA_STATUS_AWAITING } } });
 
     // The agent accepts before the old "Awaiting" job is sent: it now sends "Accepted".
     await recordAcceptance(pool, { acceptanceId: 1, filingSessionId: S1, signatureName: "Riley Test Agent", ip: null, userAgent: null, acceptedAt: at, requireSignature: false });
     built = await raDealPayloadNow(pool, S1, env);
-    expect(built.ok && built.payload.extra_fields).toEqual({ Registered_Agent_Status: RA_STATUS_ACCEPTED, Registered_Agent_Accepted_At: "2026-11-25T15:31:00+00:00" });
+    expect(built.ok && built.payload.extra_fields).toEqual({ RA_Acceptance_Status: RA_STATUS_ACCEPTED, Registered_Agent_Accepted_At: "2026-11-25T15:31:00+00:00" });
   });
 });
 

@@ -160,9 +160,23 @@ function validFieldName(v: string | undefined): string {
   return v && /^[A-Za-z][A-Za-z0-9_]{0,99}$/.test(v) ? v : "";
 }
 
-/** Off unless RA_DEAL_STATUS_FIELD names a Deal field (none exists yet: an admin creates the picklist). */
+/** Deals.RA_Acceptance_Status (text, id 2654294000040675015), created by the dispatcher 25 Nov 2026. */
+export const DEFAULT_RA_DEAL_STATUS_FIELD = "RA_Acceptance_Status";
+
+/**
+ * The Deal field for the agent status: RA_DEAL_STATUS_FIELD when set,
+ * otherwise RA_Acceptance_Status. Set RA_DEAL_STATUS_FIELD=off to switch the
+ * Deal update off. A malformed name also switches it off.
+ */
+export function raDealStatusField(env: NodeJS.ProcessEnv = process.env): string {
+  const v = env.RA_DEAL_STATUS_FIELD;
+  if (v === undefined) return DEFAULT_RA_DEAL_STATUS_FIELD;
+  if (v.trim().toLowerCase() === "off") return "";
+  return validFieldName(v.trim());
+}
+
 export function raDealSyncEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return validFieldName(env.RA_DEAL_STATUS_FIELD) !== "";
+  return raDealStatusField(env) !== "";
 }
 
 /** The Deal of the session's earliest held or paid order whose Deal id a sync job verified (#26's rule). */
@@ -194,7 +208,7 @@ export async function queueRaDealStatus(
   filingSessionId: string,
   env: NodeJS.ProcessEnv = process.env
 ): Promise<{ queued: boolean; reason?: string }> {
-  if (!raDealSyncEnabled(env)) return { queued: false, reason: "RA_DEAL_STATUS_FIELD not set" };
+  if (!raDealSyncEnabled(env)) return { queued: false, reason: "RA Deal status switched off (RA_DEAL_STATUS_FIELD=off)" };
   if (!(await verifiedDealId(db, filingSessionId))) return { queued: false, reason: "no verified Deal (held or paid order) yet" };
   const pending = await db.query(
     `SELECT 1 FROM crm_sync_queue WHERE filing_session_id = $1 AND sync_type = $2 AND status = 'pending' LIMIT 1`,
@@ -225,8 +239,8 @@ export async function raDealPayloadNow(
   filingSessionId: string,
   env: NodeJS.ProcessEnv = process.env
 ): Promise<{ ok: true; payload: DealStageUpdatePayload } | { ok: false; reason: string }> {
-  const statusField = validFieldName(env.RA_DEAL_STATUS_FIELD);
-  if (!statusField) return { ok: false, reason: "RA_DEAL_STATUS_FIELD not set" };
+  const statusField = raDealStatusField(env);
+  if (!statusField) return { ok: false, reason: "RA Deal status switched off (RA_DEAL_STATUS_FIELD=off)" };
   const dealId = await verifiedDealId(db, filingSessionId);
   if (!dealId) return { ok: false, reason: "no verified Deal for this filing session" };
   const { rows } = await db.query<{ registered_agent_status: string | null }>(
