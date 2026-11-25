@@ -4,5 +4,5 @@
 - Downloaded 23 Nov 2026 on Damian's written authorization (specimen package ART-12); copied here 25 Nov 2026 for T144 Dispatch 11.
 - Revision printed on the form: Rev. December 2025 (Cat. No. 16055N).
 - Size 122,921 bytes. SHA-256 `23d295529950b05979596cf58d559db6c433a4ec852407b1820265c117cb3ca2`.
-- AcroForm, no XFA, not encrypted. Filled by `render_pdf.py` POST /generate-ss4 with values from `server/src/ein/ss4.ts`.
+- Hybrid form, not encrypted: an AcroForm plus an XFA copy whose data is empty. The filler deletes /XFA from its output so XFA-aware viewers (Acrobat, Reader) show the filled AcroForm (T144 D11 follow-up). Filled by `render_pdf.py` POST /generate-ss4 with values from `server/src/ein/ss4.ts`.
 - The IRS revises this form. Before relying on a new download, re-check the field names in `ss4.ts` (the filler refuses unknown field names) and the hash above.
