@@ -155,6 +155,15 @@ registeredAgentRouter.post("/registered-agent/select", async (req, res) => {
     await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'pending' WHERE filing_session_id = $1`, [
       filingSessionId,
     ]);
+    // A link already out was sent for the details saved before this call.
+    // The website only re-saves an own agent when those details changed
+    // (ST06), so that old link must stop working: otherwise the agent could
+    // accept an address the customer has since replaced.
+    await pool.query(
+      `UPDATE registered_agent_acceptances SET status = 'expired'
+       WHERE filing_session_id = $1 AND status = 'acceptance_requested'`,
+      [filingSessionId]
+    );
 
     const llcNameRow = await pool.query<{ filing_data: { llc_name?: string } | null }>(
       `SELECT filing_data FROM filing_sessions WHERE filing_session_id = $1`,
