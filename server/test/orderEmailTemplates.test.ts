@@ -209,3 +209,14 @@ describe("filing confirmation", () => {
     expect(text).not.toContain("Sunbiz");
   });
 });
+
+describe("Article IV titles in the intake summary (website ST07)", () => {
+  it("spells out AR as Authorized Representative and keeps older AMBR sessions readable", () => {
+    const ar = buildOrderEmail("intake_summary", row({
+      filing_data: { ...row().filing_data, authorized_persons: [{ name: "Ana Sol", article_iv_title: "AR", address: "100 Main St, Miami, FL" }] },
+    }), "hold");
+    expect(ar.text).toContain("Authorized Representative");
+    const ambr = buildOrderEmail("intake_summary", row(), "hold");
+    expect(ambr.text).toContain("Member");
+  });
+});

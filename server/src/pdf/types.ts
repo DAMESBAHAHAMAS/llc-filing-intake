@@ -8,7 +8,7 @@
  * shape onto the template's exact variable names.
  */
 export interface AuthorizedPerson {
-  article_iv_title: string; // "AMBR" or "MGR" per the template's key
+  article_iv_title: string; // "MGR" or "AR" (website ST07, 25 Nov 2026); older sessions may hold "AMBR"
   name: string;
   address: string;
 }
