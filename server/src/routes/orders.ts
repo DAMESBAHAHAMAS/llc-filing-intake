@@ -11,6 +11,7 @@ import {
 } from "../stripe/restClient.js";
 import { holdNoLongerCapturable } from "../payments/holdState.js";
 import { sendOpsAlert } from "../ops/alerts.js";
+import { effectiveDateProblem, floridaToday, windowForFilingDate } from "../filing/effectiveDateWindow.js";
 import { alertEmailsNotQueued, enqueueCustomerEmails, listOrderEmails } from "../orderEmails/worker.js";
 
 export const ordersRouter = Router();
@@ -161,6 +162,46 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
   } catch (err) {
     await recordCaptureError(order.order_id, err);
     res.status(502).json({ error: "saved-card charge failed", detail: describeError(err), order_id: order.order_id });
+  }
+});
+
+/**
+ * POST /api/orders/:orderId/effective-date-check (operator)
+ *
+ * ST08: run right before submitting the Articles to Sunbiz. Re-checks a
+ * chosen effective date against Florida's window for a filing made today.
+ * Out of range: the order is paused (requires_review, with the reason) and
+ * the answer is 409, so the date is not filed; ask the customer for a new
+ * date. No payment is touched.
+ */
+ordersRouter.post("/api/orders/:orderId/effective-date-check", async (req, res) => {
+  if (!operatorAuthorized(req)) {
+    res.status(401).json({ error: "operator key required" });
+    return;
+  }
+  try {
+    const { rows } = await pool.query<{ filing_data: { effective_date_option?: string; effective_date?: string } | null }>(
+      `SELECT fs.filing_data FROM orders o JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id
+       WHERE o.order_id = $1`,
+      [req.params.orderId]
+    );
+    if (!rows.length) {
+      res.status(404).json({ error: "order not found" });
+      return;
+    }
+    const today = floridaToday();
+    const problem = effectiveDateProblem(rows[0].filing_data ?? {}, today);
+    if (problem) {
+      await pool.query(
+        `UPDATE orders SET fulfillment_status = 'requires_review', fulfillment_last_error = $2 WHERE order_id = $1`,
+        [req.params.orderId, problem]
+      );
+      res.status(409).json({ ok: false, error: problem });
+      return;
+    }
+    res.status(200).json({ ok: true, submission_date: today, window: windowForFilingDate(today) });
+  } catch (err) {
+    res.status(500).json({ error: "effective date check failed", detail: describeError(err) });
   }
 });
 

@@ -3,6 +3,8 @@ import { backoffForAttempt, isDeadLetter } from "../sync/backoff.js";
 import { buildPdfContext } from "../pdf/context.js";
 import type { FilingSessionRecord } from "../pdf/types.js";
 import { generateArticlesOfOrganizationPdf } from "../pdf/serviceClient.js";
+import { effectiveDateProblem, floridaToday } from "../filing/effectiveDateWindow.js";
+import { sendOpsAlert } from "../ops/alerts.js";
 
 const MAX_FULFILLMENT_ATTEMPTS = 6;
 
@@ -73,7 +75,12 @@ export async function claimNextReadyOrder(pool: Pool, lockedBy: string): Promise
  * a timer, it needs the customer/ops to actually supply the missing
  * data, so it is deliberately NOT re-queued via backoff.
  */
-export async function processClaimedOrder(pool: Pool, order: ClaimedOrder): Promise<void> {
+export interface ProcessDeps {
+  now?: () => Date;
+  alert?: (subject: string, body: string) => Promise<unknown>;
+}
+
+export async function processClaimedOrder(pool: Pool, order: ClaimedOrder, deps: ProcessDeps = {}): Promise<void> {
   const sessionRes = await pool.query<{ filing_data: Partial<FilingSessionRecord> | null; registered_agent_status: string | null }>(
     `SELECT filing_data, registered_agent_status FROM filing_sessions WHERE filing_session_id = $1`,
     [order.filing_session_id]
@@ -81,6 +88,20 @@ export async function processClaimedOrder(pool: Pool, order: ClaimedOrder): Prom
 
   const filingData = sessionRes.rows[0]?.filing_data ?? {};
   const registeredAgentStatus = sessionRes.rows[0]?.registered_agent_status ?? null;
+
+  // ST08 pre-submission guard: a chosen effective date must still fit the
+  // window for a filing made today. If a delay pushed it out, pause for a
+  // person to ask the customer for a new date; never file a date Florida
+  // would refuse.
+  const dateProblem = effectiveDateProblem(filingData, floridaToday((deps.now ?? (() => new Date()))()));
+  if (dateProblem) {
+    await pool.query(
+      `UPDATE orders SET fulfillment_status = 'requires_review', fulfillment_last_error = $2 WHERE order_id = $1`,
+      [order.order_id, dateProblem]
+    );
+    await (deps.alert ?? sendOpsAlert)(`Effective date needs a new date (order ${order.order_id})`, dateProblem).catch(() => {});
+    return;
+  }
 
   const contextResult = buildPdfContext(filingData, registeredAgentStatus);
   if (!contextResult.ok) {
