@@ -1,6 +1,8 @@
 import { isValidFaxAuditNumber } from "./faxAudit.js";
 import { floridaLongDate } from "../filing/esignature.js";
 import { HOUSE_REGISTERED_AGENT, type FilingSessionRecord } from "./types.js";
+import { registeredAgentSignatureForArticles } from "../registeredAgent/acceptanceStatement.js";
+import type { StoredAcceptance } from "../registeredAgent/acceptanceRecord.js";
 
 export type PdfContextResult =
   | { ok: true; context: Record<string, unknown> }
@@ -46,7 +48,11 @@ export function buildPdfContext(
   filingData: Partial<FilingSessionRecord>,
   registeredAgentAcceptanceStatus: string | null,
   /** Fax filings only: the Sunbiz Fax Audit Number, printed top and bottom of every page. */
-  options: { faxAuditNumber?: string } = {}
+  options: {
+    faxAuditNumber?: string;
+    /** T144 D12: the own agent's signed acceptance, from the server-side row (loadStoredAcceptance). */
+    registeredAgentAcceptance?: StoredAcceptance | null;
+  } = {}
 ): PdfContextResult {
   const missing: string[] = [];
 
@@ -138,6 +144,13 @@ export function buildPdfContext(
       other_provisions: filingData.other_provisions ?? "",
       esignature,
       ...(options.faxAuditNumber ? { fax_audit_number: options.faxAuditNumber } : {}),
+      // T144 D12: the own agent's typed acceptance signature (Article III), from the
+      // server-side acceptance row only, and only while the filing names the agent and
+      // address that were accepted. Otherwise null: the Zoho Sign anchors print instead.
+      registered_agent_signature:
+        filingData.registered_agent_path === "customer" && registeredAgentAcceptanceStatus === "accepted"
+          ? registeredAgentSignatureForArticles(options.registeredAgentAcceptance ?? null, filingData)
+          : null,
     },
   };
 }

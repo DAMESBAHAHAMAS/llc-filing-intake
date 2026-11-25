@@ -2,6 +2,7 @@ import { Router } from "express";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { buildPdfContext } from "../pdf/context.js";
+import { loadStoredAcceptance } from "../registeredAgent/acceptanceRecord.js";
 import { generateArticlesOfOrganizationPdf } from "../pdf/serviceClient.js";
 import type { FilingSessionRecord } from "../pdf/types.js";
 
@@ -66,7 +67,9 @@ filingDocumentRouter.post("/api/filing-session/:filingSessionId/pdf", async (req
     const filingData = sessionRes.rows[0].filing_data ?? {};
     const registeredAgentStatus = sessionRes.rows[0].registered_agent_status;
 
-    const contextResult = buildPdfContext(filingData, registeredAgentStatus);
+    const contextResult = buildPdfContext(filingData, registeredAgentStatus, {
+      registeredAgentAcceptance: await loadStoredAcceptance(pool, filingSessionId),
+    });
     if (!contextResult.ok) {
       res.status(422).json({ error: "filing data incomplete", missingFields: contextResult.missingFields });
       return;

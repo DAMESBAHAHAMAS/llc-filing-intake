@@ -4,6 +4,39 @@ import { describeError } from "../db/describeError.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
 import { isDuplicateAcceptanceRequest, type LatestAcceptanceRow } from "../registeredAgent/acceptancePolicy.js";
+import {
+  checkSignature,
+  loadStoredAcceptance,
+  queueRaDealStatus,
+  RA_ACCEPTANCE_STATEMENT,
+  RA_ACCEPTANCE_STATEMENT_VERSION,
+  requireSignature,
+} from "../registeredAgent/acceptanceRecord.js";
+import { recordAcceptance } from "../registeredAgent/acceptTransaction.js";
+import { clientKey } from "../middleware/rateLimit.js";
+import { buildAcceptanceStatementContext } from "../registeredAgent/acceptanceStatement.js";
+import { renderTemplatePdf } from "../pdf/serviceClient.js";
+import { operatorAuthorized } from "./orders.js";
+
+/** The visitor's IP behind Render's proxies (True-Client-IP), or null. */
+function visitorIp(req: import("express").Request): string | null {
+  const ip = clientKey(req);
+  return ip === "unknown" ? null : ip;
+}
+
+/**
+ * Logs and swallows: a Zoho status update must never fail the agent's answer.
+ * The job sends the session's status as it is when the job runs (see
+ * acceptanceRecord.ts raDealPayloadNow), so the order of jobs does not matter.
+ */
+async function queueRaStatusQuietly(filingSessionId: string): Promise<void> {
+  try {
+    const r = await queueRaDealStatus(pool, filingSessionId);
+    if (!r.queued) console.log(`[ra status] Deal not updated for ${filingSessionId}: ${r.reason}`);
+  } catch (err) {
+    console.error(`[ra status] queueing failed for ${filingSessionId}:`, err);
+  }
+}
 
 export const registeredAgentRouter = Router();
 
@@ -256,6 +289,8 @@ registeredAgentRouter.post("/api/registered-agent/request-acceptance", async (re
       return;
     }
 
+    await queueRaStatusQuietly(filingSessionId);
+
     const frontendBaseUrl = process.env.FRONTEND_BASE_URL ?? "";
     res.status(200).json({ email_sent: true, note: "Acceptance email sent via Resend." , frontend_base_url: frontendBaseUrl });
   } catch (err) {
@@ -291,9 +326,17 @@ async function resolveActionableAcceptance(token: string) {
 
 /** POST /api/registered-agent/accept — { token } */
 registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
-  const token = typeof (req.body as Record<string, unknown>)?.token === "string" ? (req.body as Record<string, unknown>).token as string : "";
+  const body = ((req.body ?? {}) as Record<string, unknown>);
+  const token = typeof body.token === "string" ? body.token : "";
   if (!token) {
     res.status(400).json({ error: "token is required" });
+    return;
+  }
+  // T144 D12: the agent's typed full name and consent (required once
+  // RA_ACCEPT_REQUIRE_SIGNATURE=true; see registeredAgent/acceptanceRecord.ts).
+  const signature = checkSignature(body);
+  if (!signature.ok) {
+    res.status(signature.status).json({ error: signature.error, code: signature.code });
     return;
   }
 
@@ -308,14 +351,33 @@ registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
       return;
     }
 
-    const clientIp = req.ip ?? req.socket.remoteAddress ?? null;
-    await pool.query(
-      `UPDATE registered_agent_acceptances SET status = 'accepted', accepted_at = now(), accepted_ip = $2 WHERE id = $1`,
-      [resolved.row.id, clientIp]
-    );
-    await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'accepted' WHERE filing_session_id = $1`, [
-      resolved.row.filing_session_id,
-    ]);
+    // One transaction: uses the token, stores the signed acceptance on the
+    // acceptance row (never filing_data) and opens the filing gate.
+    const outcome = await recordAcceptance(pool, {
+      acceptanceId: resolved.row.id,
+      filingSessionId: resolved.row.filing_session_id,
+      signatureName: signature.signatureName,
+      ip: visitorIp(req),
+      userAgent: req.get("user-agent"),
+      acceptedAt: new Date(),
+      requireSignature: requireSignature(),
+    });
+    if (outcome.kind === "not_actionable") {
+      res.status(409).json({ error: `token is not actionable (status=${outcome.status})` });
+      return;
+    }
+    if (outcome.kind === "signature_mismatch") {
+      res.status(400).json({
+        error: "signature_name must be the name of the registered agent named in this request",
+        code: "signature_mismatch",
+        registered_agent_name: outcome.agentName,
+      });
+      return;
+    }
+    if (outcome.kind === "signature_storage_unavailable") {
+      res.status(503).json({ error: "signatures cannot be stored yet (migration 0033 not applied)", code: "not_ready" });
+      return;
+    }
 
     // Best-effort, post-commit-equivalent: the acceptance itself is
     // already durable regardless of what happens here. A failure just
@@ -327,13 +389,67 @@ registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
       console.error(`Fulfillment re-evaluation failed for filing_session_id=${resolved.row.filing_session_id}:`, err);
     }
 
-    res.status(200).json({ status: "accepted" });
+    await queueRaStatusQuietly(resolved.row.filing_session_id);
+
+    res.status(200).json({ status: "accepted", signed: outcome.signed });
   } catch (err) {
     res.status(500).json({ error: "accept failed", detail: describeError(err) });
   }
 });
 
 /** POST /api/registered-agent/decline — { token } */
+/**
+ * POST /api/registered-agent/acceptance/details { token } (T144 D12)
+ *
+ * What the acceptance page shows before the agent answers: the LLC, the agent
+ * name and Florida address the email already named, and the statement they
+ * sign. The token goes in the body, not the URL, so it stays out of access
+ * logs. Records nothing. 404 for an unknown token; status tells the page
+ * whether the link can still be answered.
+ */
+registeredAgentRouter.post("/api/registered-agent/acceptance/details", async (req, res) => {
+  const token = typeof (req.body as Record<string, unknown>)?.token === "string" ? ((req.body as Record<string, unknown>).token as string) : "";
+  if (!token) {
+    res.status(400).json({ error: "token is required" });
+    return;
+  }
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const resolved = await resolveActionableAcceptance(token);
+    if (!resolved.found) {
+      res.status(404).json({ error: "unknown or invalid token" });
+      return;
+    }
+    const { rows } = await pool.query<{ filing_data: Record<string, unknown> | null }>(
+      `SELECT filing_data FROM filing_sessions WHERE filing_session_id = $1`,
+      [resolved.row.filing_session_id]
+    );
+    const fd = rows[0]?.filing_data ?? {};
+    const s = (k: string) => (typeof fd[k] === "string" ? (fd[k] as string) : "");
+    // The agent name the signature is checked against: the one the request was sent to.
+    const named = await pool.query<{ registered_agent_name: string }>(
+      `SELECT registered_agent_name FROM registered_agent_acceptances WHERE id = $1`,
+      [resolved.row.id]
+    );
+    const expiresAt = resolved.row.requested_at
+      ? new Date(new Date(resolved.row.requested_at).getTime() + ACCEPTANCE_TOKEN_TTL_MS).toISOString()
+      : null;
+    res.status(200).json({
+      actionable: resolved.actionable,
+      status: resolved.row.status,
+      llc_name: s("llc_name").toUpperCase(),
+      registered_agent_name: named.rows[0]?.registered_agent_name ?? s("registered_agent_name"),
+      registered_agent_florida_address: s("registered_agent_florida_address"),
+      statement: RA_ACCEPTANCE_STATEMENT,
+      statement_version: RA_ACCEPTANCE_STATEMENT_VERSION,
+      signature_required: requireSignature(),
+      expires_at: expiresAt,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "details lookup failed", detail: describeError(err) });
+  }
+});
+
 registeredAgentRouter.post("/api/registered-agent/decline", async (req, res) => {
   const token = typeof (req.body as Record<string, unknown>)?.token === "string" ? (req.body as Record<string, unknown>).token as string : "";
   if (!token) {
@@ -356,6 +472,7 @@ registeredAgentRouter.post("/api/registered-agent/decline", async (req, res) => 
     await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'declined' WHERE filing_session_id = $1`, [
       resolved.row.filing_session_id,
     ]);
+    await queueRaStatusQuietly(resolved.row.filing_session_id);
 
     res.status(200).json({ status: "declined" });
   } catch (err) {
@@ -364,6 +481,41 @@ registeredAgentRouter.post("/api/registered-agent/decline", async (req, res) => 
 });
 
 /** GET /api/registered-agent/status/:filingSessionId — polling endpoint. */
+/**
+ * POST /api/ops/registered-agent/acceptance-statement/:filingSessionId (operator, T144 D12)
+ * Renders the signed Registered Agent Acceptance Statement as a PDF. Stores and sends nothing.
+ */
+registeredAgentRouter.post("/api/ops/registered-agent/acceptance-statement/:filingSessionId", async (req, res) => {
+  if (!operatorAuthorized(req)) {
+    res.status(401).json({ error: "operator key required" });
+    return;
+  }
+  try {
+    const exists = await pool.query(`SELECT 1 FROM filing_sessions WHERE filing_session_id = $1`, [req.params.filingSessionId]);
+    if (!exists.rowCount) {
+      res.status(404).json({ error: "unknown filing_session_id" });
+      return;
+    }
+    // Server-side acceptance row only (migration 0033), never filing_data.
+    const ctx = buildAcceptanceStatementContext(await loadStoredAcceptance(pool, req.params.filingSessionId));
+    if (!ctx.ok) {
+      res.status(422).json({ error: "no signed acceptance on file", missingFields: ctx.missingFields });
+      return;
+    }
+    const pdf = await renderTemplatePdf("registered_agent_acceptance_statement", ctx.context);
+    if (!pdf.ok) {
+      res.status(502).json({ error: "PDF generation failed", detail: pdf.error });
+      return;
+    }
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("X-Content-SHA256", pdf.sha256);
+    res.setHeader("Cache-Control", "no-store");
+    res.status(200).send(pdf.pdfBytes);
+  } catch (err) {
+    res.status(500).json({ error: "statement failed", detail: describeError(err) });
+  }
+});
+
 registeredAgentRouter.get("/api/registered-agent/status/:filingSessionId", async (req, res) => {
   try {
     const { rows } = await pool.query(

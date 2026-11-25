@@ -249,6 +249,19 @@
     color: #0087D4;
     margin: 0 0 10px 0;
   }
+
+  /* T144 D12: own registered agent's typed acceptance signature (Article III). */
+  .ra-esignature {
+    font-family: "Brush Script MT", "Segoe Script", cursive;
+    font-size: 16pt;
+    margin: 6px 0 2px;
+  }
+
+  .ra-esignature-detail {
+    font-size: 8.5pt;
+    color: #334155;
+    margin: 0;
+  }
 </style>
 </head>
 <body>
@@ -287,9 +300,15 @@
 
   <div class="signature-block">
     <p class="signature-label">Registered Agent's Signature (REQUIRED)</p>
+    {# T144 D12: 'is defined' first, because render_pdf.py uses StrictUndefined and the PDF service can deploy before the data spine. #}
+    {% if registered_agent_signature is defined and registered_agent_signature %}
+    <p class="ra-esignature">/s/ {{ registered_agent_signature.name }}</p>
+    <p class="ra-esignature-detail">{{ registered_agent_signature.name }}, Registered Agent &middot; Electronically signed {{ registered_agent_signature.date }}</p>
+    {% else %}
     {# Zoho Sign text-tag anchors must render as literal braces in the output HTML for Zoho Sign's text scanner — not resolved as Jinja variables #}
     <span class="zs-anchor">{{ '{{zs_agent_signature}}' }}</span>
     <span class="zs-anchor">{{ '{{zs_agent_printed_name}}' }}</span>
+    {% endif %}
   </div>
 </section>
 

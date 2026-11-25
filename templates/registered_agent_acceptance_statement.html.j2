@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Registered Agent Acceptance Statement — {{ llc_name }}</title>
+<style>
+  /* No context values inside CSS strings: autoescaped entities (&amp;, &#39;) would print literally there. */
+  @page { size: letter; margin: 0.9in 0.9in 0.8in; @bottom-center { content: "Registered Agent Acceptance Statement · Page " counter(page) " of " counter(pages); font-size: 8pt; color: #64748b; } }
+  body { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 10.5pt; color: #0f172a; line-height: 1.5; }
+  h1 { font-size: 16pt; margin: 0 0 4px; color: #12395a; text-transform: uppercase; letter-spacing: .5px; }
+  .sub { color: #1f5ea8; font-style: italic; margin: 0 0 22px; }
+  h2 { font-size: 10pt; text-transform: uppercase; letter-spacing: .8px; color: #12395a; border-bottom: 1.5px solid #1f8fd6; padding-bottom: 3px; margin: 20px 0 8px; }
+  .label { font-size: 8pt; text-transform: uppercase; letter-spacing: .6px; color: #1f5ea8; margin: 8px 0 0; }
+  .value { margin: 0; }
+  .statement { border-left: 3px solid #1f5ea8; padding: 6px 12px; background: #f8fafc; }
+  .sig { font-family: "Brush Script MT", "Segoe Script", cursive; font-size: 18pt; margin: 6px 0 0; }
+  table.audit { width: 100%; border-collapse: collapse; font-size: 9pt; }
+  table.audit td { border-top: 1px solid #e2e8f0; padding: 5px 4px; vertical-align: top; }
+  table.audit td:first-child { width: 32%; color: #334155; }
+  .note { font-size: 8.5pt; color: #475569; margin-top: 18px; }
+</style>
+</head>
+<body>
+  <h1>Registered Agent Acceptance Statement</h1>
+  <p class="sub">Florida limited liability company · Chapter 605, Florida Statutes</p>
+
+  <h2>Company and Registered Agent</h2>
+  <p class="label">Limited liability company</p><p class="value">{{ llc_name }}</p>
+  <p class="label">Registered agent</p><p class="value">{{ registered_agent_name }}</p>
+  <p class="label">Registered office (Florida street address)</p><p class="value">{{ registered_agent_florida_address }}</p>
+
+  <h2>Statement of Acceptance</h2>
+  <p class="statement">{{ statement_text }}</p>
+
+  <h2>Signature</h2>
+  <p class="sig">/s/ {{ signature_name }}</p>
+  <p class="value">{{ signature_name }}, Registered Agent · Electronically signed {{ accepted_at_display }}</p>
+
+  <h2>Electronic Signature Record</h2>
+  <table class="audit">
+    <tr><td>Signed (UTC)</td><td>{{ accepted_at_iso }}</td></tr>
+    <tr><td>Method</td><td>Full name typed by the registered agent after reading the statement, with consent, on the secure acceptance page linked from the email sent to the agent</td></tr>
+    <tr><td>IP address</td><td>{{ ip }}</td></tr>
+    <tr><td>Browser</td><td>{{ user_agent }}</td></tr>
+    <tr><td>Statement version</td><td>{{ statement_version }}</td></tr>
+    <tr><td>Request reference</td><td>{{ token_ref }}</td></tr>
+  </table>
+  <p class="note">Electronic signatures are valid under s. 668.50, Florida Statutes. This record is kept with the company's filing; it is not filed with the Department of State.</p>
+</body>
+</html>
