@@ -6,7 +6,7 @@ import re
 from flask import Flask, Response, jsonify, request
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, TemplateNotFound, UndefinedError
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import NameObject
+from pypdf.generic import NameObject, TextStringObject
 from weasyprint import HTML
 from werkzeug.utils import secure_filename
 
@@ -150,6 +150,7 @@ def generate_ss4():
     values = body["values"]
     text = values.get("text") or {}
     checks = values.get("check") or []
+    font_sizes = values.get("font_size") or {}
     watermark = body.get("watermark")
 
     if not isinstance(text, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in text.items()):
@@ -158,6 +159,11 @@ def generate_ss4():
         isinstance(c, list) and len(c) == 2 and all(isinstance(x, str) for x in c) for c in checks
     ):
         return jsonify({"error": "values.check must be a list of [field, on_state] pairs"}), 400
+    if not isinstance(font_sizes, dict) or not all(
+        isinstance(k, str) and k in text and isinstance(v, (int, float)) and not isinstance(v, bool) and 5 <= v <= 12
+        for k, v in font_sizes.items()
+    ):
+        return jsonify({"error": "values.font_size must map filled text fields to 5-12 pt"}), 422
     if any(len(v) > _SS4_MAX_TEXT for v in text.values()):
         return jsonify({"error": f"text values are limited to {_SS4_MAX_TEXT} characters"}), 422
     if watermark is not None and not (isinstance(watermark, str) and _WATERMARK.fullmatch(watermark)):
@@ -177,6 +183,19 @@ def generate_ss4():
     bad_states = sorted(f for f, on in checks if on not in widgets[f][2])
     if bad_states:
         return jsonify({"error": "checkbox on-state not on this form revision", "fields": bad_states}), 422
+
+    # The IRS form is a hybrid: an XFA copy of the form (with empty data) sits
+    # beside the AcroForm. XFA-aware viewers (Acrobat, Reader) would show that
+    # empty copy, so the filled output keeps only the AcroForm.
+    acroform = writer._root_object["/AcroForm"]
+    if "/XFA" in acroform:
+        del acroform["/XFA"]
+
+    # A smaller font for a field whose text would not fit (line 9a's write-in).
+    for field, size in font_sizes.items():
+        widget = widgets[field][0]
+        da = str(widget.get("/DA", ""))
+        widget[NameObject("/DA")] = TextStringObject(re.sub(r"[0-9.]+ Tf", f"{float(size):.2f} Tf", da, count=1))
 
     writer.update_page_form_field_values(
         writer.pages[0], {SS4_PREFIX + k: v for k, v in text.items()}, auto_regenerate=False

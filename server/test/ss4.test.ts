@@ -38,7 +38,9 @@ describe("buildSs4Values (T144 D11)", () => {
     expect(t[FIELD.line7aResponsibleParty]).toBe("Jordan Test Rivera");
     expect(t[FIELD.line7bSsnItin]).toBe("Foreign");
     expect(t[FIELD.line8bMemberCount]).toBe("1");
-    expect(t[FIELD.line9aOtherSpecify]).toBe("Foreign-owned disregarded entity");
+    expect(t[FIELD.line9aOtherSpecify]).toBe("Foreign-owned U.S. disregarded entity-Form 5472");
+    expect(r.values.font_size).toEqual({ [FIELD.line9aOtherSpecify]: 6.5 });
+    expect(t[FIELD.line15FirstWages]).toBe("N/A");
     expect(t[FIELD.line11DateStarted]).toBe("11/30/2026");
     expect(t[FIELD.line12ClosingMonth]).toBe("December");
     expect(t[FIELD.designeeName]).toBe("Damian Knowles");
@@ -52,6 +54,7 @@ describe("buildSs4Values (T144 D11)", () => {
     const r = buildSs4Values(filing, { filing_date: "2026-11-30" }, { ...inputs, member_count: 2 });
     expect(r.ok && r.values.check).toContainEqual([CHECK.line9aPartnership.field, CHECK.line9aPartnership.on]);
     expect(r.ok && r.values.text[FIELD.line9aOtherSpecify]).toBeUndefined();
+    expect(r.ok && r.values.font_size).toBeUndefined();
   });
 
   it("leaves lines 5a-5b empty when the street matches the mailing address", () => {

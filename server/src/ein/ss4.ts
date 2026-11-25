@@ -21,6 +21,11 @@ export const SS4_FORM_REVISION = "Rev. December 2025";
 /** Line 10's "specify type" box is about 57pt wide. */
 export const LINE10_MAX = 14;
 
+/** Line 9a write-in for a foreign-owned single-member LLC, word for word from the SS-4 instructions. */
+export const LINE9A_FOREIGN_OWNED_DE = "Foreign-owned U.S. disregarded entity-Form 5472";
+/** The 9a "Other (specify)" box is 180pt wide at a fixed 8pt; the official phrase needs about 6.5pt. */
+const LINE9A_FONT_SIZE = 6.5;
+
 /** Text fields, by SS-4 line. */
 export const FIELD = {
   line1LegalName: "f1_2[0]",
@@ -40,6 +45,7 @@ export const FIELD = {
   line13Agricultural: "f1_33[0]",
   line13Household: "f1_34[0]",
   line13Other: "f1_35[0]",
+  line15FirstWages: "f1_36[0]",
   line16OtherSpecify: "f1_37[0]",
   line17Merchandise: "f1_38[0]",
   designeeName: "f1_40[0]",
@@ -110,8 +116,11 @@ export interface Ss4Filed {
 export type Ss4Result =
   | {
       ok: true;
-      /** Values for render_pdf.py: text by field name, checkboxes as [field, on-state]. */
-      values: { text: Record<string, string>; check: Array<[string, string]> };
+      /**
+       * Values for render_pdf.py: text by field name, checkboxes as [field, on-state],
+       * and a smaller font for a field whose text would not fit at the form's own size.
+       */
+      values: { text: Record<string, string>; check: Array<[string, string]>; font_size?: Record<string, number> };
       /** The same answers by SS-4 line, for the operator and the audit log. */
       summary: Record<string, string>;
     }
@@ -260,11 +269,12 @@ export function buildSs4Values(
 
   if (missing.length > 0) return { ok: false, missingFields: missing };
 
-  // Line 9a. A foreign-owned single-member LLC is a disregarded entity: "Other"
-  // with "Foreign-owned disregarded entity" written in (Instructions for Form
-  // 5472; the SS-4 instructions say "Other" + "disregarded entity"). Two or more
-  // members default to a partnership.
-  const entityOther = single ? "Foreign-owned disregarded entity" : "";
+  // Line 9a. A foreign-owned single-member LLC that needs the EIN to file Form
+  // 5472: check "Other" and write exactly "Foreign-owned U.S. disregarded
+  // entity-Form 5472" (Instructions for Form SS-4, Rev. 12/2025, line 9a,
+  // Disregarded entities). The IRS uses the marker to route the EIN for 5472
+  // filing. Two or more members default to a partnership.
+  const entityOther = single ? LINE9A_FOREIGN_OWNED_DE : "";
 
   const text: Record<string, string> = {
     [FIELD.line1LegalName]: legalName,
@@ -282,6 +292,8 @@ export function buildSs4Values(
     [FIELD.line13Agricultural]: "0",
     [FIELD.line13Household]: "0",
     [FIELD.line13Other]: "0",
+    // Line 15: no employees are expected (line 13 is 0/0/0), so "N/A" per the SS-4 instructions.
+    [FIELD.line15FirstWages]: "N/A",
     [FIELD.line16OtherSpecify]: activity,
     [FIELD.line17Merchandise]: products,
     [FIELD.designeeName]: str(d.name),
@@ -319,6 +331,7 @@ export function buildSs4Values(
     "11 Date business started": started!,
     "12 Closing month": closingMonth,
     "13 Employees": "0 / 0 / 0",
+    "15 First date wages paid": "N/A",
     "16 Principal activity": `Other: ${activity}`,
     "17 Products or services": products,
     "18 Applied for an EIN before": "No",
@@ -326,5 +339,13 @@ export function buildSs4Values(
     "Signature line": `${responsible}, ${title} (signed by the applicant; left blank)`,
   };
 
-  return { ok: true, values: { text, check: checks.map((c) => [c.field, c.on]) }, summary };
+  return {
+    ok: true,
+    values: {
+      text,
+      check: checks.map((c) => [c.field, c.on]),
+      ...(single ? { font_size: { [FIELD.line9aOtherSpecify]: LINE9A_FONT_SIZE } } : {}),
+    },
+    summary,
+  };
 }
