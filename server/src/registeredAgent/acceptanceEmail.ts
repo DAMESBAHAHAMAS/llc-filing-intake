@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { Pool } from "pg";
 import { realEmailSender } from "./emailSender.js";
+import { isUndefinedColumn } from "./acceptanceRecord.js";
 
 /** Same values as routes/registeredAgent.ts's existing token/TTL
  *  constants — kept here too since this module is the other caller of
@@ -117,6 +118,17 @@ export async function dispatchAcceptanceEmail(
      VALUES ($1, 'acceptance_requested', $2, $3, $4, $5, $6)`,
     [filingSessionId, requestedAt, registeredAgentName, registeredAgentEmail, token, ACCEPTANCE_VERSION]
   );
+  // T144 D12: keep what the email named on the request row (migration 0035), so
+  // the acceptance records the emailed address and LLC, not filing_data at click
+  // time. Before 0035 is applied the columns do not exist: skip, as before.
+  try {
+    await pool.query(
+      `UPDATE registered_agent_acceptances SET requested_agent_address = $2, requested_llc_name = $3 WHERE acceptance_token_id = $1`,
+      [token, registeredAgentAddress, llcName]
+    );
+  } catch (err) {
+    if (!isUndefinedColumn(err)) throw err;
+  }
   await pool.query(
     `UPDATE filing_sessions SET registered_agent_status = 'acceptance_requested' WHERE filing_session_id = $1`,
     [filingSessionId]

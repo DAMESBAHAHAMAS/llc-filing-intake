@@ -68,7 +68,7 @@ export async function renderTemplatePdf(template: string, context: Record<string
  * caller decides what happens to the PDF (never an automatic fax).
  */
 export async function generateSs4Pdf(
-  values: { text: Record<string, string>; check: Array<[string, string]> },
+  values: { text: Record<string, string>; check: Array<[string, string]>; font_size?: Record<string, number> },
   options: { watermark?: string } = {}
 ): Promise<PdfGenerationResult> {
   const baseUrl = process.env.PDF_SERVICE_URL;

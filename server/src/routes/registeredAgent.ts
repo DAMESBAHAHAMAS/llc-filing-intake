@@ -12,7 +12,7 @@ import {
   RA_ACCEPTANCE_STATEMENT_VERSION,
   requireSignature,
 } from "../registeredAgent/acceptanceRecord.js";
-import { recordAcceptance } from "../registeredAgent/acceptTransaction.js";
+import { recordAcceptance, recordDecline } from "../registeredAgent/acceptTransaction.js";
 import { clientKey } from "../middleware/rateLimit.js";
 import { buildAcceptanceStatementContext } from "../registeredAgent/acceptanceStatement.js";
 import { renderTemplatePdf } from "../pdf/serviceClient.js";
@@ -426,20 +426,23 @@ registeredAgentRouter.post("/api/registered-agent/acceptance/details", async (re
     );
     const fd = rows[0]?.filing_data ?? {};
     const s = (k: string) => (typeof fd[k] === "string" ? (fd[k] as string) : "");
-    // The agent name the signature is checked against: the one the request was sent to.
-    const named = await pool.query<{ registered_agent_name: string }>(
-      `SELECT registered_agent_name FROM registered_agent_acceptances WHERE id = $1`,
+    // What the email named, from the request row (server-written): the agent the
+    // signature is checked against, and (0035) the address and LLC. SELECT *: the
+    // 0035 columns may not exist yet; then filing_data is shown as before.
+    const named = await pool.query<{ registered_agent_name: string; requested_agent_address?: string | null; requested_llc_name?: string | null }>(
+      `SELECT * FROM registered_agent_acceptances WHERE id = $1`,
       [resolved.row.id]
     );
+    const req = named.rows[0];
     const expiresAt = resolved.row.requested_at
       ? new Date(new Date(resolved.row.requested_at).getTime() + ACCEPTANCE_TOKEN_TTL_MS).toISOString()
       : null;
     res.status(200).json({
       actionable: resolved.actionable,
       status: resolved.row.status,
-      llc_name: s("llc_name").toUpperCase(),
-      registered_agent_name: named.rows[0]?.registered_agent_name ?? s("registered_agent_name"),
-      registered_agent_florida_address: s("registered_agent_florida_address"),
+      llc_name: (req?.requested_llc_name || s("llc_name")).toUpperCase(),
+      registered_agent_name: req?.registered_agent_name ?? s("registered_agent_name"),
+      registered_agent_florida_address: req?.requested_agent_address || s("registered_agent_florida_address"),
       statement: RA_ACCEPTANCE_STATEMENT,
       statement_version: RA_ACCEPTANCE_STATEMENT_VERSION,
       signature_required: requireSignature(),
@@ -468,10 +471,12 @@ registeredAgentRouter.post("/api/registered-agent/decline", async (req, res) => 
       return;
     }
 
-    await pool.query(`UPDATE registered_agent_acceptances SET status = 'declined' WHERE id = $1`, [resolved.row.id]);
-    await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'declined' WHERE filing_session_id = $1`, [
-      resolved.row.filing_session_id,
-    ]);
+    // Same row lock and status guard as accept: a committed acceptance stays accepted.
+    const declined = await recordDecline(pool, { acceptanceId: resolved.row.id, filingSessionId: resolved.row.filing_session_id });
+    if (declined.kind === "not_actionable") {
+      res.status(409).json({ error: `token is not actionable (status=${declined.status})` });
+      return;
+    }
     await queueRaStatusQuietly(resolved.row.filing_session_id);
 
     res.status(200).json({ status: "declined" });
