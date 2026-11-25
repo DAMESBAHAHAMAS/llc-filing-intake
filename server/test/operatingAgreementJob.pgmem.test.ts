@@ -150,6 +150,8 @@ describe("Operating Agreement job (T144 D10)", () => {
     (deps.zoho.updateDeal as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: false, error: "503" });
     await runOperatingAgreementJobOnce(deps);
     await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10', proof_of_filing_at = '2026-11-30T15:00:00Z' WHERE order_id = $1`, [O1]);
+    await runOperatingAgreementJobOnce(deps); // generated, but the Deal is still in its 1-hour backoff
+    deps.now = () => new Date("2026-11-30T17:00:00Z");
     await runOperatingAgreementJobOnce(deps);
     const deal1 = updates.filter(([id]) => id === "deal-1").map(([, f]) => f.Operating_Agreement_Stat);
     expect(deal1[deal1.length - 1]).toBe("Generated");
@@ -176,3 +178,45 @@ describe("Banking Resolution (DRAFT) context", () => {
     expect(!r.ok && r.missingFields.join("|")).toMatch(/llc_name.*filing_date.*document_number/);
   });
 });
+
+describe("review fixes (T144 D10)", () => {
+  it("survives an odd operating_agreement_requested value written by a client", async () => {
+    const { pool, deps } = await setup();
+    await pool.query(`UPDATE filing_sessions SET filing_data = $2 WHERE filing_session_id = $1`, [S2, JSON.stringify({ ...fileIt, operating_agreement_requested: "Yes please" })]);
+    const r = await runOperatingAgreementJobOnce(deps);
+    expect(r.registered).toBe(3);
+  });
+
+  it("leaves orders from before OA_JOB_START_DATE alone", async () => {
+    const { pool, deps } = await setup({ OA_JOB_START_DATE: "2026-11-26" });
+    await runOperatingAgreementJobOnce(deps);
+    expect((await pool.query(`SELECT count(*)::int AS n FROM operating_agreement_status`)).rows[0].n).toBe(0);
+  });
+
+  it("treats an already stored agreement as generated, so the status cannot stick", async () => {
+    const { pool, deps } = await setup();
+    await runOperatingAgreementJobOnce(deps);
+    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10', proof_of_filing_at = '2026-11-30T15:00:00Z' WHERE order_id = $1`, [O1]);
+    await pool.query(`INSERT INTO formation_documents (order_id, filing_session_id, kind, template, draft, byte_size, sha256, pdf_bytes)
+                      VALUES ($1, $2, 'operating_agreement', 'operating_agreement_single_member', true, 3, 'abc', '\\x00')`, [O1, S1]);
+    expect(await generateForOrder(deps, O1)).toMatchObject({ ok: true, operating_agreement: { sha256: "abc" } });
+    expect((await statusOf(pool, "deal-1")).status).toBe(OA_STATUS.generated);
+  });
+
+  it("backs off a Deal whose update fails permanently, with one alert", async () => {
+    const { pool, deps, alerts } = await setup();
+    (deps.zoho.updateDeal as ReturnType<typeof vi.fn>).mockImplementation(async (id: string) =>
+      id === "deal-2" ? { ok: false, permanent: true, error: "INVALID_DATA" } : { ok: true });
+    await runOperatingAgreementJobOnce(deps);
+    await runOperatingAgreementJobOnce(deps);
+    expect(alerts.filter((a) => a.includes("not written to Zoho"))).toHaveLength(1);
+    expect((deps.zoho.updateDeal as ReturnType<typeof vi.fn>).mock.calls.filter(([id]) => id === "deal-2")).toHaveLength(1);
+  });
+
+  it("gives refunded or released orders no agreement", async () => {
+    const { pool, deps } = await setup();
+    await pool.query(`UPDATE orders SET payment_status = 'refunded', proof_of_filing_ref = 'L1' WHERE order_id = $1`, [O1]);
+    expect(await generateForOrder(deps, O1)).toMatchObject({ ok: false, status: 409 });
+  });
+});
+

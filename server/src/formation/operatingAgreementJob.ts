@@ -66,6 +66,17 @@ export function oaDealField(env: NodeJS.ProcessEnv = process.env): string {
   return /^[A-Za-z][A-Za-z0-9_]{0,99}$/.test(t) ? t : "";
 }
 
+/**
+ * Orders held or paid before this date are left alone, so switching the job on
+ * does not rewrite old Deals, generate agreements for past filings or send a
+ * burst of alerts. OA_JOB_START_DATE (YYYY-MM-DD) overrides the default.
+ */
+export const DEFAULT_OA_JOB_START_DATE = "2026-11-25";
+export function oaJobStartDate(env: NodeJS.ProcessEnv = process.env): string {
+  const v = (env.OA_JOB_START_DATE ?? "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : DEFAULT_OA_JOB_START_DATE;
+}
+
 /** Bank-Ready (FASTTRACK) and Finance-Ready (PREMIUM) include the agreement; File It does not. */
 export function packageIncludesOperatingAgreement(codes: string[]): boolean {
   const pkg = packageFromCodes(codes);
@@ -104,12 +115,16 @@ export async function registerOperatingAgreementDeals(deps: OaDeps): Promise<num
     requested: boolean | null;
   }>(
     `SELECT o.order_id, o.filing_session_id, o.crm_deal_id, o.line_items,
-            (fs.filing_data->>'operating_agreement_requested')::boolean AS requested
+            -- Compared as text: filing_data is client-written, and a cast to
+            -- boolean would throw on any odd value and stop every tick.
+            (fs.filing_data->>'operating_agreement_requested') = 'true' AS requested
      FROM orders o
      ${VERIFIED_DEAL_JOIN}
      JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id
      WHERE o.payment_status IN ('authorized', 'paid') AND o.crm_deal_id IS NOT NULL
-     ORDER BY COALESCE(o.authorized_at, o.paid_at) ASC`
+       AND COALESCE(o.authorized_at, o.paid_at) >= $1
+     ORDER BY COALESCE(o.authorized_at, o.paid_at) ASC`,
+    [oaJobStartDate(deps.env)]
   );
   const byDeal = new Map<string, { filing_session_id: string; oaOrder: string | null; requested: boolean }>();
   for (const r of rows) {
@@ -174,9 +189,12 @@ export async function generateForOrder(
     line_items: LineItems;
     proof_of_filing_ref: string | null;
     proof_of_filing_at: Date | string | null;
+    payment_status: string;
+    crm_deal_id: string | null;
     filing_data: Partial<FilingSessionRecord> | null;
   }>(
-    `SELECT o.order_id, o.filing_session_id, o.line_items, o.proof_of_filing_ref, o.proof_of_filing_at, fs.filing_data
+    `SELECT o.order_id, o.filing_session_id, o.line_items, o.proof_of_filing_ref, o.proof_of_filing_at, o.payment_status,
+            o.crm_deal_id, fs.filing_data
      FROM orders o JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id
      WHERE o.order_id = $1`,
     [orderId]
@@ -186,10 +204,21 @@ export async function generateForOrder(
   if (!packageIncludesOperatingAgreement(codesOf(o.line_items))) {
     return { ok: false, status: 409, error: "this order's package does not include an Operating Agreement" };
   }
+  if (!["authorized", "paid"].includes(o.payment_status)) {
+    return { ok: false, status: 409, error: `order payment_status is ${o.payment_status}; only a held or paid order gets an agreement` };
+  }
   if (!o.proof_of_filing_ref) return { ok: false, status: 409, error: "no proof of filing recorded on this order yet" };
   if (!opts.replace) {
-    const existing = await deps.db.query(`SELECT 1 FROM formation_documents WHERE order_id = $1 AND kind = 'operating_agreement'`, [orderId]);
-    if (existing.rowCount) return { ok: false, status: 409, error: "already generated (pass replace: true to regenerate)" };
+    // Already stored (e.g. a crash between storing and updating the status):
+    // that is success, so the status can never stick at Pending Generation.
+    const existing = await deps.db.query<{ sha256: string; byte_size: number; template: string; draft: boolean }>(
+      `SELECT sha256, byte_size, template, draft FROM formation_documents WHERE order_id = $1 AND kind = 'operating_agreement'`,
+      [orderId]
+    );
+    if (existing.rows.length) {
+      await markGenerated(deps.db, o.order_id, o.crm_deal_id);
+      return { ok: true, operating_agreement: existing.rows[0] };
+    }
   }
 
   const filed = {
@@ -220,16 +249,21 @@ export async function generateForOrder(
     }
   }
 
-  await deps.db.query(
-    `UPDATE operating_agreement_status SET status = $2, last_error = NULL, updated_at = now()
-     WHERE order_id = $1 AND status IN ($3, $2)`,
-    [o.order_id, OA_STATUS.generated, OA_STATUS.pending]
-  );
+  await markGenerated(deps.db, o.order_id, o.crm_deal_id);
   return {
     ok: true,
     operating_agreement: { sha256: pdf.sha256, byte_size: pdf.pdfBytes.length, template: ctx.template, draft },
     ...(bankingOut ? { banking_resolution: bankingOut } : {}),
   };
+}
+
+/** Generated, on the status row of the order's Deal (or the order's own row). Delivered is never undone. */
+async function markGenerated(db: Db, orderId: string, crmDealId: string | null): Promise<void> {
+  await db.query(
+    `UPDATE operating_agreement_status SET status = $3, last_error = NULL, updated_at = now()
+     WHERE (order_id = $1 OR crm_deal_id = $2) AND status IN ($4, $5)`,
+    [orderId, crmDealId ?? "", OA_STATUS.generated, OA_STATUS.pending, OA_STATUS.notIncluded]
+  );
 }
 
 async function storeDocument(
@@ -253,10 +287,12 @@ async function storeDocument(
 
 /** Step 2. Generates every pending agreement whose order has proof of filing. */
 export async function generatePendingAgreements(deps: OaDeps): Promise<{ generated: number; needsInputs: string[] }> {
-  const { rows } = await deps.db.query<{ crm_deal_id: string; order_id: string; alerted_at: Date | null }>(
-    `SELECT s.crm_deal_id, s.order_id, s.alerted_at
+  const { rows } = await deps.db.query<{ crm_deal_id: string; order_id: string; alerted_at: Date | null; last_error: string | null }>(
+    `SELECT s.crm_deal_id, s.order_id, s.alerted_at, s.last_error
      FROM operating_agreement_status s JOIN orders o ON o.order_id = s.order_id
-     WHERE s.status = $1 AND o.proof_of_filing_ref IS NOT NULL`,
+     WHERE s.status = $1 AND o.proof_of_filing_ref IS NOT NULL
+     ORDER BY s.updated_at ASC
+     LIMIT 10`,
     [OA_STATUS.pending]
   );
   let generated = 0;
@@ -275,7 +311,9 @@ export async function generatePendingAgreements(deps: OaDeps): Promise<{ generat
     const why = res.missingFields ? `${res.error}: ${res.missingFields.join("; ")}` : res.error;
     await deps.db.query(`UPDATE operating_agreement_status SET last_error = $2, updated_at = now() WHERE crm_deal_id = $1`, [r.crm_deal_id, why]);
     if (res.status === 422) needsInputs.push(r.order_id);
-    if (!r.alerted_at) {
+    // Alert once per distinct problem: a new error (e.g. answers needed after a
+    // PDF-service outage) alerts again; the same error every tick does not.
+    if (!r.alerted_at || r.last_error !== why) {
       await deps.alert(
         "Operating Agreement needs attention",
         `Order ${r.order_id} (Deal ${r.crm_deal_id}): ${why}. ` +
@@ -291,10 +329,14 @@ export async function generatePendingAgreements(deps: OaDeps): Promise<{ generat
 export async function syncOperatingAgreementDeals(deps: OaDeps): Promise<{ synced: number; errors: string[] }> {
   const field = oaDealField(deps.env);
   if (!field) return { synced: 0, errors: [] };
-  const { rows } = await deps.db.query<{ crm_deal_id: string; status: string }>(
-    `SELECT crm_deal_id, status FROM operating_agreement_status
-     WHERE deal_synced_status IS NULL OR deal_synced_status <> status
-     LIMIT 50`
+  const now = deps.now();
+  const { rows } = await deps.db.query<{ crm_deal_id: string; status: string; deal_sync_alerted: boolean | null }>(
+    `SELECT crm_deal_id, status, deal_sync_alerted FROM operating_agreement_status
+     WHERE (deal_synced_status IS NULL OR deal_synced_status <> status)
+       AND (deal_sync_retry_at IS NULL OR deal_sync_retry_at <= $1)
+     ORDER BY updated_at ASC
+     LIMIT 50`,
+    [now]
   );
   let synced = 0;
   const errors: string[] = [];
@@ -303,13 +345,23 @@ export async function syncOperatingAgreementDeals(deps: OaDeps): Promise<{ synce
     if (res.ok) {
       // Only if the status did not change meanwhile; otherwise the next pass writes the newer one.
       await deps.db.query(
-        `UPDATE operating_agreement_status SET deal_synced_status = $2, updated_at = now() WHERE crm_deal_id = $1 AND status = $2`,
+        `UPDATE operating_agreement_status SET deal_synced_status = $2, deal_sync_retry_at = NULL, deal_sync_alerted = false
+         WHERE crm_deal_id = $1 AND status = $2`,
         [r.crm_deal_id, r.status]
       );
       synced++;
     } else {
       errors.push(`${r.crm_deal_id}: ${res.error ?? "unknown"}`);
-      await deps.db.query(`UPDATE operating_agreement_status SET last_error = $2, updated_at = now() WHERE crm_deal_id = $1`, [r.crm_deal_id, `Deal update: ${res.error ?? "unknown"}`]);
+      // Back off so failing Deals cannot hold the batch: an hour for a transient
+      // error, a day for a permanent one (deleted Deal, rejected value), with one alert.
+      const retryAt = new Date(now.getTime() + (res.permanent ? 24 : 1) * 3600_000);
+      await deps.db.query(
+        `UPDATE operating_agreement_status SET last_error = $2, deal_sync_retry_at = $3, deal_sync_alerted = $4 WHERE crm_deal_id = $1`,
+        [r.crm_deal_id, `Deal update: ${res.error ?? "unknown"}`, retryAt, r.deal_sync_alerted === true || res.permanent === true]
+      );
+      if (res.permanent && !r.deal_sync_alerted) {
+        await deps.alert("Operating Agreement status not written to Zoho", `Deal ${r.crm_deal_id}: ${res.error ?? "unknown"}. Retried daily.`).catch(() => undefined);
+      }
     }
   }
   return { synced, errors };

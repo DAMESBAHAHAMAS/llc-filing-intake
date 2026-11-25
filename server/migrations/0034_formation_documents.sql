@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS operating_agreement_status (
   status              text NOT NULL
                         CHECK (status IN ('Not Included', 'Pending Generation', 'Generated', 'Delivered')),
   deal_synced_status  text,
+  deal_sync_retry_at  timestamptz,
+  deal_sync_alerted   boolean NOT NULL DEFAULT false,
   last_error          text,
   alerted_at          timestamptz,
   created_at          timestamptz NOT NULL DEFAULT now(),

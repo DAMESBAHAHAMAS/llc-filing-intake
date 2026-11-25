@@ -226,8 +226,12 @@ if (postFilingSyncIntervalMs > 0) {
  */
 const oaJobIntervalMs = Number(process.env.OPERATING_AGREEMENT_JOB_INTERVAL_MS ?? 10 * 60_000);
 let oaMissingTableLogged = false;
+let oaJobRunning = false;
 if (oaJobIntervalMs > 0) {
   setInterval(() => {
+    // One run at a time: a slow PDF service must not overlap the next tick.
+    if (oaJobRunning) return;
+    oaJobRunning = true;
     defaultOaDeps(pool)
       .then((deps) => runOperatingAgreementJobOnce(deps))
       .then((r) => {
@@ -240,6 +244,9 @@ if (oaJobIntervalMs > 0) {
           return;
         }
         console.error("[operating agreement] tick failed", err);
+      })
+      .finally(() => {
+        oaJobRunning = false;
       });
   }, oaJobIntervalMs);
 }

@@ -11,6 +11,8 @@ import { defaultOaDeps, generateForOrder, isMissingTable } from "../formation/op
  */
 export const formationDocumentsRouter = Router();
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function operatorAuthorized(req: Request): boolean {
   const expected = process.env.OPERATOR_API_KEY;
   const given = req.header("x-operator-key");
@@ -30,6 +32,10 @@ function operatorAuthorized(req: Request): boolean {
 formationDocumentsRouter.post("/api/ops/operating-agreement/:orderId", async (req, res) => {
   if (!operatorAuthorized(req)) {
     res.status(401).json({ error: "operator key required" });
+    return;
+  }
+  if (!UUID_RE.test(req.params.orderId)) {
+    res.status(400).json({ error: "orderId must be a UUID" });
     return;
   }
   const body = (req.body ?? {}) as Record<string, unknown>;
@@ -63,6 +69,10 @@ formationDocumentsRouter.post("/api/ops/operating-agreement/:orderId", async (re
 formationDocumentsRouter.get("/api/ops/formation-documents/:orderId/:kind", async (req, res) => {
   if (!operatorAuthorized(req)) {
     res.status(401).json({ error: "operator key required" });
+    return;
+  }
+  if (!UUID_RE.test(req.params.orderId)) {
+    res.status(400).json({ error: "orderId must be a UUID" });
     return;
   }
   if (!["operating_agreement", "banking_resolution"].includes(req.params.kind)) {
