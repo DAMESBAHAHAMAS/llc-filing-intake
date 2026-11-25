@@ -33,6 +33,8 @@ interface EnqueueInput {
   filingSessionId: string;
   emailTypes: OrderEmailType[];
   paymentMode: PaymentMode;
+  /** hold_released: the Day-5 Payment Link (payments/holdRelease.ts). */
+  paymentLinkUrl?: string;
 }
 
 type QueryClient = { query: (text: string, params?: unknown[]) => Promise<unknown> };
@@ -55,7 +57,12 @@ export async function enqueueCustomerEmails(client: QueryClient, input: EnqueueI
         `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot)
          SELECT $1::uuid, $2::uuid, $3::text, $4::jsonb
          WHERE NOT EXISTS (SELECT 1 FROM crm_sync_queue WHERE order_id = $2::uuid AND sync_type = $3::text)`,
-        [input.filingSessionId, input.orderId, syncTypeFor(emailType), JSON.stringify({ payment_mode: input.paymentMode })]
+        [
+          input.filingSessionId,
+          input.orderId,
+          syncTypeFor(emailType),
+          JSON.stringify({ payment_mode: input.paymentMode, ...(input.paymentLinkUrl ? { payment_link_url: input.paymentLinkUrl } : {}) }),
+        ]
       );
     }
     await client.query("RELEASE SAVEPOINT customer_emails");
@@ -75,7 +82,7 @@ export interface ClaimedEmailJob {
   id: number;
   order_id: string;
   sync_type: string;
-  payload_snapshot: { payment_mode?: PaymentMode } & Record<string, unknown>;
+  payload_snapshot: { payment_mode?: PaymentMode; payment_link_url?: string } & Record<string, unknown>;
   attempts: number;
   max_attempts: number;
 }
@@ -153,7 +160,13 @@ async function sendJob(pool: Pool, sender: OrderEmailSender, job: ClaimedEmailJo
   if (!row) return { ok: false, permanent: true, error: "order not found" };
   if (!row.email) return { ok: false, permanent: true, error: "no customer email on the filing session" };
 
-  const email = buildOrderEmail(type, row, job.payload_snapshot.payment_mode ?? "hold");
+  const linkUrl = job.payload_snapshot.payment_link_url;
+  if (type === "hold_released" && typeof linkUrl !== "string") {
+    return { ok: false, permanent: true, error: "hold_released email queued without a payment link" };
+  }
+  const email = buildOrderEmail(type, row, job.payload_snapshot.payment_mode ?? "hold", {
+    paymentLinkUrl: typeof linkUrl === "string" ? linkUrl : undefined,
+  });
   const result = await sender.send({ to: row.email, ...email, idempotencyKey: `order-email/${job.order_id}/${type}` });
   return { ok: result.ok, error: result.error, providerMessageId: result.providerMessageId };
 }

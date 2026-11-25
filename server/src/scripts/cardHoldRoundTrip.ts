@@ -2,7 +2,6 @@ import "dotenv/config";
 import {
   cancelPaymentIntent,
   capturePaymentIntent,
-  chargeSavedCard,
   holdDetails,
   retrievePaymentIntent,
   type StripePaymentIntent,
@@ -16,8 +15,9 @@ import {
  *
  * A: hold (manual capture, card saved) → read expiry → collect → collect
  *    again with the same idempotency key (must not charge twice).
- * B: hold → release (as if it expired) → charge the saved card
- *    off-session (the fallback used when proof of filing comes late).
+ * B: hold → release (as the Day-5 job does). Nothing is charged after a
+ *    release: the off-session saved-card fallback was removed on 25 Nov 2026
+ *    (owner's final hold rule); the customer gets a Payment Link instead.
  */
 const key = process.env.STRIPE_SECRET_KEY ?? "";
 if (!key.startsWith("sk_test_")) {
@@ -45,7 +45,6 @@ async function placeHold(customer: string, label: string): Promise<StripePayment
     payment_method: "pm_card_visa",
     "payment_method_types[]": "card",
     capture_method: "manual",
-    setup_future_usage: "off_session",
     confirm: "true",
     "metadata[order_id]": label,
     "metadata[purpose]": "card-hold round trip (test mode)",
@@ -77,22 +76,10 @@ result.A_after_collect = aCap1.status;
 result.A_amount_received = aCap1.amount_received;
 result.A_repeat_collect_same_result = aCap2.status === aCap1.status && aCap2.amount_received === aCap1.amount_received;
 
-// B — hold, release, charge the saved card.
+// B — hold, release. Nothing is charged afterwards.
 const b = await placeHold(customer.id, `roundtrip-B-${run}`);
-const bCancel = await cancelPaymentIntent(b.id, `release-roundtrip-B-${run}`);
+const bCancel = await cancelPaymentIntent(b.id, `release-roundtrip-B-${run}`, "abandoned");
 result.B_after_release = bCancel.status;
-const bRead = await retrievePaymentIntent(b.id);
-if (!bRead.customer || !bRead.payment_method) throw new Error("hold B has no saved card");
-const fallback = await chargeSavedCard({
-  customerId: bRead.customer,
-  paymentMethodId: bRead.payment_method,
-  amountCents: 49900,
-  currency: "usd",
-  idempotencyKey: `fallback-roundtrip-B-${run}`,
-  metadata: { order_id: `roundtrip-B-${run}` },
-});
-result.B_fallback_status = fallback.status;
-result.B_fallback_amount_received = fallback.amount_received;
-result.payment_intents = [a.id, b.id, fallback.id];
+result.payment_intents = [a.id, b.id];
 
 console.log(JSON.stringify(result, null, 2));

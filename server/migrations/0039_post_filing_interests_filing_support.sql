@@ -1,0 +1,11 @@
+-- 0039 — ST17 four-card hub: a fourth post-filing topic.
+--
+-- Damian, 25 Nov 2026 (A6Y2-T144 final pre-launch round): the Thank You page
+-- shows four next-step cards. Three map to the existing columns (0032):
+--   Local Business Licenses & Permits     -> licenses_permits
+--   Business Banking, Credit & Financing  -> bank_account
+--   Bookkeeping, Tax & Annual Compliance  -> tax_compliance
+-- The fourth, Dedicated Filing Support & Strategy, needs this column.
+--
+-- Additive only. Rollback: migrations-rollback/0039_post_filing_interests_filing_support.rollback.sql.
+ALTER TABLE post_filing_interests ADD COLUMN IF NOT EXISTS filing_support boolean NOT NULL DEFAULT false;

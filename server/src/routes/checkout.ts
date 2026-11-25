@@ -5,7 +5,7 @@ import { describeError } from "../db/describeError.js";
 import { resolveActiveOffers } from "../offers/catalog.js";
 import { createCheckoutSession, StripeApiError } from "../stripe/restClient.js";
 import { getEinExpressAvailability } from "../ein/capacity.js";
-import { houseAgentLineMissing } from "../offers/houseAgentRule.js";
+import { agentLineIssue, coversHouseAgent, dropBundledAgentLine, HOUSE_AGENT_OFFER_CODE, houseAgentLineMissing } from "../offers/houseAgentRule.js";
 import { einLineIssue } from "../offers/einBundleRule.js";
 import { getEinUpsell, orderedOfferCodes } from "../offers/einUpsell.js";
 import { holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
@@ -87,10 +87,17 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
     return;
   }
 
-  const requestedItems = parseLineItems(body);
-  if (!requestedItems) {
+  const parsedItems = parseLineItems(body);
+  if (!parsedItems) {
     res.status(400).json({ error: "line_items must be a non-empty array of { offer_code, quantity? }" });
     return;
+  }
+  // Bank-Ready and Finance-Ready include the 3-year registered agent (25 Nov 2026).
+  // A website build from before that still adds the $98 line beside them; it is
+  // dropped here, not refused, so the customer is charged the package price only.
+  const requestedItems = dropBundledAgentLine(parsedItems);
+  if (requestedItems.length !== parsedItems.length) {
+    console.log(`[checkout] dropped ${HOUSE_AGENT_OFFER_CODE}: included in ${requestedItems.map((i) => i.offer_code).join(", ")}`);
   }
 
   // Finance-Ready kickoff hold: validated before any database or Stripe work.
@@ -143,27 +150,32 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
 
     const uniqueCodes = [...new Set(requestedItems.map((i) => i.offer_code))];
 
-    // Registered-agent billing rule: choosing Damian as agent means the
-    // 3-year agent service must be on the order (routes/../houseAgentRule.ts).
-    if (session.rows[0].filing_data?.registered_agent_path === "house") {
-      const paidAgent = await pool.query(
-        `SELECT 1 FROM orders
-          WHERE filing_session_id = $1 AND payment_status IN ('paid', 'authorized')
-            AND line_items @> '[{"offer_code":"REGISTERED_AGENT_3YR"}]'::jsonb
-          LIMIT 1`,
-        [filingSessionId]
-      );
-      if (houseAgentLineMissing("house", uniqueCodes, (paidAgent.rowCount ?? 0) > 0)) {
-        res.status(422).json({
-          error: "registered agent service is required when Damian Knowles is the registered agent",
-          required_offer_code: "REGISTERED_AGENT_3YR",
-        });
-        return;
-      }
+    // Offer codes on this session's held or paid orders: what it already has.
+    const previousCodes = await orderedOfferCodes(pool, filingSessionId);
+
+    // Registered-agent billing rule (offers/houseAgentRule.ts): choosing Damian as
+    // agent needs the 3-year agent service, which Bank-Ready and Finance-Ready
+    // (including the kickoff) include and File It buys as the $98 line.
+    if (houseAgentLineMissing(session.rows[0].filing_data?.registered_agent_path, uniqueCodes, coversHouseAgent(previousCodes))) {
+      res.status(422).json({
+        error: "registered agent service is required when Damian Knowles is the registered agent",
+        required_offer_code: "REGISTERED_AGENT_3YR",
+      });
+      return;
+    }
+    // ...and the $98 line is never sold on top of a package that includes it
+    // (in the cart it was dropped above; this refuses it after an earlier order).
+    const agentIssue = agentLineIssue(uniqueCodes, previousCodes);
+    if (agentIssue) {
+      res.status(422).json({
+        error: "registered agent service is already included in this order or a previous one; it cannot be purchased again",
+        reason: agentIssue,
+      });
+      return;
     }
     // EIN billing rule (2026-11-22): the EIN is an add-on to File It only. Bank-Ready
     // and Premium include it, so selling it again would charge the customer twice.
-    const einIssue = einLineIssue(uniqueCodes, await orderedOfferCodes(pool, filingSessionId));
+    const einIssue = einLineIssue(uniqueCodes, previousCodes);
     if (einIssue) {
       res.status(422).json({
         error: "EIN is already included in this order or a previous one; it cannot be purchased again",

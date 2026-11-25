@@ -59,12 +59,13 @@ const O2 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2";
 const O3 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3";
 const NOW = new Date("2026-11-25T12:00:00Z");
 
-async function setup() {
+async function setup(opts: { without0039?: boolean } = {}) {
   const db = newDb();
   const { Pool } = db.adapters.createPg();
   const pool = new Pool();
   await pool.query(BASE);
   await pool.query(migration("0032_post_filing_interests.sql"));
+  if (!opts.without0039) await pool.query(migration("0039_post_filing_interests_filing_support.sql"));
   await pool.query(`INSERT INTO filing_sessions VALUES ('${S1}', 'ada@example.test'), ('${S2}', 'eve@example.test'), ('${S3}', 'bob@example.test')`);
   const items = JSON.stringify([{ offer_code: "FASTTRACK" }]);
   await pool.query(
@@ -104,7 +105,17 @@ async function setup() {
   const app = express();
   app.use(express.json());
   let enabled = true;
-  app.use(createPostFilingInterestsRouter({ db: pool, config: () => ({ ...postFilingConfig({}), enabled }), now: () => now }));
+  const routeAlerts: string[] = [];
+  app.use(
+    createPostFilingInterestsRouter({
+      db: pool,
+      config: () => ({ ...postFilingConfig({}), enabled }),
+      now: () => now,
+      alert: async (subject, body) => {
+        routeAlerts.push(`${subject}: ${body}`);
+      },
+    }),
+  );
   const server: http.Server = await new Promise((resolve) => {
     const s = app.listen(0, () => resolve(s));
   });
@@ -121,6 +132,7 @@ async function setup() {
     deps,
     calls,
     alerts,
+    routeAlerts,
     post,
     get,
     setNow: (d: Date) => (now = d),
@@ -143,7 +155,7 @@ describe("POST/GET /api/post-filing-interests", () => {
     expect(initial.status).toBe(200);
     expect(await initial.json()).toEqual({
       status: "open",
-      interests: { bank_account: false, licenses_permits: false, tax_compliance: false },
+      interests: { bank_account: false, licenses_permits: false, tax_compliance: false, filing_support: false },
       license_note: null,
     });
 
@@ -151,7 +163,7 @@ describe("POST/GET /api/post-filing-interests", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       status: "saved",
-      interests: { bank_account: false, licenses_permits: true, tax_compliance: false },
+      interests: { bank_account: false, licenses_permits: true, tax_compliance: false, filing_support: false },
       license_note: "Food truck, Miami-Dade",
     });
     await t.post({ filing_session_id: S1, order_id: O1, interest: "tax_compliance", selected: true });
@@ -370,13 +382,57 @@ describe("Zoho Deal copy", () => {
 
 describe("config and limits", () => {
   it("is on by default with the created Deal field, and has its own per-IP limit", () => {
-    expect(postFilingConfig({})).toEqual({ enabled: true, dealField: "Post_Filing_Interests", noteField: "Post_Filing_License_Note" });
+    expect(postFilingConfig({})).toEqual({ enabled: true, dealField: "Post_Filing_Interests", noteField: "Post_Filing_License_Note", filingSupportValue: "" });
     expect(postFilingConfig({ POST_FILING_INTERESTS_ENABLED: "FALSE", POST_FILING_INTERESTS_FIELD: "X", POST_FILING_NOTE_FIELD: "Y" })).toEqual({
       enabled: false,
       dealField: "X",
       noteField: "Y",
+      filingSupportValue: "",
     });
     expect(typeof funnelRateLimiters().postFilingInterests).toBe("function");
+  });
+});
+
+describe("ST17 fourth card: Dedicated Filing Support & Strategy (migration 0039)", () => {
+  it("saves filing_support and reads it back with the other three", async () => {
+    const t = await setup();
+    const res = await t.post({ filing_session_id: S1, order_id: O1, interest: "filing_support", selected: true });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      status: "saved",
+      interests: { bank_account: false, licenses_permits: false, tax_compliance: false, filing_support: true },
+      license_note: null,
+    });
+    const { rows } = await t.pool.query(`SELECT filing_support, version FROM post_filing_interests WHERE filing_session_id = $1`, [S1]);
+    expect(rows).toEqual([{ filing_support: true, version: 1 }]);
+    // Not on the Deal until the picklist value exists, so each request reaches a person.
+    expect(t.routeAlerts).toHaveLength(1);
+    expect(t.routeAlerts[0]).toContain(S1);
+    await t.post({ filing_session_id: S1, order_id: O1, interest: "bank_account", selected: true });
+    expect(t.routeAlerts).toHaveLength(1);
+  });
+
+  it("keeps it out of the Zoho multi-select until the picklist value is configured", async () => {
+    const t = await setup();
+    await t.verifyDeal();
+    await t.post({ filing_session_id: S1, order_id: O1, interest: "bank_account", selected: true });
+    await t.post({ filing_session_id: S1, order_id: O1, interest: "filing_support", selected: true });
+    expect((await runPostFilingSyncOnce(t.deps)).synced).toEqual([S1]);
+    expect(t.calls).toEqual([`set deal-1 {"Post_Filing_Interests":["Bank Account Setup"],"Post_Filing_License_Note":null}`]);
+
+    t.calls.length = 0;
+    t.deps.config = postFilingConfig({ POST_FILING_SUPPORT_ZOHO_VALUE: "Filing Support and Strategy" });
+    await t.post({ filing_session_id: S1, order_id: O1, interest: "tax_compliance", selected: true });
+    expect((await runPostFilingSyncOnce(t.deps)).synced).toEqual([S1]);
+    expect(t.calls).toEqual([
+      `set deal-1 {"Post_Filing_Interests":["Bank Account Setup","Tax and Compliance","Filing Support and Strategy"],"Post_Filing_License_Note":null}`,
+    ]);
+  });
+
+  it("behaves as switched off when 0032 is applied but 0039 is not", async () => {
+    const t = await setup({ without0039: true });
+    expect((await t.get(S1, O1)).status).toBe(503);
+    expect((await t.post({ filing_session_id: S1, order_id: O1, interest: "bank_account", selected: true })).status).toBe(503);
   });
 });
 

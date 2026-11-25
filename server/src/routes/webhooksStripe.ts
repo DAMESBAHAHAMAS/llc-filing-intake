@@ -392,17 +392,22 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
   }
 });
 
-type TxClient = { query: (text: string, params?: unknown[]) => Promise<{ rows: any[]; rowCount: number | null }> };
+export type TxClient = { query: (text: string, params?: unknown[]) => Promise<{ rows: any[]; rowCount: number | null }> };
 
 /**
  * PaymentIntent / Charge lifecycle for card holds:
- *  - payment_intent.succeeded: the hold was collected (or the saved-card
- *    fallback charged) → order paid; Deal moves to Closed Won.
+ *  - payment_intent.succeeded: the hold was collected, or (for an order the
+ *    Day-5 job released) the customer paid the emailed Payment Link, whose
+ *    PaymentIntent carries metadata.order_id → order paid; Deal moves to Closed Won.
  *  - payment_intent.canceled: the hold was released or expired before
  *    collection → order released; filing that has not started is stopped.
  *  - charge.refunded (full refund) → order refunded.
  * The order is found by metadata.order_id (set at checkout and on the
- * fallback charge) or by the stored PaymentIntent id.
+ * Day-5 Payment Link), by the stored PaymentIntent id (the hold), or by the
+ * PaymentIntent that collected a Day-5 Payment Link (collected_payment_intent_id).
+ *
+ * Columns of migration 0038 are used only when the order row has them
+ * (SELECT *), so this handler keeps working before 0038 is applied.
  */
 export async function handlePaymentLifecycleEvent(
   client: TxClient,
@@ -419,13 +424,17 @@ export async function handlePaymentLifecycleEvent(
   const metadataOrderId = obj.metadata?.order_id;
   const uuidLike = /^[0-9a-f-]{36}$/i;
 
-  const found = await client.query(
-    `SELECT order_id, filing_session_id, payment_status, fulfillment_status, crm_deal_id, proof_of_filing_at
+  let found = await client.query(
+    `SELECT *
      FROM orders
      WHERE ($1::uuid IS NOT NULL AND order_id = $1::uuid) OR ($2::text IS NOT NULL AND stripe_payment_intent_id = $2::text)
      ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
     [metadataOrderId && uuidLike.test(metadataOrderId) ? metadataOrderId : null, paymentIntentId]
   );
+  if (!found.rowCount && paymentIntentId && (await ordersHasColumn(client, "collected_payment_intent_id"))) {
+    // A refund of a Day-5 Payment Link payment whose Charge carries no order_id.
+    found = await client.query(`SELECT * FROM orders WHERE collected_payment_intent_id = $1 LIMIT 1 FOR UPDATE`, [paymentIntentId]);
+  }
   if (!found.rowCount) return { processingResult: "order_not_found", orderId: null };
   const order = found.rows[0] as {
     order_id: string;
@@ -434,7 +443,15 @@ export async function handlePaymentLifecycleEvent(
     fulfillment_status: string;
     crm_deal_id: string | null;
     proof_of_filing_at: Date | null;
+    stripe_payment_intent_id?: string | null;
+    line_items?: Array<{ offer_code?: string }> | null;
+    /** Migration 0038 columns: absent (undefined) before it is applied. */
+    hold_release_started_at?: Date | null;
+    hold_auto_released_at?: Date | null;
+    hold_cancellation_reason?: string | null;
+    collected_payment_intent_id?: string | null;
   };
+  const has0038 = "hold_auto_released_at" in order;
 
   if (event.type === "payment_intent.succeeded") {
     if (!shouldMarkPaidOnPaymentIntentSucceeded(order.payment_status)) {
@@ -445,6 +462,15 @@ export async function handlePaymentLifecycleEvent(
        WHERE order_id = $1`,
       [order.order_id]
     );
+    if (has0038 && paymentIntentId && paymentIntentId !== order.stripe_payment_intent_id) {
+      // Paid through the Day-5 Payment Link: a new PaymentIntent. Kept so a later refund finds the order.
+      await client.query(`UPDATE orders SET collected_payment_intent_id = $2 WHERE order_id = $1`, [order.order_id, paymentIntentId]);
+    }
+    if (order.payment_status === "released" && order.hold_auto_released_at && order.fulfillment_status === "not_ready") {
+      // The release stopped a filing that had not started; paying the link restarts
+      // it, behind the same registered-agent gate as checkout.
+      await restoreFulfillmentAfterLinkPayment(client, order.order_id, order.filing_session_id, order.line_items ?? []);
+    }
     const enqueued = await enqueueDealUpdate(client, order, {
       target_stage: process.env.ZOHO_DEAL_STAGE_ON_CAPTURE || process.env.ZOHO_DEAL_STAGE_ON_PAYMENT || "Closed Won",
       extra_fields: {
@@ -464,10 +490,19 @@ export async function handlePaymentLifecycleEvent(
        WHERE order_id = $1`,
       [order.order_id, fulfillmentAfterPaymentEnds(order.fulfillment_status)]
     );
-    await enqueueDealUpdate(client, order, {
-      target_stage: process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED",
-      extra_fields: { Payment_Status: "Hold Released" },
-    });
+    if (has0038) {
+      await client.query(`UPDATE orders SET hold_cancellation_reason = $2 WHERE order_id = $1`, [order.order_id, obj.cancellation_reason ?? null]);
+    }
+    // The Day-5 job's own cancel ("abandoned", order already taken by the job):
+    // the job writes the Deal update itself (the owner's Hold Expired marker), so
+    // a second, different one is not queued here.
+    const day5Release = obj.cancellation_reason === "abandoned" && Boolean(order.hold_release_started_at);
+    if (!day5Release) {
+      await enqueueDealUpdate(client, order, {
+        target_stage: process.env.ZOHO_DEAL_STAGE_ON_HOLD || "SERVICE REQUESTED",
+        extra_fields: { Payment_Status: "Hold Released" },
+      });
+    }
     console.error(
       `[payments] hold released for order ${order.order_id} (reason: ${obj.cancellation_reason ?? "unknown"}; fulfillment was ${order.fulfillment_status})`
     );
@@ -488,16 +523,48 @@ export async function handlePaymentLifecycleEvent(
   return { processingResult: "refunded", orderId: order.order_id };
 }
 
+/** Whether orders has this column (for code that must run before its migration is applied). */
+async function ordersHasColumn(client: TxClient, column: string): Promise<boolean> {
+  const { rows } = await client.query(
+    `SELECT 1 FROM information_schema.columns WHERE table_name = 'orders' AND column_name = $1 LIMIT 1`,
+    [column]
+  );
+  return rows.length > 0;
+}
+
+/**
+ * After a Day-5 Payment Link is paid: a filing order the release stopped goes
+ * back to ready, unless a third-party registered agent has still not accepted
+ * (the same gate as checkout.session.completed above; registeredAgent.ts
+ * unblocks it on acceptance).
+ */
+async function restoreFulfillmentAfterLinkPayment(
+  client: TxClient,
+  orderId: string,
+  filingSessionId: string,
+  lineItems: Array<{ offer_code?: string }>
+): Promise<void> {
+  if (!needsSunbizFiling(lineItems)) return;
+  const gate = await client.query(`SELECT filing_data, registered_agent_status FROM filing_sessions WHERE filing_session_id = $1`, [filingSessionId]);
+  const path = (gate.rows[0]?.filing_data as { registered_agent_path?: string } | null)?.registered_agent_path;
+  if (path === "customer" && gate.rows[0]?.registered_agent_status !== "accepted") return;
+  await client.query(
+    `UPDATE orders SET fulfillment_status = 'ready', fulfillment_ready_at = now() WHERE order_id = $1 AND fulfillment_status = 'not_ready'`,
+    [orderId]
+  );
+}
+
 /**
  * Queues a Deal update for an order's Deal, if one is known. A Deal this
  * data spine created itself (a synced order_deal job for the order) is
  * updated directly; a Deal id that came from intake metadata keeps the
  * email-ownership check in zoho/client.ts.
  */
-async function enqueueDealUpdate(
+export async function enqueueDealUpdate(
   client: TxClient,
   order: { order_id: string; filing_session_id: string; crm_deal_id: string | null },
-  update: { target_stage: string; extra_fields: Record<string, unknown> }
+  /** target_stage omitted: a field-only update that leaves the Deal's Stage alone. */
+  update: { target_stage?: string; extra_fields: Record<string, unknown> }
 ): Promise<boolean> {
   if (!order.crm_deal_id) return false;
   const own = await client.query(

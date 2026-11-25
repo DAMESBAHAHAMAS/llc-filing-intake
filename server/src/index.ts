@@ -24,6 +24,7 @@ import { sendOpsAlert } from "./ops/alerts.js";
 import { runScorecardTick } from "./scorecard/service.js";
 import { realScorecardSender } from "./scorecard/sender.js";
 import { runHoldSweepOnce } from "./fulfillment/holdSweep.js";
+import { holdReleaseConfig, runHoldReleaseOnce } from "./payments/holdRelease.js";
 import { realOrderEmailSender } from "./orderEmails/sender.js";
 import { runOnce as runOrderEmailsOnce } from "./orderEmails/worker.js";
 import { pool } from "./db/pool.js";
@@ -118,17 +119,28 @@ if (fulfillmentPollerIntervalMs > 0) {
 
 /**
  * Card-hold watch (pay-after-filing): records hold expiry times and flags
- * held orders nearing expiry without proof of filing. Every 15 minutes by
- * default; HOLD_SWEEP_INTERVAL_MS=0 disables it.
+ * held orders nearing expiry without proof of filing, then runs the Day-5
+ * release (payments/holdRelease.ts: HOLD_RELEASE_ENABLED, HOLD_RELEASE_START).
+ * Every 15 minutes by default; HOLD_SWEEP_INTERVAL_MS=0 disables both.
  */
 const holdSweepIntervalMs = Number(process.env.HOLD_SWEEP_INTERVAL_MS ?? 15 * 60_000);
 if (holdSweepIntervalMs > 0) {
   setInterval(() => {
-    runHoldSweepOnce(pool).catch((err) => {
-      console.error("[hold sweep] tick failed", err);
-    });
+    runHoldSweepOnce(pool)
+      .catch((err) => {
+        console.error("[hold sweep] tick failed", err);
+      })
+      .then(() => runHoldReleaseOnce(pool))
+      .catch((err) => {
+        console.error("[hold release] tick failed", err);
+      });
   }, holdSweepIntervalMs);
-  console.log(`Card-hold watch running every ${holdSweepIntervalMs}ms`);
+  const release = holdReleaseConfig();
+  console.log(
+    `Card-hold watch running every ${holdSweepIntervalMs}ms; Day-5 release ${
+      release.error ? `NOT running (${release.error})` : release.enabled ? `on for holds placed since ${release.start.toISOString()}, after ${release.afterHours}h` : "off (HOLD_RELEASE_ENABLED)"
+    }`
+  );
 }
 
 /**

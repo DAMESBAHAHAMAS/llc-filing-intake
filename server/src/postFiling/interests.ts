@@ -25,7 +25,14 @@ import { auth, detail, recordOk, timeout, zfetch } from "../zoho/einPortal.js";
  *   - The Zoho copy runs in the background; the page never waits on Zoho.
  */
 
-export const INTERESTS = ["bank_account", "licenses_permits", "tax_compliance"] as const;
+/**
+ * ST17 four-card hub (Damian, 25 Nov 2026):
+ *   Local Business Licenses & Permits     -> licenses_permits
+ *   Business Banking, Credit & Financing  -> bank_account
+ *   Bookkeeping, Tax & Annual Compliance  -> tax_compliance
+ *   Dedicated Filing Support & Strategy   -> filing_support (migration 0039)
+ */
+export const INTERESTS = ["bank_account", "licenses_permits", "tax_compliance", "filing_support"] as const;
 export type Interest = (typeof INTERESTS)[number];
 
 /**
@@ -36,6 +43,10 @@ export const INTEREST_LABELS: Record<Interest, string> = {
   bank_account: "Bank Account Setup",
   licenses_permits: "Licenses and Permits",
   tax_compliance: "Tax and Compliance",
+  // No such picklist value exists in Zoho yet. It is sent only once Damian has
+  // added it and set POST_FILING_SUPPORT_ZOHO_VALUE (labelsFor); until then the
+  // choice is saved in post_filing_interests only.
+  filing_support: "",
 };
 
 export const NOTE_MAX = 500;
@@ -49,6 +60,12 @@ export interface PostFilingConfig {
   dealField: string;
   /** API name of the Deal long-text field for the licence note. */
   noteField: string;
+  /**
+   * The Post_Filing_Interests picklist value for "Dedicated Filing Support &
+   * Strategy" (POST_FILING_SUPPORT_ZOHO_VALUE). Empty until Damian adds the value
+   * in Zoho: the choice is then kept out of the Zoho copy.
+   */
+  filingSupportValue: string;
 }
 
 export function postFilingConfig(env: Record<string, string | undefined> = process.env): PostFilingConfig {
@@ -56,6 +73,7 @@ export function postFilingConfig(env: Record<string, string | undefined> = proce
     enabled: (env.POST_FILING_INTERESTS_ENABLED ?? "true").trim().toLowerCase() !== "false",
     dealField: (env.POST_FILING_INTERESTS_FIELD ?? "").trim() || "Post_Filing_Interests",
     noteField: (env.POST_FILING_NOTE_FIELD ?? "").trim() || "Post_Filing_License_Note",
+    filingSupportValue: (env.POST_FILING_SUPPORT_ZOHO_VALUE ?? "").trim(),
   };
 }
 
@@ -63,6 +81,7 @@ export interface InterestState {
   bank_account: boolean;
   licenses_permits: boolean;
   tax_compliance: boolean;
+  filing_support: boolean;
   license_note: string | null;
 }
 
@@ -99,11 +118,11 @@ export async function sessionHasHeldOrPaidOrder(db: Db, filingSessionId: string,
   return rows.length > 0;
 }
 
-const EMPTY: InterestState = { bank_account: false, licenses_permits: false, tax_compliance: false, license_note: null };
+const EMPTY: InterestState = { bank_account: false, licenses_permits: false, tax_compliance: false, filing_support: false, license_note: null };
 
 export async function readInterests(db: Db, filingSessionId: string): Promise<InterestState> {
   const { rows } = await db.query<InterestState>(
-    `SELECT bank_account, licenses_permits, tax_compliance, license_note FROM post_filing_interests WHERE filing_session_id = $1`,
+    `SELECT bank_account, licenses_permits, tax_compliance, filing_support, license_note FROM post_filing_interests WHERE filing_session_id = $1`,
     [filingSessionId],
   );
   return rows[0] ? { ...rows[0] } : { ...EMPTY };
@@ -114,6 +133,7 @@ const COLUMN: Record<Interest, string> = {
   bank_account: "bank_account",
   licenses_permits: "licenses_permits",
   tax_compliance: "tax_compliance",
+  filing_support: "filing_support",
 };
 
 /**
@@ -179,8 +199,9 @@ const BATCH = 25;
 /** Repeated failures with the same cause alert once per this window, not once per customer. */
 export const ALERT_REPEAT_MS = 6 * 60 * MINUTE_MS;
 
-export function labelsFor(state: InterestState): string[] {
-  return INTERESTS.filter((i) => state[i]).map((i) => INTEREST_LABELS[i]);
+export function labelsFor(state: InterestState, filingSupportValue = ""): string[] {
+  const labels: Record<Interest, string> = { ...INTEREST_LABELS, filing_support: filingSupportValue };
+  return INTERESTS.filter((i) => state[i] && labels[i]).map((i) => labels[i]);
 }
 
 /** The Deal of the session's earliest held or paid order whose Deal id was verified. */
@@ -208,7 +229,7 @@ interface ClaimedRow extends InterestState {
 /** The Deal fields for the customer's current choices. */
 export function dealFieldsFor(config: PostFilingConfig, state: InterestState): Record<string, unknown> {
   return {
-    [config.dealField]: labelsFor(state),
+    [config.dealField]: labelsFor(state, config.filingSupportValue),
     [config.noteField]: state.licenses_permits && state.license_note ? state.license_note : null,
   };
 }
@@ -220,7 +241,9 @@ export function dealFieldsFor(config: PostFilingConfig, state: InterestState): R
 export function isMissingTable(err: unknown): boolean {
   const e = err as { code?: unknown; message?: unknown } | null;
   const message = typeof e?.message === "string" ? e.message : "";
-  return message.includes('relation "post_filing_interests" does not exist') && (e?.code === undefined || e.code === "42P01");
+  if (message.includes('relation "post_filing_interests" does not exist') && (e?.code === undefined || e.code === "42P01")) return true;
+  // Migration 0032 applied but not 0039: treated the same way (switched off).
+  return /column "?filing_support"? does not exist/.test(message) && (e?.code === undefined || e.code === "42703");
 }
 
 let running = false;
@@ -267,7 +290,7 @@ async function syncDue(deps: PostFilingDeps, out: { synced: string[]; retried: s
       `UPDATE post_filing_interests SET crm_claimed_at = $2
        WHERE filing_session_id = $1 AND synced_version < version AND crm_blocked_at IS NULL AND next_sync_at <= $2
          AND (crm_claimed_at IS NULL OR crm_claimed_at < $3)
-       RETURNING filing_session_id, bank_account, licenses_permits, tax_compliance, license_note, version, crm_attempts`,
+       RETURNING filing_session_id, bank_account, licenses_permits, tax_compliance, filing_support, license_note, version, crm_attempts`,
       [id, now, leaseBefore],
     );
     const row = claimed.rows[0];
@@ -341,7 +364,7 @@ async function recordFailure(
   await deps
     .alert(
       "Post-filing interests not copied to Zoho",
-      `Filing session ${row.filing_session_id}: ${labelsFor(row).join(", ") || "(none selected)"}. ${error}. ` +
+      `Filing session ${row.filing_session_id}: ${labelsFor(row, "Filing Support and Strategy").join(", ") || "(none selected)"}. ${error}. ` +
         `The customer's choices are saved in post_filing_interests (other sessions with the same error are not alerted again for 6 hours: ` +
         `SELECT * FROM post_filing_interests WHERE crm_blocked_at IS NOT NULL). Fix the cause, then clear crm_blocked_at to retry.`,
     )

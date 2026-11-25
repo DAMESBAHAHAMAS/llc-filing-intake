@@ -34,6 +34,7 @@ const CATALOG: Record<string, KickoffOffer & { crm_intent: string }> = {
   DIY_SERVICE_FEE: { offer_code: "DIY_SERVICE_FEE", offer_version: "v2", display_name: "DIY Processing / Service Fee", stripe_price_id: "price_service", unit_amount_cents: 900, crm_intent: "LLC_FORMATION_DIY" },
   DIY_CERT_OF_STATUS: { offer_code: "DIY_CERT_OF_STATUS", offer_version: "v1", display_name: "Certificate of Status (Included)", stripe_price_id: "price_cos", unit_amount_cents: 500, crm_intent: "LLC_FORMATION_DIY" },
   PREMIUM: { offer_code: "PREMIUM", offer_version: "v3", display_name: "Florida LLC Formation — Finance-Ready", stripe_price_id: "price_premium_997", unit_amount_cents: 99700, crm_intent: "LLC_FORMATION_PREMIUM" },
+  FASTTRACK: { offer_code: "FASTTRACK", offer_version: "v3", display_name: "Florida LLC Formation — Bank-Ready", stripe_price_id: "price_bank_499", unit_amount_cents: 49900, crm_intent: "LLC_FORMATION_FASTTRACK" },
   REGISTERED_AGENT_3YR: { offer_code: "REGISTERED_AGENT_3YR", offer_version: "v2", display_name: "Florida Registered Agent Service — 3 Years", stripe_price_id: "price_ra", unit_amount_cents: 9800, crm_intent: "REGISTERED_AGENT" },
 };
 
@@ -282,7 +283,7 @@ describe("POST /api/checkout/create with the Finance-Ready kickoff", () => {
 
   it("refuses a kickoff cart with anything besides PREMIUM, an unknown plan, or the switch off", async () => {
     const fs = await newSession();
-    const extra = await create({ ...kickoffBody(fs), line_items: [{ offer_code: "PREMIUM" }, { offer_code: "REGISTERED_AGENT_3YR" }] });
+    const extra = await create({ ...kickoffBody(fs), line_items: [{ offer_code: "PREMIUM" }, { offer_code: "EIN_FILING" }] });
     expect(extra.status).toBe(422);
     expect((await create({ ...kickoffBody(fs), line_items: [{ offer_code: "FASTTRACK" }] })).status).toBe(422);
     expect((await create({ ...kickoffBody(fs), payment_plan: "pay_later" })).status).toBe(400);
@@ -303,6 +304,58 @@ describe("POST /api/checkout/create with the Finance-Ready kickoff", () => {
     expect(status).toBe(200);
     expect(body.payment_plan).toBeUndefined();
     expect(stripeBodies[0]).not.toContain("custom_text");
+  });
+});
+
+describe("registered agent included in Bank-Ready and Finance-Ready (25 Nov 2026)", () => {
+  const DIY = [{ offer_code: "DIY_STATE_FEE" }, { offer_code: "DIY_SERVICE_FEE" }, { offer_code: "DIY_CERT_OF_STATUS" }];
+
+  it("Bank-Ready with Damian as agent goes to Stripe for $499 with no $98 line", async () => {
+    const { status, body } = await create({ filing_session_id: await newSession(), line_items: [{ offer_code: "FASTTRACK" }] });
+    expect(status).toBe(200);
+    expect(body.total_cents).toBe(49900);
+    expect(stripeBodies[0]).toContain("line_items[0][price]=price_bank_499");
+    expect(stripeBodies[0]).not.toContain("price_ra");
+  });
+
+  it("the Finance-Ready $139 kickoff with Damian as agent needs no $98 line either", async () => {
+    const { status, body } = await create(kickoffBody(await newSession()));
+    expect(status).toBe(200);
+    expect(body.total_cents).toBe(13900);
+    expect(stripeBodies[0]).not.toContain("price_ra");
+  });
+
+  it("File It with Damian as agent still requires the $98 line", async () => {
+    const without = await create({ filing_session_id: await newSession(), line_items: DIY });
+    expect(without.status).toBe(422);
+    expect(without.body.required_offer_code).toBe("REGISTERED_AGENT_3YR");
+    const withAgent = await create({ filing_session_id: await newSession(), line_items: [...DIY, { offer_code: "REGISTERED_AGENT_3YR" }] });
+    expect(withAgent.status).toBe(200);
+    expect(withAgent.body.total_cents).toBe(13900 + 9800);
+  });
+
+  it("drops the $98 line sent beside Bank-Ready (website main before the 25 Nov change), so nobody pays twice", async () => {
+    const r = await create({ filing_session_id: await newSession(), line_items: [{ offer_code: "FASTTRACK" }, { offer_code: "REGISTERED_AGENT_3YR" }] });
+    expect(r.status).toBe(200);
+    expect(r.body.total_cents).toBe(49900);
+    expect(stripeBodies[0]).toContain("line_items[0][price]=price_bank_499");
+    expect(stripeBodies[0]).not.toContain("price_ra");
+  });
+
+  it("drops it beside the Finance-Ready kickoff too: the hold stays $139", async () => {
+    const r = await create({ ...kickoffBody(await newSession()), line_items: [{ offer_code: "PREMIUM" }, { offer_code: "REGISTERED_AGENT_3YR" }] });
+    expect(r.status).toBe(200);
+    expect(r.body.total_cents).toBe(13900);
+    expect(stripeBodies[0]).not.toContain("price_ra");
+  });
+
+  it("after a held Bank-Ready order the $98 line is never sold to the same session", async () => {
+    const fs = await newSession();
+    expect((await create({ filing_session_id: fs, line_items: [{ offer_code: "FASTTRACK" }] })).status).toBe(200);
+    await state.db.query(`UPDATE orders SET payment_status = 'authorized' WHERE filing_session_id = $1`, [fs]);
+    const later = await create({ filing_session_id: fs, line_items: [{ offer_code: "REGISTERED_AGENT_3YR" }] });
+    expect(later.status).toBe(422);
+    expect(later.body.reason).toBe("already_included");
   });
 });
 

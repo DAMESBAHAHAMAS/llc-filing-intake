@@ -112,9 +112,11 @@ export interface CreateCheckoutSessionParams {
    * "hold" (default for LLC orders — Damian's rule, 29 Sep 2026: the card
    * is not charged until proof of filing is delivered) authorizes the
    * card without collecting: Stripe manual capture (a 7-day hold; longer
-   * only if STRIPE_EXTENDED_AUTHORIZATION is enabled), and the card saved to a
-   * Customer so it can still be charged after proof if the hold expires
-   * first. "immediate" is the previous behavior, kept for rollback.
+   * only if STRIPE_EXTENDED_AUTHORIZATION is enabled). The card is still saved
+   * to a Customer, but nothing in this service charges it off-session: a hold
+   * that lapses is released at Day 5 and the customer gets a Payment Link
+   * (owner's final hold rule, 25 Nov 2026; payments/holdRelease.ts).
+   * "immediate" is the previous behavior, kept for rollback.
    */
   captureMode?: "hold" | "immediate";
   /** Written onto the PaymentIntent so payment_intent.* webhook events
@@ -155,16 +157,19 @@ export async function createCheckoutSession(params: CreateCheckoutSessionParams)
     ...(params.captureMode === "hold"
       ? {
           customer_creation: "always",
+          // No setup_future_usage: the card is never saved for later
+          // off-session charges (owner's final hold rule, 25 Nov 2026), so
+          // Checkout shows no "allow future charges" consent.
           payment_intent_data: {
             capture_method: "manual",
-            setup_future_usage: "off_session",
             metadata: params.paymentIntentMetadata,
           },
           // Extended holds (up to 30 days) are opt-in: Stripe rejected the
           // request on this account on 30 Sep 2026 ("This account is not
           // eligible for the requested card features") — they need IC+
           // pricing or Stripe's approval. Without it a card hold lasts 7
-          // days, and the saved card covers a filing that takes longer.
+          // days; a filing that takes longer gets the Day-5 release and a
+          // Payment Link (payments/holdRelease.ts), never an off-session charge.
           ...(process.env.STRIPE_EXTENDED_AUTHORIZATION === "if_available"
             ? { payment_method_options: { card: { request_extended_authorization: "if_available" } } }
             : {}),
@@ -236,44 +241,65 @@ export async function capturePaymentIntent(paymentIntentId: string, idempotencyK
   );
 }
 
-/** Releases a hold without collecting anything. */
-export async function cancelPaymentIntent(paymentIntentId: string, idempotencyKey: string): Promise<StripePaymentIntent> {
+/** Releases a hold without collecting anything. The Day-5 release passes "abandoned". */
+export async function cancelPaymentIntent(
+  paymentIntentId: string,
+  idempotencyKey: string,
+  reason: "requested_by_customer" | "abandoned" = "requested_by_customer"
+): Promise<StripePaymentIntent> {
   return stripeRequest<StripePaymentIntent>(
     "POST",
     `/payment_intents/${encodeURIComponent(paymentIntentId)}/cancel`,
-    { cancellation_reason: "requested_by_customer" },
+    { cancellation_reason: reason },
     idempotencyKey
   );
 }
 
 /**
- * Fallback when a hold expired before proof of filing existed: charges the
- * card saved at checkout, off-session, for the same amount. Only ever
- * called after proof of filing is recorded, so the pay-after-filing rule
- * still holds. Can be declined by the bank — the caller records that.
+ * A Stripe Payment Link for a released hold (payments/holdRelease.ts, owner's
+ * final hold rule, 25 Nov 2026). It reuses the order's own Stripe Prices, so the
+ * amount is exactly the hold's and no new Stripe Price is created. It can be
+ * paid once (restrictions.completed_sessions.limit = 1). The PaymentIntent it
+ * creates carries metadata.order_id, which is how the existing webhook
+ * (payment_intent.succeeded) finds the order and marks it paid. The customer
+ * pays it themselves; nothing here charges a card.
  */
-export async function chargeSavedCard(params: {
-  customerId: string;
-  paymentMethodId: string;
-  amountCents: number;
-  currency: string;
+export interface CreatePaymentLinkParams {
+  lineItems: StripeCheckoutSessionLineItem[];
+  /** Written onto the link and onto the PaymentIntent it creates. */
+  metadata: Record<string, string>;
+  /** Shown on Stripe's confirmation page after payment (max 500 characters). */
+  confirmationMessage?: string;
   idempotencyKey: string;
-  metadata?: Record<string, string>;
-}): Promise<StripePaymentIntent> {
-  return stripeRequest<StripePaymentIntent>(
+}
+
+export interface StripePaymentLink {
+  id: string;
+  url: string;
+  active: boolean;
+}
+
+export async function createPaymentLink(params: CreatePaymentLinkParams): Promise<StripePaymentLink> {
+  return stripeRequest<StripePaymentLink>(
     "POST",
-    "/payment_intents",
+    "/payment_links",
     {
-      amount: params.amountCents,
-      currency: params.currency,
-      customer: params.customerId,
-      payment_method: params.paymentMethodId,
-      off_session: true,
-      confirm: true,
+      line_items: params.lineItems,
       metadata: params.metadata,
+      payment_intent_data: { metadata: params.metadata },
+      billing_address_collection: "required",
+      restrictions: { completed_sessions: { limit: 1 } },
+      ...(params.confirmationMessage
+        ? { after_completion: { type: "hosted_confirmation", hosted_confirmation: { custom_message: params.confirmationMessage.slice(0, 500) } } }
+        : {}),
     },
     params.idempotencyKey
   );
+}
+
+/** Closes a Day-5 Payment Link so it can no longer be paid (order closed, cancelled or paid another way). */
+export async function deactivatePaymentLink(paymentLinkId: string, idempotencyKey: string): Promise<StripePaymentLink> {
+  return stripeRequest<StripePaymentLink>("POST", `/payment_links/${encodeURIComponent(paymentLinkId)}`, { active: false }, idempotencyKey);
 }
 
 /** Reads the hold expiry and extended-hold status from an expanded

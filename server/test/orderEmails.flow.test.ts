@@ -362,7 +362,7 @@ describe("when proof of filing is recorded", () => {
     await state.db.query(`UPDATE orders SET payment_status = 'paid'`);
     expect((await proof()).json.status).toBe("already_paid");
     await runOnce(state.db, realOrderEmailSender);
-    expect(resend.send.mock.calls[0][0].text).toContain("You paid for this order at checkout.");
+    expect(resend.send.mock.calls[0][0].text).toContain("Your payment for this order is complete.");
   });
 
   it("sends nothing for an order with nothing paid or held", async () => {

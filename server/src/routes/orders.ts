@@ -1,14 +1,8 @@
-import { Router, type Request } from "express";
+import { Router, type Request, type Response } from "express";
 import { timingSafeEqual } from "node:crypto";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
-import {
-  cancelPaymentIntent,
-  capturePaymentIntent,
-  chargeSavedCard,
-  retrievePaymentIntent,
-  StripeApiError,
-} from "../stripe/restClient.js";
+import { cancelPaymentIntent, capturePaymentIntent, deactivatePaymentLink, StripeApiError } from "../stripe/restClient.js";
 import { holdNoLongerCapturable } from "../payments/holdState.js";
 import { sendOpsAlert } from "../ops/alerts.js";
 import { effectiveDateProblem, floridaToday, windowForFilingDate } from "../filing/effectiveDateWindow.js";
@@ -62,7 +56,7 @@ async function recordProofAndQueueConfirmation(orderId: string, documentNumber: 
         orderId: order.order_id,
         filingSessionId: order.filing_session_id,
         emailTypes: ["filing_confirmation"],
-        paymentMode: order.payment_status === "paid" ? "paid" : "hold",
+        paymentMode: order.payment_status === "paid" ? "paid" : order.payment_status === "released" ? "released" : "hold",
       });
     }
     await client.query("COMMIT");
@@ -83,14 +77,21 @@ async function recordProofAndQueueConfirmation(orderId: string, documentNumber: 
  * Body: { document_number: string }
  *
  * Records proof of filing (the Sunbiz document number of the filed
- * Articles) and then collects the held payment. This is the only path
- * that collects money on a held order — Damian's rule: the card is not
- * charged until proof of filing is delivered.
+ * Articles) and collects the held payment if it was not already collected
+ * at submission. Under the owner's final hold rule (25 Nov 2026) the hold is
+ * captured when the Articles are SUBMITTED to Sunbiz, through
+ * POST /api/orders/:orderId/sunbiz-submitted below; this route is the
+ * fallback for an order whose submission was not recorded. Both use the same
+ * Stripe idempotency key, so the hold is never captured twice.
  *
  * If the hold can no longer be collected (it expired or was released),
- * the card saved at checkout is charged instead. Either way the order
- * becomes "paid" only when Stripe's own payment_intent.succeeded webhook
- * arrives — this route never marks an order paid itself.
+ * NOTHING is charged (owner's final hold rule, 25 Nov 2026: a lapsed hold is
+ * never auto-charged; the off-session saved-card charge that used to run here
+ * is removed). The route answers 409 fresh_consent_required and alerts ops.
+ * A hold released by the Day-5 job (payments/holdRelease.ts) already sent the
+ * customer a Payment Link for the same amount. The order becomes "paid" only
+ * when Stripe's own payment_intent.succeeded webhook arrives — this route
+ * never marks an order paid itself.
  *
  * The customer's filing confirmation is queued with the proof, before
  * collection is requested, so a collection problem cannot hold back the
@@ -136,6 +137,20 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
     });
   }
 
+  await collectHeldPayment(order, "Proof of filing is recorded", res);
+});
+
+/**
+ * Captures a held order's payment, or reports why nothing can be collected.
+ * Shared by the Sunbiz-submission and proof-of-filing routes; the idempotency
+ * key is the same for both, so a retry or the second route never captures twice.
+ * An expired or released hold charges nothing: 409 fresh_consent_required.
+ */
+async function collectHeldPayment(
+  order: { order_id: string; payment_status: string; stripe_payment_intent_id: string | null },
+  context: string,
+  res: Response
+): Promise<void> {
   if (order.payment_status === "paid") {
     res.status(200).json({ order_id: order.order_id, status: "already_paid" });
     return;
@@ -153,33 +168,131 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
     } catch (err) {
       const code = err instanceof StripeApiError ? (err.stripeError as { code?: string } | undefined)?.code : undefined;
       if (!holdNoLongerCapturable(code)) {
-        await recordCaptureError(order.order_id, err);
+        await recordCaptureError(order.order_id, err, context);
         res.status(502).json({ error: "collection failed", detail: describeError(err), order_id: order.order_id });
         return;
       }
-      // Hold expired or released — fall through to the saved card.
+      // Hold expired or released: fall through. Fresh consent is required.
     }
   }
 
+  // An expired or released hold charges nothing here. The order is flagged and
+  // ops is alerted so the customer can approve a new payment.
+  const reason = order.payment_status === "released" ? "hold_released" : "hold_expired";
+  const paymentLinkUrl = await flagFreshConsentRequired(order.order_id, reason, context);
+  res.status(409).json({
+    order_id: order.order_id,
+    status: "fresh_consent_required",
+    reason,
+    payment_link_url: paymentLinkUrl,
+    detail: paymentLinkUrl
+      ? "The card hold can no longer be collected. Nothing was charged. The customer was already emailed a payment link for the same amount."
+      : "The card hold can no longer be collected. Nothing was charged. Ask the customer to approve a new payment.",
+  });
+}
+
+/**
+ * POST /api/orders/:orderId/sunbiz-submitted (operator)
+ * Body: { tracking_ref: string } (the Sunbiz tracking/confirmation number of the submission)
+ *
+ * Rule 1 of the owner's final hold rule (25 Nov 2026): the hold is captured
+ * when the Articles are SUBMITTED to Sunbiz, never later (Florida's approval
+ * can take longer than the hold lasts). Records the submission
+ * (sunbiz_submitted_at, sunbiz_submission_ref; migration 0038) and captures the
+ * hold. The Day-5 job never releases a submitted order. No customer email is
+ * sent here: the filing confirmation goes out with the document number
+ * (proof-of-filing). Repeat calls are safe (same capture idempotency key).
+ */
+ordersRouter.post("/api/orders/:orderId/sunbiz-submitted", async (req, res) => {
+  if (!operatorAuthorized(req)) {
+    res.status(401).json({ error: "operator key required" });
+    return;
+  }
+  const trackingRef = typeof req.body?.tracking_ref === "string" ? req.body.tracking_ref.trim() : "";
+  if (!/^[A-Z0-9-]{4,30}$/i.test(trackingRef)) {
+    res.status(400).json({ error: "tracking_ref is required (the Sunbiz tracking or confirmation number of the submission)" });
+    return;
+  }
+  let order: { order_id: string; payment_status: string; stripe_payment_intent_id: string | null };
   try {
-    const original = await retrievePaymentIntent(order.stripe_payment_intent_id);
-    if (!original.customer || !original.payment_method) {
-      throw new Error("no saved card on the original payment");
+    const { rows } = await pool.query<{ order_id: string; payment_status: string; stripe_payment_intent_id: string | null }>(
+      `UPDATE orders
+       SET sunbiz_submitted_at = COALESCE(sunbiz_submitted_at, now()), sunbiz_submission_ref = COALESCE(sunbiz_submission_ref, $2)
+       WHERE order_id = $1
+       RETURNING order_id, payment_status, stripe_payment_intent_id`,
+      [req.params.orderId, trackingRef]
+    );
+    if (!rows.length) {
+      res.status(404).json({ error: "order not found" });
+      return;
     }
-    const charged = await chargeSavedCard({
-      customerId: original.customer,
-      paymentMethodId: original.payment_method,
-      amountCents: order.total_cents,
-      currency: order.currency || "usd",
-      idempotencyKey: `fallback-${order.order_id}`,
-      metadata: { order_id: order.order_id, reason: "hold_expired_before_proof_of_filing" },
-    });
-    res.status(200).json({ order_id: order.order_id, status: "saved_card_charged", payment_intent_status: charged.status });
+    order = rows[0];
   } catch (err) {
-    await recordCaptureError(order.order_id, err);
-    res.status(502).json({ error: "saved-card charge failed", detail: describeError(err), order_id: order.order_id });
+    const missing = (err as { code?: string })?.code === "42703";
+    res.status(missing ? 503 : 500).json({
+      error: missing ? "apply migration 0038 first (sunbiz_submitted_at)" : "could not record the Sunbiz submission",
+      detail: describeError(err),
+    });
+    return;
+  }
+  await collectHeldPayment(order, "The filing is submitted to Sunbiz", res);
+});
+
+/**
+ * POST /api/orders/:orderId/close-payment-link (operator)
+ *
+ * Deactivates the Day-5 Payment Link (the customer asked to close the order,
+ * was refunded, or paid another way), so it can no longer be paid.
+ */
+ordersRouter.post("/api/orders/:orderId/close-payment-link", async (req, res) => {
+  if (!operatorAuthorized(req)) {
+    res.status(401).json({ error: "operator key required" });
+    return;
+  }
+  try {
+    const { rows } = await pool.query<{ payment_link_id: string | null; payment_status: string }>(
+      `SELECT payment_link_id, payment_status FROM orders WHERE order_id = $1`,
+      [req.params.orderId]
+    );
+    if (!rows.length) {
+      res.status(404).json({ error: "order not found" });
+      return;
+    }
+    if (!rows[0].payment_link_id) {
+      res.status(409).json({ error: "this order has no Day-5 payment link" });
+      return;
+    }
+    const link = await deactivatePaymentLink(rows[0].payment_link_id, `close-paylink-${req.params.orderId}`);
+    await pool.query(`UPDATE orders SET payment_link_closed_at = COALESCE(payment_link_closed_at, now()) WHERE order_id = $1`, [req.params.orderId]);
+    res.status(200).json({ order_id: req.params.orderId, payment_link_id: link.id, active: link.active, payment_status: rows[0].payment_status });
+  } catch (err) {
+    res.status(502).json({ error: "could not close the payment link", detail: describeError(err) });
   }
 });
+
+/** Records why nothing was collected and alerts ops. Returns the Day-5 Payment Link, if one was sent. */
+async function flagFreshConsentRequired(orderId: string, reason: string, context: string): Promise<string | null> {
+  let paymentLinkUrl: string | null = null;
+  try {
+    await pool.query(`UPDATE orders SET capture_error = $2 WHERE order_id = $1`, [orderId, `fresh_consent_required:${reason}`]);
+  } catch (e) {
+    console.error(`[payments] could not flag fresh consent for ${orderId}:`, describeError(e));
+  }
+  try {
+    const { rows } = await pool.query<{ payment_link_url: string | null }>(`SELECT payment_link_url FROM orders WHERE order_id = $1`, [orderId]);
+    paymentLinkUrl = rows[0]?.payment_link_url ?? null;
+  } catch {
+    // Before migration 0038 the column does not exist: no link was sent.
+  }
+  await sendOpsAlert(
+    "New payment approval needed",
+    `Order ${orderId}: ${context.charAt(0).toLowerCase() + context.slice(1)} but the card hold is ${reason === "hold_released" ? "released" : "expired"}. Nothing was charged. ` +
+      (paymentLinkUrl
+        ? `The customer was emailed a payment link for the same amount at Day 5: ${paymentLinkUrl}`
+        : "Ask the customer to approve a new payment.")
+  );
+  return paymentLinkUrl;
+}
 
 /**
  * POST /api/orders/:orderId/effective-date-check (operator)
@@ -260,12 +373,12 @@ ordersRouter.get("/api/orders/:orderId/emails", async (req, res) => {
   }
 });
 
-async function recordCaptureError(orderId: string, err: unknown): Promise<void> {
+async function recordCaptureError(orderId: string, err: unknown, context: string): Promise<void> {
   try {
     await pool.query(`UPDATE orders SET capture_error = $2 WHERE order_id = $1`, [orderId, describeError(err)]);
   } catch (e) {
     console.error(`[payments] could not record capture error for ${orderId}:`, describeError(e));
   }
   console.error(`[payments] collection problem on order ${orderId}:`, describeError(err));
-  await sendOpsAlert("Payment could not be collected", `Order ${orderId}: ${describeError(err)}. Proof of filing is recorded; the card was not charged.`);
+  await sendOpsAlert("Payment could not be collected", `Order ${orderId}: ${describeError(err)}. ${context}; the card was not charged.`);
 }

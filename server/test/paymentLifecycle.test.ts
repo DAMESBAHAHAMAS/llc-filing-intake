@@ -79,4 +79,22 @@ describe("handlePaymentLifecycleEvent", () => {
       "order_not_found"
     );
   });
+  it("finds a refunded Day-5 link payment by the PaymentIntent that collected it", async () => {
+    const paid = { ...baseOrder, payment_status: "paid", hold_auto_released_at: new Date(), collected_payment_intent_id: "pi_link" };
+    const writes: string[] = [];
+    const c = {
+      query: vi.fn(async (sql: string) => {
+        if (/stripe_payment_intent_id = \$2/.test(sql)) return { rows: [], rowCount: 0 };
+        if (/information_schema\.columns/.test(sql)) return { rows: [{}], rowCount: 1 };
+        if (/collected_payment_intent_id = \$1/.test(sql)) return { rows: [paid], rowCount: 1 };
+        if (/sync_type = 'order_deal'/.test(sql)) return { rows: [{}], rowCount: 1 };
+        if (/SELECT email FROM filing_sessions/.test(sql)) return { rows: [{ email: "founder@example.com" }], rowCount: 1 };
+        writes.push(sql);
+        return { rows: [], rowCount: 1 };
+      }),
+    };
+    const r = await handlePaymentLifecycleEvent(c as never, event("charge.refunded", { id: "ch_2", payment_intent: "pi_link", refunded: true }));
+    expect(r).toEqual({ processingResult: "refunded", orderId: baseOrder.order_id });
+    expect(writes[0]).toMatch(/payment_status = 'refunded'/);
+  });
 });
