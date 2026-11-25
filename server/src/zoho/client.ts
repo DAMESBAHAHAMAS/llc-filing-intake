@@ -59,7 +59,8 @@ export interface ZohoClient {
 
 export interface DealStageUpdatePayload {
   crm_deal_id: string;
-  target_stage: string;
+  /** Omitted for a field-only update (T144 D12: the registered agent status), which leaves Stage alone. */
+  target_stage?: string;
   /**
    * filing_sessions.email at the moment payment was confirmed
    * (routes/webhooksStripe.ts) — the ownership check updateDealStage
@@ -584,7 +585,9 @@ async function putDealUpdate(token: string, payload: DealStageUpdatePayload): Pr
   const updateRes = await fetch(`https://www.zohoapis.com/crm/v2/Deals/${encodeURIComponent(payload.crm_deal_id)}`, {
     method: "PUT",
     headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ data: [{ Stage: payload.target_stage, ...(payload.extra_fields ?? {}) }] }),
+    body: JSON.stringify({
+      data: [{ ...(payload.target_stage ? { Stage: payload.target_stage } : {}), ...(payload.extra_fields ?? {}) }],
+    }),
   });
 
   if (updateRes.status === 401) {

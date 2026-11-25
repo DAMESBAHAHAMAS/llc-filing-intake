@@ -21,7 +21,7 @@ export const ordersRouter = Router();
  * (header x-operator-key). With the key unset, the endpoints refuse every
  * request rather than run unprotected.
  */
-function operatorAuthorized(req: Request): boolean {
+export function operatorAuthorized(req: Request): boolean {
   const expected = process.env.OPERATOR_API_KEY;
   const given = req.header("x-operator-key");
   if (!expected || !given) return false;

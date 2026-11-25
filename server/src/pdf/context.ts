@@ -1,5 +1,6 @@
 import { isValidFaxAuditNumber } from "./faxAudit.js";
 import { HOUSE_REGISTERED_AGENT, type FilingSessionRecord } from "./types.js";
+import { registeredAgentSignatureForArticles } from "../registeredAgent/acceptanceStatement.js";
 
 export type PdfContextResult =
   | { ok: true; context: Record<string, unknown> }
@@ -105,6 +106,12 @@ export function buildPdfContext(
       annual_report_due_date: filingData.annual_report_due_date ?? "",
       other_provisions: filingData.other_provisions ?? "",
       ...(options.faxAuditNumber ? { fax_audit_number: options.faxAuditNumber } : {}),
+      // T144 D12: the own agent's typed acceptance signature (Article III). Null for the
+      // house agent and for a button-only acceptance: the Zoho Sign anchors print instead.
+      registered_agent_signature:
+        filingData.registered_agent_path === "customer"
+          ? registeredAgentSignatureForArticles(filingData as Record<string, unknown>)
+          : null,
     },
   };
 }

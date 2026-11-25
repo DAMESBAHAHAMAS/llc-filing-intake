@@ -276,3 +276,10 @@ If the frontend needs a "is my document ready" signal, the closest
 available today is polling `GET /api/checkout/order/:orderId`'s
 `fulfillment_status` field — a document-download endpoint (signed,
 expiring URL per decision boundary #1) is not yet built.
+
+## Registered agent acceptance signature (T144 Dispatch 12)
+
+- `POST /api/registered-agent/acceptance/details` `{ token }` → `{ actionable, status, llc_name, registered_agent_name, registered_agent_florida_address, statement, statement_version, signature_required, expires_at }`. Records nothing; 404 for an unknown token.
+- `POST /api/registered-agent/accept` now also takes `{ signature_name, consent: true }`. Optional until `RA_ACCEPT_REQUIRE_SIGNATURE=true` (set it once the new acceptance page is published). The answer adds `signed: true|false`. The audit record (typed name, time, True-Client-IP, user agent, statement and version, token reference) is stored in `filing_data.registered_agent_acceptance`.
+- `POST /api/ops/registered-agent/acceptance-statement/:filingSessionId` (header `x-operator-key`) → the signed Registered Agent Acceptance Statement PDF. 422 when the acceptance has no typed signature.
+- Zoho Deal status: off unless `RA_DEAL_STATUS_FIELD` names a Deal field (optional `RA_DEAL_ACCEPTED_AT_FIELD`, DateTime). Then a request writes "Awaiting agent acceptance" and an acceptance writes "Agent Accepted — Ready for Sunbiz" to the session's Deal, through the `deal_stage_update` ownership check, without touching Stage.

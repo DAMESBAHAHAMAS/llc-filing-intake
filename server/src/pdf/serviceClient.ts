@@ -23,6 +23,11 @@ export type PdfGenerationResult = PdfGenerationSuccess | PdfGenerationFailure;
  * discover missing fields.
  */
 export async function generateArticlesOfOrganizationPdf(context: Record<string, unknown>): Promise<PdfGenerationResult> {
+  return renderTemplatePdf("articles_of_organization", context);
+}
+
+/** Any template in templates/ through POST /generate-pdf (T144 D12: the RA acceptance statement). */
+export async function renderTemplatePdf(template: string, context: Record<string, unknown>): Promise<PdfGenerationResult> {
   const baseUrl = process.env.PDF_SERVICE_URL;
   const apiKey = process.env.PDF_SERVICE_API_KEY;
   if (!baseUrl) {
@@ -36,7 +41,7 @@ export async function generateArticlesOfOrganizationPdf(context: Record<string, 
         "Content-Type": "application/json",
         ...(apiKey ? { "X-PDF-Service-Key": apiKey } : {}),
       },
-      body: JSON.stringify({ template: "articles_of_organization", context }),
+      body: JSON.stringify({ template, context }),
     });
 
     if (!res.ok) {

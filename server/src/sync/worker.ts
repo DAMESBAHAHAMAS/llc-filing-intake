@@ -1,4 +1,5 @@
 import type { Pool } from "pg";
+import { RA_DEAL_SYNC_TYPE } from "../registeredAgent/acceptanceRecord.js";
 import type { DealStageUpdatePayload, OrderSyncPayload, ZohoClient, ZohoSyncResult } from "../zoho/client.js";
 import { backoffForAttempt, isDeadLetter } from "./backoff.js";
 import { sendOpsAlert } from "../ops/alerts.js";
@@ -69,7 +70,9 @@ function dispatchSync(client: ZohoClient, job: ClaimedJob): Promise<ZohoSyncResu
   if (job.sync_type === "order_deal" || job.sync_type === "abandoned_cart") {
     return client.syncOrderEvent(job.payload_snapshot as unknown as OrderSyncPayload);
   }
-  if (job.sync_type === "deal_stage_update") {
+  // T144 D12: the registered agent's status, a field-only update through the
+  // same Deal ownership check (no Stage in the payload).
+  if (job.sync_type === "deal_stage_update" || job.sync_type === RA_DEAL_SYNC_TYPE) {
     return client.updateDealStage(job.payload_snapshot as unknown as DealStageUpdatePayload);
   }
   return client.syncSession(job.payload_snapshot);
