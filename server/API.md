@@ -312,3 +312,15 @@ expiring URL per decision boundary #1) is not yet built.
 - Articles Article III prints the agent's `/s/` line only from that row, and only while the filing still names the accepted agent and address.
 - `POST /api/ops/registered-agent/acceptance-statement/:filingSessionId` (header `x-operator-key`) → the signed Registered Agent Acceptance Statement PDF, from the row. 422 when there is no typed signature.
 - Zoho Deal status: written to `RA_Acceptance_Status` (text, created 25 Nov 2026) unless `RA_DEAL_STATUS_FIELD` names another field; `RA_DEAL_STATUS_FIELD=off` switches it off (values: "Awaiting agent acceptance", "Agent Accepted — Ready for Sunbiz", "Agent declined", "Agent acceptance expired", "Agent email failed"; optional DateTime `RA_DEAL_ACCEPTED_AT_FIELD`). Written only to the session's verified Deal (VERIFIED_DEAL_JOIN: a held or paid order whose Deal a sync job confirmed), field-only (Stage untouched). The job carries no status: the worker sends the session's status as it is when the job runs, so an older job cannot overwrite a newer status. One pending job per session.
+
+## Operating Agreement and Banking Resolution (T144 Dispatch 10)
+
+- Background job (every `OPERATING_AGREEMENT_JOB_INTERVAL_MS`, default 10 min; 0 disables):
+  - **Register:** every verified Deal of a held or paid order gets a row: "Pending Generation" for Bank-Ready (FASTTRACK) and Finance-Ready (PREMIUM), otherwise "Not Included".
+  - **Generate:** after proof of filing, the agreement is generated and stored in `formation_documents`.
+  - **Sync:** the current status is written to the Deal field `Operating_Agreement_Stat`. `OA_DEAL_STATUS_FIELD` overrides the field name; `off` disables the write.
+- `POST /api/ops/operating-agreement/:orderId` (header `x-operator-key`). Body: `{ inputs?, banking_resolution_inputs?, filing_date?: "YYYY-MM-DD", replace?: boolean }`. Generates and stores the agreement (plus the DRAFT Banking Resolution when `BANKING_RESOLUTION_ENABLED=true`). Responses:
+  - `422 { missingFields }` when answers are missing.
+  - `409` when the package does not include the agreement, no proof of filing is recorded, or the agreement was already generated (pass `replace: true` to regenerate).
+- `GET /api/ops/formation-documents/:orderId/:kind` (`operating_agreement` | `banking_resolution`) returns the stored PDF. Headers: `X-Content-SHA256`, `X-Draft`.
+- Migration 0034 (`operating_agreement_status`, `formation_documents`). Until it is applied, the job logs once and stays idle.

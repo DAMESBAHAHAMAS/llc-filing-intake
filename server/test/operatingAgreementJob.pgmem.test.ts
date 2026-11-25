@@ -1,0 +1,178 @@
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { newDb } from "pg-mem";
+import { describe, expect, it, vi } from "vitest";
+import {
+  generateForOrder,
+  OA_STATUS,
+  oaDealField,
+  packageIncludesOperatingAgreement,
+  runOperatingAgreementJobOnce,
+  type OaDeps,
+} from "../src/formation/operatingAgreementJob.js";
+import { buildBankingResolutionContext } from "../src/pdf/bankingResolutionContext.js";
+
+const S1 = "11111111-1111-4111-8111-111111111111"; // Bank-Ready, single member
+const S2 = "22222222-2222-4222-8222-222222222222"; // File It, asked for an OA at Article VI
+const S3 = "33333333-3333-4333-8333-333333333333"; // Finance-Ready kickoff, manager-managed
+const O1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+const O2 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2";
+const O3 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3";
+
+const base = {
+  principal_address: "100 S Biscayne Blvd, Suite 300, Miami, FL, 33131",
+  mailing_address: "100 S Biscayne Blvd, Suite 300, Miami, FL, 33131",
+  registered_agent_path: "house",
+  effective_date_option: "Immediate",
+};
+const sm = { ...base, llc_name: "Test Dispatch Ten SM llc", authorized_persons: [{ article_iv_title: "AR", name: "Jordan Test Rivera", address: base.principal_address }], operating_agreement_requested: true };
+const fileIt = { ...sm, llc_name: "TEST DISPATCH TEN FILE IT LLC" };
+const mgr = { ...base, llc_name: "TEST DISPATCH TEN MGR LLC", authorized_persons: [{ article_iv_title: "MGR", name: "Casey Test Morgan", address: base.principal_address }] };
+
+function migration(file: string): string {
+  return readFileSync(new URL(`../migrations/${file}`, import.meta.url), "utf8")
+    .replace(/^--.*$/gm, "")
+    .replace(/ALTER TABLE \w+ ENABLE ROW LEVEL SECURITY;/g, "");
+}
+
+async function setup(env: NodeJS.ProcessEnv = {}) {
+  const { Pool } = newDb().adapters.createPg();
+  const pool = new Pool();
+  await pool.query(`
+    CREATE TABLE filing_sessions (filing_session_id uuid PRIMARY KEY, filing_data jsonb);
+    CREATE TABLE orders (order_id uuid PRIMARY KEY, filing_session_id uuid NOT NULL, line_items jsonb NOT NULL,
+      payment_status text NOT NULL, paid_at timestamptz, authorized_at timestamptz, crm_deal_id text,
+      proof_of_filing_ref text, proof_of_filing_at timestamptz);
+    CREATE TABLE crm_sync_queue (id bigserial PRIMARY KEY, filing_session_id uuid NOT NULL, order_id uuid, sync_type text NOT NULL,
+      payload_snapshot jsonb NOT NULL, status text NOT NULL DEFAULT 'pending');
+  `);
+  await pool.query(migration("0034_formation_documents.sql"));
+  for (const [s, fd] of [[S1, sm], [S2, fileIt], [S3, mgr]] as const) {
+    await pool.query(`INSERT INTO filing_sessions VALUES ($1, $2)`, [s, JSON.stringify(fd)]);
+  }
+  const li = (c: string) => JSON.stringify([{ offer_code: c }]);
+  await pool.query(`INSERT INTO orders VALUES
+    ($1, $4, $7, 'authorized', NULL, '2026-11-25T10:00:00Z', 'deal-1', NULL, NULL),
+    ($2, $5, $8, 'paid', '2026-11-25T11:00:00Z', NULL, 'deal-2', NULL, NULL),
+    ($3, $6, $9, 'authorized', NULL, '2026-11-25T12:00:00Z', 'deal-3', NULL, NULL)`,
+    [O1, O2, O3, S1, S2, S3, li("FASTTRACK"), li("DIY_STATE_FEE"), li("PREMIUM")]);
+  for (const o of [O1, O2, O3]) {
+    await pool.query(`INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot, status) SELECT filing_session_id, order_id, 'order_deal', '{}'::jsonb, 'synced' FROM orders WHERE order_id = $1`, [o]);
+  }
+  const updates: Array<[string, Record<string, unknown>]> = [];
+  const alerts: string[] = [];
+  const pdf = (tag: string) => {
+    const pdfBytes = Buffer.from(`%PDF-${tag}`);
+    return { ok: true as const, pdfBytes, sha256: createHash("sha256").update(pdfBytes).digest("hex") };
+  };
+  const deps: OaDeps = {
+    db: pool as never,
+    zoho: { updateDeal: vi.fn(async (id: string, f: Record<string, unknown>) => { updates.push([id, f]); return { ok: true }; }) },
+    renderOperatingAgreement: vi.fn(async (t: string) => pdf(t)),
+    renderBankingResolution: vi.fn(async (t: string) => pdf(t)),
+    alert: vi.fn(async (s: string, b: string) => { alerts.push(`${s}: ${b}`); }),
+    now: () => new Date("2026-11-30T15:00:00Z"),
+    env,
+  };
+  return { pool, deps, updates, alerts };
+}
+
+const statusOf = async (pool: { query: (q: string, p?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> }, deal: string) =>
+  (await pool.query(`SELECT status, deal_synced_status, last_error FROM operating_agreement_status WHERE crm_deal_id = $1`, [deal])).rows[0];
+
+describe("Operating Agreement job (T144 D10)", () => {
+  it("knows which packages include the agreement", () => {
+    expect(packageIncludesOperatingAgreement(["FASTTRACK"])).toBe(true);
+    expect(packageIncludesOperatingAgreement(["PREMIUM"])).toBe(true);
+    expect(packageIncludesOperatingAgreement(["DIY_STATE_FEE"])).toBe(false);
+    expect(oaDealField({})).toBe("Operating_Agreement_Stat");
+    expect(oaDealField({ OA_DEAL_STATUS_FIELD: "off" })).toBe("");
+  });
+
+  it("registers Bank-Ready and Finance-Ready as Pending Generation, File It as Not Included, and writes the Deal", async () => {
+    const { pool, deps, updates, alerts } = await setup();
+    await runOperatingAgreementJobOnce(deps);
+    expect(await statusOf(pool, "deal-1")).toMatchObject({ status: OA_STATUS.pending, deal_synced_status: OA_STATUS.pending });
+    expect(await statusOf(pool, "deal-3")).toMatchObject({ status: OA_STATUS.pending });
+    expect(await statusOf(pool, "deal-2")).toMatchObject({ status: OA_STATUS.notIncluded });
+    expect(updates).toContainEqual(["deal-1", { Operating_Agreement_Stat: "Pending Generation" }]);
+    expect(updates).toContainEqual(["deal-2", { Operating_Agreement_Stat: "Not Included" }]);
+    // The Article VI request on a File It order is flagged once.
+    expect(alerts.filter((a) => a.includes("requested but not in the package"))).toHaveLength(1);
+    await runOperatingAgreementJobOnce(deps);
+    expect(alerts.filter((a) => a.includes("requested but not in the package"))).toHaveLength(1);
+    expect(updates).toHaveLength(3); // nothing re-sent when nothing changed
+  });
+
+  it("generates after proof of filing and moves the Deal to Generated", async () => {
+    const { pool, deps, updates } = await setup();
+    await runOperatingAgreementJobOnce(deps);
+    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10', proof_of_filing_at = '2026-11-30T15:00:00Z' WHERE order_id = $1`, [O1]);
+    const r = await runOperatingAgreementJobOnce(deps);
+    expect(r.generated).toBe(1);
+    expect(await statusOf(pool, "deal-1")).toMatchObject({ status: OA_STATUS.generated, deal_synced_status: OA_STATUS.generated });
+    expect(updates).toContainEqual(["deal-1", { Operating_Agreement_Stat: "Generated" }]);
+    const doc = (await pool.query(`SELECT kind, template, draft FROM formation_documents WHERE order_id = $1`, [O1])).rows;
+    expect(doc).toEqual([{ kind: "operating_agreement", template: "operating_agreement_single_member", draft: true }]);
+    expect(deps.renderBankingResolution).not.toHaveBeenCalled(); // switched off by default
+  });
+
+  it("asks ops once for the answers a manager-managed agreement needs, then generates with them", async () => {
+    const { pool, deps, alerts } = await setup({ BANKING_RESOLUTION_ENABLED: "true" });
+    await runOperatingAgreementJobOnce(deps);
+    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST11', proof_of_filing_at = '2026-11-30T15:00:00Z' WHERE order_id = $1`, [O3]);
+    await runOperatingAgreementJobOnce(deps);
+    await runOperatingAgreementJobOnce(deps);
+    expect(alerts.filter((a) => a.includes(O3))).toHaveLength(1);
+    expect((await statusOf(pool, "deal-3")).status).toBe(OA_STATUS.pending);
+    const r = await generateForOrder(deps, O3, {
+      inputs: {
+        members: [
+          { name: "Jordan Test Rivera", address: "1 A St, Miami, FL 33131", percentage: 60 },
+          { name: "Avery Test Lee", address: "2 B St, Miami, FL 33132", percentage: 40 },
+        ],
+        borrowing_limit: "$25,000", payment_period_months: 12, partnership_representative: "Jordan Test Rivera",
+      },
+    });
+    expect(r.ok).toBe(true);
+    expect(r.ok && r.banking_resolution).toMatchObject({ template: "banking_resolution_multi_member" });
+    expect((await statusOf(pool, "deal-3")).status).toBe(OA_STATUS.generated);
+  });
+
+  it("refuses a File It order and an order without proof of filing", async () => {
+    const { deps } = await setup();
+    expect(await generateForOrder(deps, O2)).toMatchObject({ ok: false, status: 409 });
+    expect(await generateForOrder(deps, O1)).toMatchObject({ ok: false, status: 409, error: expect.stringContaining("proof of filing") });
+  });
+
+  it("writes the newest status even after an earlier write failed", async () => {
+    const { pool, deps, updates } = await setup();
+    (deps.zoho.updateDeal as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: false, error: "503" });
+    await runOperatingAgreementJobOnce(deps);
+    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10', proof_of_filing_at = '2026-11-30T15:00:00Z' WHERE order_id = $1`, [O1]);
+    await runOperatingAgreementJobOnce(deps);
+    const deal1 = updates.filter(([id]) => id === "deal-1").map(([, f]) => f.Operating_Agreement_Stat);
+    expect(deal1[deal1.length - 1]).toBe("Generated");
+    expect((await statusOf(pool, "deal-1")).deal_synced_status).toBe("Generated");
+  });
+});
+
+describe("Banking Resolution (DRAFT) context", () => {
+  const filed = { filing_date: "2026-11-30", document_number: "L26000TEST10" };
+  it("builds a single-member resolution, always marked draft", () => {
+    const r = buildBankingResolutionContext(sm as never, filed);
+    expect(r.ok && r.template).toBe("banking_resolution_single_member");
+    expect(r.ok && r.context).toMatchObject({ draft: true, llc_name: "TEST DISPATCH TEN SM LLC", adopted_by: "the sole member",
+      authorized_signers: [{ name: "Jordan Test Rivera", title: "Sole Member" }], signing_rule_text: "acting alone" });
+  });
+  it("needs the owners of a manager-managed LLC and names the managers as signers", () => {
+    expect(buildBankingResolutionContext(mgr as never, filed).ok).toBe(false);
+    const r = buildBankingResolutionContext(mgr as never, filed, { members: [{ name: "A" }, { name: "B" }], signing_rule: "any_one" });
+    expect(r.ok && r.context).toMatchObject({ adopted_by: "the sole manager", authorized_signers: [{ name: "Casey Test Morgan", title: "Manager" }] });
+  });
+  it("names every gap", () => {
+    const r = buildBankingResolutionContext({}, {}, { signing_rule: "any_two" });
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.missingFields.join("|")).toMatch(/llc_name.*filing_date.*document_number/);
+  });
+});

@@ -15,6 +15,8 @@ import { ordersRouter } from "./routes/orders.js";
 import { scorecardRouter } from "./routes/scorecard.js";
 import { einOnboardingRouter } from "./routes/einOnboarding.js";
 import { postFilingInterestsRouter } from "./routes/postFilingInterests.js";
+import { formationDocumentsRouter } from "./routes/formationDocuments.js";
+import { defaultOaDeps, isMissingTable, runOperatingAgreementJobOnce } from "./formation/operatingAgreementJob.js";
 import { defaultPostFilingDeps, runPostFilingSyncOnce } from "./postFiling/interests.js";
 import { defaultEinPortalDeps, runEinPortalInvitesOnce, runEinPortalSweepOnce } from "./ein/portalJobs.js";
 import { einPortalConfig, einPortalConfigIssues } from "./ein/onboarding.js";
@@ -70,6 +72,7 @@ app.use(ordersRouter);
 app.use(scorecardRouter);
 app.use(einOnboardingRouter);
 app.use(postFilingInterestsRouter);
+app.use(formationDocumentsRouter);
 
 const port = Number(process.env.PORT ?? 3000);
 app.listen(port, () => {
@@ -213,4 +216,30 @@ if (postFilingSyncIntervalMs > 0) {
         console.error("[post-filing sync] tick failed", err);
       });
   }, postFilingSyncIntervalMs);
+}
+
+/**
+ * T144 Dispatch 10: Operating Agreement generation and the Deal's
+ * Operating_Agreement_Stat (formation/operatingAgreementJob.ts). Every 10 minutes
+ * by default; OPERATING_AGREEMENT_JOB_INTERVAL_MS=0 disables. Before migration
+ * 0034 is applied it logs once and does nothing.
+ */
+const oaJobIntervalMs = Number(process.env.OPERATING_AGREEMENT_JOB_INTERVAL_MS ?? 10 * 60_000);
+let oaMissingTableLogged = false;
+if (oaJobIntervalMs > 0) {
+  setInterval(() => {
+    defaultOaDeps(pool)
+      .then((deps) => runOperatingAgreementJobOnce(deps))
+      .then((r) => {
+        if (r.errors.length > 0) console.error("[operating agreement] Deal updates failed", r.errors);
+      })
+      .catch((err) => {
+        if (isMissingTable(err)) {
+          if (!oaMissingTableLogged) console.log("[operating agreement] migration 0034 not applied; job idle");
+          oaMissingTableLogged = true;
+          return;
+        }
+        console.error("[operating agreement] tick failed", err);
+      });
+  }, oaJobIntervalMs);
 }

@@ -37,6 +37,14 @@ export async function generateOperatingAgreementPdf(
   return generatePdf(template, context);
 }
 
+/** T144 D10: the Banking Resolution (DRAFT wording; generated only when BANKING_RESOLUTION_ENABLED=true). */
+export async function generateBankingResolutionPdf(
+  template: "banking_resolution_single_member" | "banking_resolution_multi_member",
+  context: Record<string, unknown>
+): Promise<PdfGenerationResult> {
+  return generatePdf(template, context);
+}
+
 /** Same as renderTemplatePdf; the name the document generators use. */
 function generatePdf(template: string, context: Record<string, unknown>): Promise<PdfGenerationResult> {
   return renderTemplatePdf(template, context);
