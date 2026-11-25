@@ -1152,4 +1152,129 @@ is requested, so it does not depend on the capture succeeding, and its wording
 says payment is being collected, not that it was. An EIN-only order records the
 EIN as its proof; that number is not emailed.
 
+## 2026-10-01 — Operating Agreement generator built; wording held as draft
+
+**What exists now:** two templates, `operating_agreement_single_member`
+and `operating_agreement_multi_member`, rendered by the existing PDF
+service (`render_pdf.py`, unchanged apart from per-template download
+filenames). `buildOperatingAgreementContext()` in
+`server/src/pdf/operatingAgreementContext.ts` follows the Articles rule:
+any missing value is returned as a named gap, never filled in. The
+agreement cites the filing date and document number, so it can only be
+generated after proof of filing.
+
+**Rationale:** Premium includes a custom Operating Agreement (2026-09-17
+package pricing; Stripe Premium product), and no generator or template
+existed. The wording comes from the "Operating Agreement Templates for
+Review" doc (rev 6). Sections the doc described by reference ("same as
+the single-member version") are written out in full in the multi-member
+template, and are listed in that doc for review.
+
+**Hold:** `OPERATING_AGREEMENT_WORDING_APPROVED = false`. Until Damian
+approves the wording, every rendered PDF carries a "Draft wording, not
+yet approved. Not for customer delivery" banner. Changing that constant
+needs a new entry here that cites his approval. No delivery step is
+wired. Rendering has only been run on fictional sample data
+(`src/scripts/renderOperatingAgreementSamples.ts`).
+
+**Not yet collected by the interview:** initial contribution and
+successor (optional, so they render as blank lines to write in); and,
+for multi-member filings, each member's percentage, the borrowing limit,
+the buy-out payment period and the tax representative. Multi-member
+agreements cannot be generated until the interview collects those four.
+
 **Supersedes:** —
+
+---
+
+## 2026-10-01 — Formation package assembled as one PDF; wording held as draft
+
+**What exists now:** `server/src/pdf/formationPackage.ts` builds the cover
+letter and next-steps contexts and puts the parts in package order:
+cover letter, Articles, the state's filing confirmation, Operating
+Agreement (Premium only), next steps. `render_pdf.py` gains `/merge-pdf`
+(pypdf, already in requirements.txt; same shared-secret auth, at most 10
+parts and 25 MB) and three templates: `formation_cover_letter`,
+`formation_next_steps`, and `formation_placeholder_page` (samples only).
+The style partial is renamed `partials/document_styles.html.j2`.
+
+**Rationale:** Damian's rule is that every LLC filer gets the branded
+delivery package, and delivering it is the proof-of-filing step that
+collects the card hold. Wording comes from the "Operating Agreement
+Templates for Review" doc (rev 10).
+
+**Hold:** `FORMATION_PACKAGE_WORDING_APPROVED = false`, so every rendered
+page carries the "not for customer delivery" banner. A package can't be
+assembled without the state's filing confirmation, and a Premium package
+can't be assembled without the Operating Agreement. No delivery step is
+wired; only fictional sample data has been rendered
+(`src/scripts/renderFormationPackageSamples.ts`).
+
+**Known gap:** the Articles template is A4, the new documents are US
+Letter, so a package mixes page sizes until the Articles template is
+changed (a filed-document change, so not made here).
+
+**Supersedes:** —
+
+---
+
+## 2026-10-10 — Operating Agreement: approved cited wording in the generator; new layout; no state seal
+
+**Approval:** Damian approved the wording in the "Templates With
+Citations" tab (rev 6) in chat on 2026-10-10 at 20:08 ET ("it's
+definitely approved"), including the 12 cross-check fixes and the
+"Electronic signatures are valid" line. He did not approve the
+typesetting, so the layout was redone and is awaiting his review.
+
+**What changed:** both Operating Agreement templates now carry that
+wording with each Florida statute citation printed right after the
+provision it supports. The tab's "[Use when ...]" instructions are
+template conditions and never print. The context adds `managers`
+(name and address) for the Schedule A manager row; a manager without an
+address is now a named gap. s. 605.04074 was confirmed in the 2026
+edition before release (last section that had only been checked in 2023).
+
+**Layout:** new `partials/agreement_styles.html.j2` and
+`partials/agreement_macros.html.j2`: Oswald Bold Title Case headings
+kept with the following text, Roboto body, hanging section numbers,
+citations in small muted italic kept on one line each, running header
+from page 2, signature block kept together, Schedule A on its own page.
+Fonts are embedded from `assets/fonts/brand/` (Oswald and Roboto, SIL Open
+Font License 1.1, license files alongside); `.gitignore` now allows that
+folder only. The formation cover letter, next steps and the Articles are
+unchanged.
+
+**State seal removed from the agreement:** s. 15.03(3), Fla. Stat.,
+reserves affixing the Great Seal to the Department of State and requires
+its approval for any reproduction (second-degree misdemeanor otherwise).
+The live Articles of Organization template still prints it; removing it
+there is a production change awaiting Damian's decision.
+
+**Hold:** `OPERATING_AGREEMENT_WORDING_APPROVED` stays false until Damian
+approves the PDF output; until then every PDF carries "Review copy. Not
+for customer delivery." A Florida attorney read is still recommended
+before customer delivery.
+
+**Supersedes:** the wording source and banner text in the 2026-10-01
+Operating Agreement entry.
+
+## 2026-11-23 — Bank-Ready ($499) formation packages include the Operating Agreement
+
+**Rationale:** The Offer Master (migration 0029) and /pricing sell Bank-Ready with a custom Operating Agreement and Banking Resolution, but the formation package builder added an Operating Agreement only for Premium, so a Bank-Ready cover letter would have omitted a document the customer paid for. Found while rendering the Appendix C specimen package on 22 Nov 2026; Damian decided the fix on 23 Nov 2026. `includesOperatingAgreement` is now true for `fasttrack` and `premium`; File It (`diy`) still carries none. `orderPackageParts` refuses a Bank-Ready package without the agreement.
+
+**Supersedes:** The "Premium only" rule in the formation package header comment and `includesOperatingAgreement` (same file, earlier revision). No earlier DECISIONS entry.
+
+## 2026-11-25 — Operating Agreement generator merged and wired; Banking Resolution drafted behind a switch (A6Y2-T144 Dispatch 10)
+
+**Owner decisions (Damian, 25 Nov 2026, relayed by the dispatcher):** "Review & merge it" (the Operating Agreement generator); Banking Resolution "Draft for my review"; Deal fields "Create both" (`Operating_Agreement_Stat` picklist, `RA_Acceptance_Status` text, created and read back by the dispatcher).
+
+**What changed:** the generator branch (`claude/operating-agreement-generator` and #13, Bank-Ready includes the agreement) is rebased onto main. `formation/operatingAgreementJob.ts` runs every 10 minutes:
+- **Register:** every verified Deal (`VERIFIED_DEAL_JOIN`) gets "Pending Generation" for Bank-Ready (FASTTRACK) or Finance-Ready (PREMIUM, including the $139 kickoff order), and "Not Included" otherwise. An Article VI request on a package without the agreement is flagged to ops.
+- **Generate:** after proof of filing, generates the agreement and stores it in `formation_documents` (migration 0034).
+- **Sync:** writes the current status to `Operating_Agreement_Stat`.
+
+Agreements needing answers the interview does not collect (owners and percentages, borrowing limit and the like) are generated by `POST /api/ops/operating-agreement/:orderId`. Nothing is delivered to customers: `OPERATING_AGREEMENT_WORDING_APPROVED` stays false (review banner), and "Delivered" is never set by code.
+
+**Banking Resolution:** single- and multi-member DRAFT templates (`templates/banking_resolution_*`). Every page prints "DRAFT – pending owner approval". They are generated only when `BANKING_RESOLUTION_ENABLED=true`, which is off by default. The wording for Damian's review is in the T144 artifacts (`artifacts/d10/Banking-Resolution_DRAFT-wording-for-review.md`).
+
+**Filing date:** the agreement's "Filed" date is the Florida date when proof of filing was recorded, unless the operator passes `filing_date`.

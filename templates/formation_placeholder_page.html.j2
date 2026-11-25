@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{{ title }}</title>
+{% set footer_label = "Formation Package" %}
+{% set hide_page_numbers = true %}
+{% include "partials/document_styles.html.j2" %}
+</head>
+<body>
+{#
+  Sample packages only: stands in for a document the system receives
+  rather than renders (the state's filing confirmation). Never used for
+  a customer package; the assembler requires the real file there.
+#}
+<div class="draft-banner">Sample only. Not for customer delivery.</div>
+<h1 class="letter-subject">{{ title }}</h1>
+<div class="placeholder-box"><p>{{ note }}</p></div>
+</body>
+</html>

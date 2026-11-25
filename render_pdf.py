@@ -1,3 +1,5 @@
+import base64
+import binascii
 import hmac
 import io
 import os
@@ -51,6 +53,19 @@ def _is_authorized(req) -> bool:
 # inside a CSS string in the template, so it is checked again here against the same pattern.
 _FAX_AUDIT_NUMBER = re.compile(r"[A-Z][0-9]{11} [0-9]")
 
+# Download filename suffix per template. Before the Operating Agreement
+# templates existed, every PDF was named "..._Articles_of_Organization.pdf".
+_DOCUMENT_LABELS = {
+    "articles_of_organization": "Articles_of_Organization",
+    "operating_agreement_single_member": "Operating_Agreement",
+    "operating_agreement_multi_member": "Operating_Agreement",
+    "formation_cover_letter": "Cover_Letter",
+    "formation_next_steps": "Next_Steps",
+    "formation_placeholder_page": "Placeholder",
+    "banking_resolution_single_member": "Banking_Resolution_DRAFT",
+    "banking_resolution_multi_member": "Banking_Resolution_DRAFT",
+}
+
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -94,8 +109,9 @@ def generate_pdf():
     # In-memory only — write_pdf() with no target returns bytes, nothing touches disk.
     pdf_bytes = HTML(string=html_string, base_url=BASE_DIR).write_pdf()
 
-    llc_name = context.get("llc_name") or "Articles_of_Organization"
-    filename = secure_filename(f"{llc_name}_Articles_of_Organization.pdf")
+    document_label = _DOCUMENT_LABELS.get(template_name, template_name)
+    llc_name = context.get("llc_name") or document_label
+    filename = secure_filename(f"{llc_name}_{document_label}.pdf")
 
     return Response(
         pdf_bytes,
@@ -238,6 +254,52 @@ def generate_ss4():
         buf.getvalue(),
         mimetype="application/pdf",
         headers={"Content-Disposition": 'attachment; filename="Form_SS-4.pdf"'},
+    )
+
+
+# Formation package assembly: joins PDFs that were already rendered (or,
+# for the state's filing confirmation, received) into one file, in the
+# order given. Nothing is written to disk.
+_MAX_MERGE_PARTS = 10
+_MAX_MERGE_BYTES = 25 * 1024 * 1024
+
+
+@app.route("/merge-pdf", methods=["POST"])
+def merge_pdf():
+    if not _is_authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    parts = body.get("pdfs")
+    if not isinstance(parts, list) or not parts:
+        return jsonify({"error": "'pdfs' must be a non-empty list of base64 strings"}), 400
+    if len(parts) > _MAX_MERGE_PARTS:
+        return jsonify({"error": f"at most {_MAX_MERGE_PARTS} parts"}), 400
+
+    writer = PdfWriter()
+    total = 0
+    for i, encoded in enumerate(parts):
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, TypeError, ValueError):
+            return jsonify({"error": f"part {i} is not valid base64"}), 400
+        total += len(raw)
+        if total > _MAX_MERGE_BYTES:
+            return jsonify({"error": "parts exceed the size limit"}), 413
+        if not raw.startswith(b"%PDF"):
+            return jsonify({"error": f"part {i} is not a PDF"}), 400
+        try:
+            writer.append(PdfReader(io.BytesIO(raw)))
+        except Exception as err:  # malformed PDF
+            return jsonify({"error": f"part {i} could not be read: {err}"}), 422
+
+    out = io.BytesIO()
+    writer.write(out)
+    filename = secure_filename(f"{body.get('filename') or 'Formation_Package'}.pdf")
+    return Response(
+        out.getvalue(),
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

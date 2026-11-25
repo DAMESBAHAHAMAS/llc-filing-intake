@@ -1,0 +1,224 @@
+<style>
+  /* Operating Agreement typesetting (approved wording, 2026-10-10).
+     Brand rules: Oswald Bold headings in Title Case, Roboto body,
+     headings kept with the text that follows them. Fonts are embedded
+     from assets/fonts/brand (SIL Open Font License, see OFL-*.txt). They
+     sit in their own folder so the Articles template, which names
+     different files, does not change until that is approved separately.
+
+     No state seal: s. 15.03(3), Fla. Stat., reserves reproduction of
+     the Great Seal to Department of State approval. */
+  @font-face { font-family: "Oswald"; src: url("./assets/fonts/brand/Oswald-Medium.ttf") format("truetype"); font-weight: 500; }
+  @font-face { font-family: "Oswald"; src: url("./assets/fonts/brand/Oswald-Bold.ttf") format("truetype"); font-weight: 700; }
+  @font-face { font-family: "Roboto"; src: url("./assets/fonts/brand/Roboto-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; }
+  @font-face { font-family: "Roboto"; src: url("./assets/fonts/brand/Roboto-Italic.ttf") format("truetype"); font-weight: 400; font-style: italic; }
+  @font-face { font-family: "Roboto"; src: url("./assets/fonts/brand/Roboto-Medium.ttf") format("truetype"); font-weight: 500; font-style: normal; }
+  @font-face { font-family: "Roboto"; src: url("./assets/fonts/brand/Roboto-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; }
+
+
+  @page {
+    size: Letter;
+    margin: 0.95in 1.05in 0.9in 1.05in;
+    @top-left {
+      content: string(company);
+      font-family: "Roboto", sans-serif;
+      font-size: 8pt;
+      color: #5B7489;
+      vertical-align: bottom;
+      padding-bottom: 10pt;
+    }
+    @top-right {
+      content: "Operating Agreement";
+      font-family: "Roboto", sans-serif;
+      font-size: 8pt;
+      color: #5B7489;
+      vertical-align: bottom;
+      padding-bottom: 10pt;
+    }
+    @bottom-center {
+      content: "Page " counter(page) " of " counter(pages);
+      font-family: "Roboto", sans-serif;
+      font-size: 8pt;
+      color: #5B7489;
+      vertical-align: top;
+      padding-top: 12pt;
+    }
+  }
+  @page :first {
+    @top-left { content: none; }
+    @top-right { content: none; }
+  }
+
+  * { box-sizing: border-box; }
+
+  html { font-family: "Roboto", "Helvetica", "Arial", sans-serif; }
+  body {
+    font-size: 10.5pt;
+    line-height: 1.5;
+    color: #113A57;
+    margin: 0;
+    hyphens: manual;
+  }
+  p { margin: 0; orphans: 3; widows: 3; }
+
+  .draft-banner {
+    border: 1pt solid #B42318;
+    color: #B42318;
+    font-size: 8.5pt;
+    font-weight: 500;
+    letter-spacing: 0.03em;
+    text-align: center;
+    padding: 5pt 8pt;
+    margin-bottom: 18pt;
+  }
+
+  /* Title block */
+  .title-block { margin: 0 0 16pt 0; }
+  .title-block .kicker {
+    font-size: 8.5pt;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    color: #0087D4;
+    margin-bottom: 6pt;
+  }
+  .title-block h1 {
+    font-family: "Oswald", "Helvetica", sans-serif;
+    font-weight: 700;
+    font-size: 27pt;
+    line-height: 1.1;
+    letter-spacing: 0.005em;
+    margin: 0;
+  }
+  .title-block .company {
+    display: block;
+    font-family: "Oswald", "Helvetica", sans-serif;
+    font-weight: 500;
+    font-size: 16pt;
+    line-height: 1.25;
+    margin-top: 4pt;
+    string-set: company content(text);
+  }
+
+  /* Filing facts strip */
+  table.facts {
+    width: 100%;
+    border-collapse: collapse;
+    border-top: 2pt solid #0087D4;
+    border-bottom: 0.75pt solid rgba(17, 58, 87, 0.18);
+    margin: 0 0 12pt 0;
+  }
+  table.facts td { width: 33.3%; padding: 7pt 10pt 7pt 0; vertical-align: top; }
+  table.facts .label {
+    display: block;
+    font-size: 7.5pt;
+    font-weight: 500;
+    letter-spacing: 0.05em;
+    color: #0087D4;
+    margin-bottom: 1pt;
+  }
+  table.facts .value { font-size: 10pt; }
+
+  .cite-note {
+    font-size: 8.5pt;
+    font-style: italic;
+    color: #5B7489;
+    line-height: 1.45;
+    margin: 0 0 18pt 0;
+  }
+
+  .preamble { margin: 0 0 14pt 0; }
+
+  /* Numbered provisions: the number hangs in its own column and the
+     heading never sits alone at the foot of a page. */
+  .clause { margin: 0 0 11pt 0; }
+  .clause h2 {
+    font-family: "Oswald", "Helvetica", sans-serif;
+    font-weight: 700;
+    font-size: 12pt;
+    line-height: 1.3;
+    letter-spacing: 0.01em;
+    margin: 0 0 3pt 0;
+    break-after: avoid;
+    page-break-after: avoid;
+  }
+  .clause h2 .num {
+    display: inline-block;
+    width: 0.44in;
+    color: #0087D4;
+  }
+  .clause p { margin-left: 0.44in; }
+
+  /* Statute citations: smaller, muted and italic so the provision reads
+     first; each reference is kept on one line. */
+  .cite {
+    font-size: 8pt;
+    font-style: italic;
+    color: #5B7489;
+    letter-spacing: 0.01em;
+  }
+  .cite .part { white-space: nowrap; }
+
+  /* Signatures */
+  .sign-block { break-inside: avoid; page-break-inside: avoid; margin-top: 22pt; }
+  h2.part-heading {
+    font-family: "Oswald", "Helvetica", sans-serif;
+    font-weight: 700;
+    font-size: 14pt;
+    line-height: 1.25;
+    margin: 0 0 4pt 0;
+    padding-bottom: 5pt;
+    border-bottom: 1.5pt solid #0087D4;
+    break-after: avoid;
+    page-break-after: avoid;
+  }
+  table.sig { width: 100%; border-collapse: collapse; margin-top: 6pt; }
+  table.sig td { vertical-align: bottom; padding: 0; }
+  table.sig td.who { width: 62%; padding-right: 26pt; }
+  table.sig td.when { width: 38%; }
+  table.sig .role {
+    font-size: 7.5pt;
+    font-weight: 500;
+    letter-spacing: 0.05em;
+    color: #0087D4;
+    padding-top: 22pt;
+  }
+  table.sig .entity { font-size: 10pt; padding-top: 2pt; }
+  table.sig .line { border-bottom: 0.75pt solid #113A57; height: 30pt; }
+  table.sig .line.with-by { height: auto; padding-top: 24pt; }
+  table.sig .line .by { display: block; font-size: 9pt; line-height: 1.2; padding-bottom: 1pt; }
+  table.sig .caption { font-size: 9pt; padding-top: 3pt; }
+  table.sig .caption .name { font-weight: 500; }
+  .e-sign { font-size: 9pt; margin-top: 16pt; }
+
+  /* Schedule A starts its own page */
+  .schedule-page { break-before: page; page-break-before: always; }
+  .schedule-page .cite { margin-left: 4pt; font-family: "Roboto", sans-serif; font-weight: 400; }
+  table.schedule { width: 100%; border-collapse: collapse; margin-top: 10pt; }
+  table.schedule th {
+    font-size: 7.5pt;
+    font-weight: 500;
+    letter-spacing: 0.05em;
+    text-align: left;
+    color: #FFFFFF;
+    background: #113A57;
+    padding: 6pt 8pt;
+  }
+  table.schedule td {
+    font-size: 9.5pt;
+    line-height: 1.4;
+    padding: 8pt 8pt;
+    border-bottom: 0.75pt solid rgba(17, 58, 87, 0.18);
+    vertical-align: top;
+  }
+  table.schedule td.num { white-space: nowrap; }
+  table.schedule tr.manager td { color: #5B7489; }
+
+  .blank { display: inline-block; min-width: 1.4in; border-bottom: 0.75pt solid #113A57; }
+
+  .disclaimer {
+    font-size: 8pt;
+    font-style: italic;
+    color: #5B7489;
+    margin-top: 18pt;
+  }
+</style>

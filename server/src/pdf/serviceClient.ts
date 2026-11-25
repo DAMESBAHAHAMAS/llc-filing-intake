@@ -26,6 +26,30 @@ export async function generateArticlesOfOrganizationPdf(context: Record<string, 
   return renderTemplatePdf("articles_of_organization", context);
 }
 
+/**
+ * Operating Agreement (Premium). template and context come from
+ * buildOperatingAgreementContext() in pdf/operatingAgreementContext.ts.
+ */
+export async function generateOperatingAgreementPdf(
+  template: "operating_agreement_single_member" | "operating_agreement_multi_member",
+  context: Record<string, unknown>
+): Promise<PdfGenerationResult> {
+  return generatePdf(template, context);
+}
+
+/** T144 D10: the Banking Resolution (DRAFT wording; generated only when BANKING_RESOLUTION_ENABLED=true). */
+export async function generateBankingResolutionPdf(
+  template: "banking_resolution_single_member" | "banking_resolution_multi_member",
+  context: Record<string, unknown>
+): Promise<PdfGenerationResult> {
+  return generatePdf(template, context);
+}
+
+/** Same as renderTemplatePdf; the name the document generators use. */
+function generatePdf(template: string, context: Record<string, unknown>): Promise<PdfGenerationResult> {
+  return renderTemplatePdf(template, context);
+}
+
 /** Any template in templates/ through POST /generate-pdf (T144 D12: the RA acceptance statement). */
 export async function renderTemplatePdf(template: string, context: Record<string, unknown>): Promise<PdfGenerationResult> {
   const baseUrl = process.env.PDF_SERVICE_URL;
@@ -86,6 +110,45 @@ export async function generateSs4Pdf(
     }
     const pdfBytes = Buffer.from(await res.arrayBuffer());
     return { ok: true, pdfBytes, sha256: createHash("sha256").update(pdfBytes).digest("hex") };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Formation package pages: cover letter, next steps, and the sample-only placeholder. */
+export async function generateFormationPagePdf(
+  template: "formation_cover_letter" | "formation_next_steps" | "formation_placeholder_page",
+  context: Record<string, unknown>
+): Promise<PdfGenerationResult> {
+  return generatePdf(template, context);
+}
+
+/**
+ * Joins already-rendered PDFs into one file, in the order given, through
+ * the PDF service's /merge-pdf (pypdf). Used for the formation package.
+ */
+export async function mergePdfs(parts: Buffer[], filename: string): Promise<PdfGenerationResult> {
+  const baseUrl = process.env.PDF_SERVICE_URL;
+  const apiKey = process.env.PDF_SERVICE_API_KEY;
+  if (!baseUrl) {
+    return { ok: false, error: "server misconfigured: PDF_SERVICE_URL not set" };
+  }
+  try {
+    const res = await fetch(`${baseUrl}/merge-pdf`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey ? { "X-PDF-Service-Key": apiKey } : {}),
+      },
+      body: JSON.stringify({ pdfs: parts.map((p) => p.toString("base64")), filename }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      return { ok: false, httpStatus: res.status, error: `PDF merge returned ${res.status}: ${text.slice(0, 500)}` };
+    }
+    const pdfBytes = Buffer.from(await res.arrayBuffer());
+    const sha256 = createHash("sha256").update(pdfBytes).digest("hex");
+    return { ok: true, pdfBytes, sha256 };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }

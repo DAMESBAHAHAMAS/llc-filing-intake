@@ -1,0 +1,68 @@
+{#-
+  Banking Resolution body shared by the single- and multi-member templates.
+  DRAFT WORDING (T144 Dispatch 10, 25 Nov 2026): written for Damian's review,
+  not approved. Every page carries the DRAFT header and watermark below
+  regardless of any setting; the wording may only be relied on after Damian
+  (and counsel) approve it and DRAFT is removed in a reviewed change.
+-#}
+<div class="draft-watermark">DRAFT – pending owner approval</div>
+<div class="draft-banner">DRAFT – pending owner approval. Not for customer delivery.</div>
+
+<header class="title-block">
+  <p class="kicker">A Florida Limited Liability Company</p>
+  <h1>Banking Resolution of</h1>
+  <span class="company">{{ llc_name }}</span>
+</header>
+
+<table class="facts">
+  <tr>
+    <td><span class="label">Document Number</span><span class="value">{{ document_number }}</span></td>
+    <td><span class="label">Filed</span><span class="value">{{ filing_date }}</span></td>
+    <td><span class="label">Adopted</span><span class="value">{{ adoption_date_label }}</span></td>
+  </tr>
+</table>
+
+<p class="preamble">The undersigned, being {{ adopted_by }} of {{ llc_name }}, a Florida limited liability company (the “Company”), adopt the following resolutions by written consent without a meeting, as permitted by the Company’s Operating Agreement and Chapter 605, Florida Statutes.</p>
+
+<section class="clause">
+  <h2><span class="num">1.</span>Bank Accounts</h2>
+  <p>RESOLVED, that the Company may open and keep one or more deposit, checking, savings, payment and merchant accounts (the “Accounts”) in the Company’s name with any federally insured bank, credit union or other licensed financial institution or payment provider that the Authorized Signers choose (each a “Bank”).</p>
+</section>
+
+<section class="clause">
+  <h2><span class="num">2.</span>Authorized Signers</h2>
+  <p>RESOLVED, that each person named below (each an “Authorized Signer”) is authorized, {{ signing_rule_text }}, on behalf of the Company, to open and close Accounts; sign the Bank’s account documents and signature cards; sign, endorse and deposit checks and other items; make withdrawals, wire and electronic transfers and online payments; obtain debit and business credit cards linked to the Accounts; and give the Bank any instruction about the Accounts.</p>
+  <table class="signers">
+    <thead><tr><th>Name</th><th>Title</th></tr></thead>
+    <tbody>
+      {% for s in authorized_signers %}<tr><td>{{ s.name }}</td><td>{{ s.title }}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="clause">
+  <h2><span class="num">3.</span>Bank Forms</h2>
+  <p>RESOLVED, that any form of resolution, certificate or account agreement a Bank requires, consistent with these resolutions, is adopted as if set out here, and the Authorized Signers may certify these resolutions to a Bank.</p>
+</section>
+
+<section class="clause">
+  <h2><span class="num">4.</span>Reliance and Changes</h2>
+  <p>RESOLVED, that a Bank may rely on these resolutions until it receives written notice that they have been changed or revoked, and the Company may change the Authorized Signers at any time by a later written resolution delivered to the Bank.</p>
+</section>
+
+<section class="clause">
+  <h2><span class="num">5.</span>Prior Acts</h2>
+  <p>RESOLVED, that any action an Authorized Signer took before this date to open an Account for the Company, consistent with these resolutions, is ratified.</p>
+</section>
+
+<section class="signature-block">
+  <h2 class="part-heading">Signature</h2>
+  <table class="sig">
+    {% for p in signers_of_consent %}
+    <tr><td class="who role" colspan="2">{{ p.role }}</td></tr>
+    <tr><td class="who"><div class="line"></div></td><td class="when"><div class="line"></div></td></tr>
+    <tr><td class="who caption"><span class="name">{{ p.name }}</span></td><td class="when caption">Date</td></tr>
+    {% endfor %}
+  </table>
+  <p class="e-sign">Electronic signatures are valid. [§ 668.50(7), Fla. Stat.]</p>
+</section>
