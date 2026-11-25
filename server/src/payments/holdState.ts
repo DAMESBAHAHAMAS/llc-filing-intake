@@ -22,8 +22,8 @@ export function classifyCheckoutCompletion(
 }
 
 /**
- * Money was collected on a hold (a capture, or the saved-card fallback
- * after the hold expired). Deliberately NOT "pending": for orders paid at
+ * Money was collected on a hold (a capture), or the customer paid the
+ * Payment Link emailed after the Day-5 release (payments/holdRelease.ts). Deliberately NOT "pending": for orders paid at
  * checkout, payment_intent.succeeded can arrive before
  * checkout.session.completed, and that event is the one that starts
  * filing and creates the Deal — letting this event mark the order paid

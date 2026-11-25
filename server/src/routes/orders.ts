@@ -2,13 +2,7 @@ import { Router, type Request } from "express";
 import { timingSafeEqual } from "node:crypto";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
-import {
-  cancelPaymentIntent,
-  capturePaymentIntent,
-  chargeSavedCard,
-  retrievePaymentIntent,
-  StripeApiError,
-} from "../stripe/restClient.js";
+import { cancelPaymentIntent, capturePaymentIntent, StripeApiError } from "../stripe/restClient.js";
 import { holdNoLongerCapturable } from "../payments/holdState.js";
 import { sendOpsAlert } from "../ops/alerts.js";
 import { effectiveDateProblem, floridaToday, windowForFilingDate } from "../filing/effectiveDateWindow.js";
@@ -62,7 +56,7 @@ async function recordProofAndQueueConfirmation(orderId: string, documentNumber: 
         orderId: order.order_id,
         filingSessionId: order.filing_session_id,
         emailTypes: ["filing_confirmation"],
-        paymentMode: order.payment_status === "paid" ? "paid" : "hold",
+        paymentMode: order.payment_status === "paid" ? "paid" : order.payment_status === "released" ? "released" : "hold",
       });
     }
     await client.query("COMMIT");
@@ -88,9 +82,13 @@ async function recordProofAndQueueConfirmation(orderId: string, documentNumber: 
  * charged until proof of filing is delivered.
  *
  * If the hold can no longer be collected (it expired or was released),
- * the card saved at checkout is charged instead. Either way the order
- * becomes "paid" only when Stripe's own payment_intent.succeeded webhook
- * arrives — this route never marks an order paid itself.
+ * NOTHING is charged (owner's final hold rule, 25 Nov 2026: a lapsed hold is
+ * never auto-charged; the off-session saved-card charge that used to run here
+ * is removed). The route answers 409 fresh_consent_required and alerts ops.
+ * A hold released by the Day-5 job (payments/holdRelease.ts) already sent the
+ * customer a Payment Link for the same amount. The order becomes "paid" only
+ * when Stripe's own payment_intent.succeeded webhook arrives — this route
+ * never marks an order paid itself.
  *
  * The customer's filing confirmation is queued with the proof, before
  * collection is requested, so a collection problem cannot hold back the
@@ -157,29 +155,48 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
         res.status(502).json({ error: "collection failed", detail: describeError(err), order_id: order.order_id });
         return;
       }
-      // Hold expired or released — fall through to the saved card.
+      // Hold expired or released: fall through. Fresh consent is required.
     }
   }
 
-  try {
-    const original = await retrievePaymentIntent(order.stripe_payment_intent_id);
-    if (!original.customer || !original.payment_method) {
-      throw new Error("no saved card on the original payment");
-    }
-    const charged = await chargeSavedCard({
-      customerId: original.customer,
-      paymentMethodId: original.payment_method,
-      amountCents: order.total_cents,
-      currency: order.currency || "usd",
-      idempotencyKey: `fallback-${order.order_id}`,
-      metadata: { order_id: order.order_id, reason: "hold_expired_before_proof_of_filing" },
-    });
-    res.status(200).json({ order_id: order.order_id, status: "saved_card_charged", payment_intent_status: charged.status });
-  } catch (err) {
-    await recordCaptureError(order.order_id, err);
-    res.status(502).json({ error: "saved-card charge failed", detail: describeError(err), order_id: order.order_id });
-  }
+  // An expired or released hold charges nothing here. The order is flagged and
+  // ops is alerted so the customer can approve a new payment.
+  const reason = order.payment_status === "released" ? "hold_released" : "hold_expired";
+  const paymentLinkUrl = await flagFreshConsentRequired(order.order_id, reason);
+  res.status(409).json({
+    order_id: order.order_id,
+    status: "fresh_consent_required",
+    reason,
+    payment_link_url: paymentLinkUrl,
+    detail: paymentLinkUrl
+      ? "The card hold can no longer be collected. Nothing was charged. The customer was already emailed a payment link for the same amount."
+      : "The card hold can no longer be collected. Nothing was charged. Ask the customer to approve a new payment.",
+  });
 });
+
+/** Records why nothing was collected and alerts ops. Returns the Day-5 Payment Link, if one was sent. */
+async function flagFreshConsentRequired(orderId: string, reason: string): Promise<string | null> {
+  let paymentLinkUrl: string | null = null;
+  try {
+    await pool.query(`UPDATE orders SET capture_error = $2 WHERE order_id = $1`, [orderId, `fresh_consent_required:${reason}`]);
+  } catch (e) {
+    console.error(`[payments] could not flag fresh consent for ${orderId}:`, describeError(e));
+  }
+  try {
+    const { rows } = await pool.query<{ payment_link_url: string | null }>(`SELECT payment_link_url FROM orders WHERE order_id = $1`, [orderId]);
+    paymentLinkUrl = rows[0]?.payment_link_url ?? null;
+  } catch {
+    // Before migration 0038 the column does not exist: no link was sent.
+  }
+  await sendOpsAlert(
+    "New payment approval needed",
+    `Order ${orderId}: proof of filing is recorded but the card hold is ${reason === "hold_released" ? "released" : "expired"}. Nothing was charged. ` +
+      (paymentLinkUrl
+        ? `The customer was emailed a payment link for the same amount at Day 5: ${paymentLinkUrl}`
+        : "Ask the customer to approve a new payment.")
+  );
+  return paymentLinkUrl;
+}
 
 /**
  * POST /api/orders/:orderId/effective-date-check (operator)

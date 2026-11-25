@@ -46,6 +46,7 @@ export function createPostFilingInterestsRouter(
         bank_account: state.bank_account,
         licenses_permits: state.licenses_permits,
         tax_compliance: state.tax_compliance,
+        filing_support: state.filing_support,
       },
       license_note: state.license_note,
     };

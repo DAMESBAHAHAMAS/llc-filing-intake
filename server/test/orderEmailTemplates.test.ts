@@ -102,7 +102,7 @@ describe("order confirmation", () => {
     );
     expect(text).toContain("- Duration: A card hold may last up to 7 days.");
     expect(text).toContain(
-      "- If Filing Takes Longer: If your filing is not complete within 7 days, the temporary hold automatically drops off. We will simply charge the same card once your LLC is officially filed."
+      "- If Filing Takes Longer: If your filing is not complete within 5 days, we release the hold, so nothing is charged, and email you a secure payment link for the same amount."
     );
     expect(text).toContain("To cancel, simply reply to this email.");
     expect(text).toContain("review our Payment Protection Promise (https://damianknowles.com/refund-policy).");
@@ -136,7 +136,9 @@ describe("order confirmation", () => {
       "hold"
     );
     expect(text).toContain("We charge your card only after your filing is complete. As soon as it is complete, we will email you and process the payment.");
-    expect(text).toContain("We will simply charge the same card once your filing is complete.");
+    expect(text).toContain("- If Filing Takes Longer: If your filing is not complete within 5 days, we release the hold, so nothing is charged, and email you a secure payment link for the same amount.");
+    // Owner's final hold rule (25 Nov 2026): a lapsed hold is never charged.
+    expect(text).not.toMatch(/charge the same card/);
     expect(text).not.toContain("Division of Corporations");
     expect(text).not.toContain("LLC is");
   });
@@ -218,5 +220,34 @@ describe("Article IV titles in the intake summary (website ST07)", () => {
     expect(ar.text).toContain("Authorized Representative");
     const ambr = buildOrderEmail("intake_summary", row(), "hold");
     expect(ambr.text).toContain("Member");
+  });
+});
+
+describe("Day-5 hold release (owner's final hold rule, 25 Nov 2026)", () => {
+  const LINK = "https://buy.stripe.com/test_abc123";
+
+  it("says nothing was charged and gives the one-time payment link for the same amount", () => {
+    const { subject, text, html } = buildOrderEmail("hold_released", row(), "released", { paymentLinkUrl: LINK });
+    expect(subject).toBe("Action needed: approve your payment for Sol Ventures LLC");
+    expect(text).toContain("We released the temporary hold of $249.00 on your card. Nothing was charged.");
+    expect(text).toContain(`Pay $249.00 securely (${LINK})`);
+    expect(text).toContain("your card is charged $249.00, the same amount as your original hold. The link works once.");
+    expect(text).toContain("Order number: 0f6c1d3e-1111-4a2b-9c3d-000000000001");
+    expect(text).toContain("reply to this email and we will close your order");
+    expect(text).toContain(DISCLAIMER);
+    expect(html).toContain(`<a href="${LINK}" style="color: #1a5fb4;">Pay $249.00 securely</a>`);
+    // No selling content: only the payment link and the published terms.
+    const body = `${text} ${html}`.split(LINK).join("").split("https://damianknowles.com/refund-policy").join("");
+    expect(body).not.toMatch(/https?:\/\/|% off|upgrade|special offer/i);
+  });
+
+  it("refuses to build without the link", () => {
+    expect(() => buildOrderEmail("hold_released", row(), "released")).toThrow(/payment link/);
+  });
+
+  it("a filing confirmation for a released hold says nothing was charged", () => {
+    const { text } = buildOrderEmail("filing_confirmation", row(), "released");
+    expect(text).toContain("Your card hold was released before it could be collected, so nothing has been charged.");
+    expect(text).not.toContain("We are now collecting payment");
   });
 });

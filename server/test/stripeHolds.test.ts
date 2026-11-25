@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   capturePaymentIntent,
-  chargeSavedCard,
+  createPaymentLink,
+  cancelPaymentIntent,
   createCheckoutSession,
   holdDetails,
   retrievePaymentIntent,
@@ -89,23 +90,35 @@ describe("collection calls", () => {
     expect((calls[0].init?.headers as Record<string, string>)["Idempotency-Key"]).toBe("capture-ord_1");
   });
 
-  it("charges the saved card off-session for the fallback", async () => {
+  it("cancels a Day-5 hold as abandoned, with an idempotency key", async () => {
     process.env.STRIPE_SECRET_KEY = "sk_test_fake";
     const calls = captureFetch();
-    await chargeSavedCard({
-      customerId: "cus_1",
-      paymentMethodId: "pm_1",
-      amountCents: 49900,
-      currency: "usd",
-      idempotencyKey: "fallback-ord_1",
+    await cancelPaymentIntent("pi_123", "day5-release-ord_1", "abandoned");
+    expect(calls[0].url).toBe("https://api.stripe.com/v1/payment_intents/pi_123/cancel");
+    expect(decodeURIComponent(calls[0].init?.body as string)).toBe("cancellation_reason=abandoned");
+    expect((calls[0].init?.headers as Record<string, string>)["Idempotency-Key"]).toBe("day5-release-ord_1");
+  });
+
+  it("creates a one-time Payment Link from the order's own Prices, carrying order_id on the PaymentIntent", async () => {
+    process.env.STRIPE_SECRET_KEY = "sk_test_fake";
+    const calls = captureFetch();
+    await createPaymentLink({
+      lineItems: [{ price: "price_a", quantity: 1 }, { price: "price_b", quantity: 2 }],
       metadata: { order_id: "ord_1" },
+      confirmationMessage: "Thanks",
+      idempotencyKey: "day5-paylink-ord_1",
     });
     const body = decodeURIComponent(calls[0].init?.body as string);
-    expect(calls[0].url).toBe("https://api.stripe.com/v1/payment_intents");
-    expect(body).toContain("amount=49900");
-    expect(body).toContain("off_session=true");
-    expect(body).toContain("confirm=true");
-    expect((calls[0].init?.headers as Record<string, string>)["Idempotency-Key"]).toBe("fallback-ord_1");
+    expect(calls[0].url).toBe("https://api.stripe.com/v1/payment_links");
+    expect(body).toContain("line_items[0][price]=price_a");
+    expect(body).toContain("line_items[1][quantity]=2");
+    expect(body).toContain("payment_intent_data[metadata][order_id]=ord_1");
+    expect(body).toContain("metadata[order_id]=ord_1");
+    expect(body).toContain("restrictions[completed_sessions][limit]=1");
+    expect(body).toContain("after_completion[type]=hosted_confirmation");
+    // A link is paid by the customer; nothing here confirms or charges a card.
+    expect(body).not.toMatch(/off_session|confirm=|customer=|payment_method=/);
+    expect((calls[0].init?.headers as Record<string, string>)["Idempotency-Key"]).toBe("day5-paylink-ord_1");
   });
 
   it("expands the latest charge when reading a hold", async () => {

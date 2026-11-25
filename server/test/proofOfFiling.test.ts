@@ -4,20 +4,25 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 
 /**
  * Operator collection route: money is collected only through proof of
- * filing, the hold is captured once, and an expired hold falls back to
- * the saved card. Database and Stripe are faked; the real round trip is
+ * filing, the hold is captured once, and an expired or released hold is
+ * NEVER charged (owner's final hold rule, 25 Nov 2026; adapted from open
+ * PR #15). Database and Stripe are faked; the real round trip is
  * the Stripe test-mode run recorded in DECISIONS.md.
  */
 const db = vi.hoisted(() => ({
   order: null as null | Record<string, unknown>,
   queries: [] as string[],
   failEmailQueue: false,
+  paymentLinkUrl: null as string | null,
+  params: [] as unknown[][],
 }));
 const alerts = vi.hoisted(() => ({ send: vi.fn(async () => ({ channel: "log", ok: true })) }));
 vi.mock("../src/ops/alerts.js", () => ({ sendOpsAlert: alerts.send }));
 vi.mock("../src/db/pool.js", () => {
-  const query = vi.fn(async (sql: string) => {
+  const query = vi.fn(async (sql: string, params: unknown[] = []) => {
     db.queries.push(sql);
+    db.params.push(params);
+    if (/SELECT payment_link_url FROM orders/.test(sql)) return { rows: [{ payment_link_url: db.paymentLinkUrl }], rowCount: 1 };
     if (db.failEmailQueue && /INSERT INTO crm_sync_queue/.test(sql)) throw new Error("queue unavailable");
     if (/^\s*UPDATE orders\s+SET proof_of_filing_ref/.test(sql) || /^\s*SELECT order_id, payment_status/.test(sql)) {
       return { rows: db.order ? [db.order] : [], rowCount: db.order ? 1 : 0 };
@@ -66,6 +71,8 @@ afterAll(async () => {
 beforeEach(() => {
   db.queries = [];
   db.failEmailQueue = false;
+  db.paymentLinkUrl = null;
+  db.params = [];
   alerts.send.mockClear();
   db.order = {
     order_id: "ord-1",
@@ -123,16 +130,16 @@ describe("POST /api/orders/:orderId/proof-of-filing", () => {
     expect(alerts.send).toHaveBeenCalledWith("Customer emails not queued", expect.stringContaining("ord-1"));
   });
 
-  it("charges the saved card when the hold has expired", async () => {
+  it("charges nothing and asks for fresh consent when the hold has expired", async () => {
     stripe.capture.mockRejectedValue(new StripeApiError("expired", 400, { code: "charge_expired_for_capture" }));
-    stripe.retrieve.mockResolvedValue({ id: "pi_hold", customer: "cus_1", payment_method: "pm_1" });
-    stripe.charge.mockResolvedValue({ id: "pi_fallback", status: "succeeded" });
     const r = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
-    expect(r.status).toBe(200);
-    expect(r.json.status).toBe("saved_card_charged");
-    expect(stripe.charge).toHaveBeenCalledWith(
-      expect.objectContaining({ customerId: "cus_1", paymentMethodId: "pm_1", amountCents: 49900, idempotencyKey: "fallback-ord-1" })
-    );
+    expect(r.status).toBe(409);
+    expect(r.json.status).toBe("fresh_consent_required");
+    expect(r.json.reason).toBe("hold_expired");
+    expect(stripe.charge).not.toHaveBeenCalled();
+    expect(stripe.retrieve).not.toHaveBeenCalled();
+    expect(db.queries.some((q) => /capture_error/.test(q))).toBe(true);
+    expect(alerts.send).toHaveBeenCalledWith("New payment approval needed", expect.stringContaining("Nothing was charged"));
   });
 
   it("does not fall back on an ordinary capture error", async () => {
@@ -143,13 +150,19 @@ describe("POST /api/orders/:orderId/proof-of-filing", () => {
     expect(db.queries.some((q) => /capture_error/.test(q))).toBe(true);
   });
 
-  it("goes straight to the saved card for an order whose hold was already released", async () => {
+  it("charges nothing for an order whose hold was already released, and points to the Day-5 payment link", async () => {
     db.order = { ...db.order, payment_status: "released" };
-    stripe.retrieve.mockResolvedValue({ id: "pi_hold", customer: "cus_1", payment_method: "pm_1" });
-    stripe.charge.mockResolvedValue({ id: "pi_fallback", status: "succeeded" });
+    db.paymentLinkUrl = "https://buy.stripe.com/test_link";
     const r = await post("/api/orders/ord-1/proof-of-filing", { document_number: "L26000123456" });
-    expect(r.json.status).toBe("saved_card_charged");
+    expect(r.status).toBe(409);
+    expect(r.json.status).toBe("fresh_consent_required");
+    expect(r.json.reason).toBe("hold_released");
+    expect(r.json.payment_link_url).toBe("https://buy.stripe.com/test_link");
     expect(stripe.capture).not.toHaveBeenCalled();
+    expect(stripe.charge).not.toHaveBeenCalled();
+    // The filing confirmation says nothing was charged (payment mode "released").
+    const queued = db.params.find((p) => typeof p[2] === "string" && p[2] === "customer_email_filing_confirmation");
+    expect(queued?.[3]).toBe(JSON.stringify({ payment_mode: "released" }));
   });
 
   it("does nothing for an order already paid or with nothing held", async () => {

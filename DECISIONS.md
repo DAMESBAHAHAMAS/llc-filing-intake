@@ -969,8 +969,9 @@ CRM Deal opens at SERVICE REQUESTED with Payment_Status "Hold Placed".
 Filing may start on a held order. Proof of filing (the Sunbiz document
 number of the filed Articles; the EIN for an EIN-only order) is recorded
 through `POST /api/orders/:orderId/proof-of-filing` (operator key), which
-captures the hold. If the hold has lapsed, the saved card is charged
-off-session for the same amount. The order is marked `paid` only by
+captures the hold. ~~If the hold has lapsed, the saved card is charged
+off-session for the same amount.~~ (Superseded 25 Nov 2026: a lapsed hold
+is never charged; see "Final card-hold rule" below.) The order is marked `paid` only by
 Stripe's `payment_intent.succeeded` webhook; the Deal then moves to Closed
 Won. A watch records each hold's expiry and flags holds within 48 hours of
 expiry that have no proof yet. `PAYMENT_CAPTURE_MODE=immediate` turns the
@@ -1288,3 +1289,11 @@ Agreements needing answers the interview does not collect (owners and percentage
   - The cover letter's payment line is neutral ("Your order total is …"); when a hold is captured follows the 25 Nov hold rule.
   - `markGenerated` uses the verified Deal.
   - Deal-write failures use their own column.
+
+## 2026-11-25 — Final card-hold rule, registered agent in Bank-Ready and Finance-Ready, live checkout (A6Y2-T144 final pre-launch round)
+**Owner decisions (Damian, 25 Nov 2026):**
+- **Holds.** Capture at Sunbiz submission. A lapsed or released hold is never charged off-session: the saved-card fallback in `POST /api/orders/:orderId/proof-of-filing` is removed (it answers 409 `fresh_consent_required` and alerts ops; adapted from open PR #15). At Day 5 (120 h after authorization) an uncaptured hold is released by `payments/holdRelease.ts`: PaymentIntent cancelled (`abandoned`), order `released`, Zoho Deal field update `Payment_Status` = "Hold Released" and `Hold_Expires` = the release time, and the customer is emailed a one-time Stripe Payment Link for the same amount, built from the order's own Stripe Prices and carrying `metadata.order_id` on its PaymentIntent, so the existing `payment_intent.succeeded` handler marks the order paid. Paying the link charges the card at once (it is not a new hold).
+- **Safe rollout.** `HOLD_RELEASE_START` (default `2026-11-25`, midnight Florida time): only holds authorized on or after it are released; older holds raise one ops alert listing them. `HOLD_RELEASE_ENABLED=off` stops the job. A held order with proof of filing is never released; it raises one ops alert. Columns: migration 0038.
+- **Registered agent.** Bank-Ready ($499, FASTTRACK v3, migration 0037) and Finance-Ready ($997, PREMIUM v3, 0032) include 3 years of registered agent service at the same prices and the same Stripe Prices. A house-agent checkout is covered by FASTTRACK, PREMIUM (including the $139 kickoff) or the $98 `REGISTERED_AGENT_3YR` line (File It), or by an earlier held or paid order with any of them. The $98 line is refused on top of a package that includes it (`offers/houseAgentRule.ts`).
+- **Live checkout.** The server has no test-only gate on `POST /api/checkout/create`; the `?checkout=test` gate is on the website. Unchanged: full-price PREMIUM stays closed (`closedOffers.ts`); Finance-Ready is sold as the $139 kickoff.
+- **ST17 hub.** A fourth post-filing topic, `filing_support` (migration 0039). It is copied to the Zoho multi-select only once Damian adds the picklist value and sets `POST_FILING_SUPPORT_ZOHO_VALUE`.

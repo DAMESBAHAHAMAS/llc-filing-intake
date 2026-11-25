@@ -392,17 +392,18 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
   }
 });
 
-type TxClient = { query: (text: string, params?: unknown[]) => Promise<{ rows: any[]; rowCount: number | null }> };
+export type TxClient = { query: (text: string, params?: unknown[]) => Promise<{ rows: any[]; rowCount: number | null }> };
 
 /**
  * PaymentIntent / Charge lifecycle for card holds:
- *  - payment_intent.succeeded: the hold was collected (or the saved-card
- *    fallback charged) → order paid; Deal moves to Closed Won.
+ *  - payment_intent.succeeded: the hold was collected, or (for an order the
+ *    Day-5 job released) the customer paid the emailed Payment Link, whose
+ *    PaymentIntent carries metadata.order_id → order paid; Deal moves to Closed Won.
  *  - payment_intent.canceled: the hold was released or expired before
  *    collection → order released; filing that has not started is stopped.
  *  - charge.refunded (full refund) → order refunded.
  * The order is found by metadata.order_id (set at checkout and on the
- * fallback charge) or by the stored PaymentIntent id.
+ * Day-5 Payment Link) or by the stored PaymentIntent id.
  */
 export async function handlePaymentLifecycleEvent(
   client: TxClient,
@@ -494,10 +495,11 @@ export async function handlePaymentLifecycleEvent(
  * updated directly; a Deal id that came from intake metadata keeps the
  * email-ownership check in zoho/client.ts.
  */
-async function enqueueDealUpdate(
+export async function enqueueDealUpdate(
   client: TxClient,
   order: { order_id: string; filing_session_id: string; crm_deal_id: string | null },
-  update: { target_stage: string; extra_fields: Record<string, unknown> }
+  /** target_stage omitted: a field-only update that leaves the Deal's Stage alone. */
+  update: { target_stage?: string; extra_fields: Record<string, unknown> }
 ): Promise<boolean> {
   if (!order.crm_deal_id) return false;
   const own = await client.query(
