@@ -43,6 +43,15 @@ describe("stampEsignature (T144 D9)", () => {
     expect(stampEsignature({ a: 1, esignature: "x" }, stamp)).toEqual({ a: 1 });
   });
 
+  it("omits over_18_confirmed when the website does not send it (7B)", () => {
+    const { over_18_confirmed: _drop, ...without } = signed;
+    const out = stampEsignature({ esignature: without }, stamp) as { esignature: Record<string, unknown> };
+    expect(out.esignature).not.toHaveProperty("over_18_confirmed");
+    expect(out.esignature.consent_version).toBe("esign-2026-11-25");
+    const legacy = stampEsignature({ esignature: { ...signed, over_18_confirmed: "yes" } }, stamp) as { esignature: Record<string, unknown> };
+    expect(legacy.esignature).not.toHaveProperty("over_18_confirmed");
+  });
+
   it("leaves filing_data without a record untouched", () => {
     const fd = { llc_name: "X LLC" };
     expect(stampEsignature(fd, stamp)).toBe(fd);
