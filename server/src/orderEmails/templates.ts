@@ -75,7 +75,7 @@ export interface RenderedEmail {
 
 const SSN_OR_ITIN = /\b\d{3}-\d{2}-\d{4}\b|\b\d{3} \d{2} \d{4}\b|\b\d{9}\b/g;
 const CARD_NUMBER = /\b\d(?:[ -]?\d){12,18}\b/g;
-const ARTICLE_IV_TITLES: Record<string, string> = { AMBR: "Member", MGR: "Manager" };
+const ARTICLE_IV_TITLES: Record<string, string> = { AMBR: "Member", MGR: "Manager", AR: "Authorized Representative" };
 
 /** Customer-typed text is echoed back, so a tax ID or card number typed
  *  into a free-text box must not travel by email. */
