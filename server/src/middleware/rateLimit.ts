@@ -122,6 +122,9 @@ export function funnelRateLimiters() {
     filingPdf: createRateLimiter({ name: "filing-pdf", windowMs: 10 * MINUTE, max: envInt("RATE_LIMIT_FILING_PDF_PER_10MIN", 10) }),
     // Scorecard sign-up: stores a lead and queues five emails.
     scorecardSignup: createRateLimiter({ name: "scorecard-signup", windowMs: 10 * MINUTE, max: envInt("RATE_LIMIT_SCORECARD_PER_10MIN", 10) }),
+    // Post-filing roadmap toggles on the Thank You page (Dispatch 13): a few clicks per
+    // customer; each change queues one Zoho Deal update.
+    postFilingInterests: createRateLimiter({ name: "post-filing-interests", windowMs: 10 * MINUTE, max: envInt("RATE_LIMIT_POST_FILING_PER_10MIN", 30) }),
     // Cheap reads.
     reads: createRateLimiter({ name: "reads", windowMs: MINUTE, max: envInt("RATE_LIMIT_READS_PER_MIN", 120) }),
   };

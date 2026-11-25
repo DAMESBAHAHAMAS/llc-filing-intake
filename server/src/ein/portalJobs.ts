@@ -62,7 +62,7 @@ const SWEEP_BATCH = 500;
  * Contact was verified against the customer's email (deal_stage_update). A plain join:
  * an order with two such jobs appears twice, which both callers tolerate.
  */
-const VERIFIED_DEAL_JOIN = `JOIN crm_sync_queue q
+export const VERIFIED_DEAL_JOIN = `JOIN crm_sync_queue q
     ON q.order_id = o.order_id AND q.status = 'synced'
    AND (q.sync_type = 'order_deal'
         OR (q.sync_type = 'deal_stage_update' AND q.payload_snapshot->>'crm_deal_id' = o.crm_deal_id))`;
