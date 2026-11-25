@@ -16,7 +16,7 @@ import {
   tokenRef,
   type StoredAcceptance,
 } from "../src/registeredAgent/acceptanceRecord.js";
-import { recordAcceptance } from "../src/registeredAgent/acceptTransaction.js";
+import { recordAcceptance, recordDecline } from "../src/registeredAgent/acceptTransaction.js";
 import { buildAcceptanceStatementContext, floridaDateTime, registeredAgentSignatureForArticles } from "../src/registeredAgent/acceptanceStatement.js";
 import { buildPdfContext } from "../src/pdf/context.js";
 import { realZohoClient, resetZohoTokenCache } from "../src/zoho/client.js";
@@ -38,7 +38,7 @@ const fd = {
 };
 
 /** pg-mem with the columns the migrations leave (0005 + 0033), as in the other pg-mem tests. */
-async function db(withSignatureColumns = true) {
+async function db(withSignatureColumns = true, withRequestSnapshot = false) {
   const { Pool } = newDb().adapters.createPg();
   const pool = new Pool();
   await pool.query(`
@@ -49,6 +49,7 @@ async function db(withSignatureColumns = true) {
       accepted_ip text, acceptance_token_id text NOT NULL, acceptance_version text NOT NULL
       ${withSignatureColumns ? `, signature_name text, signature_consent boolean, accepted_user_agent text, statement_version text,
         accepted_agent_name text, accepted_agent_address text, accepted_llc_name text` : ""}
+      ${withRequestSnapshot ? `, requested_agent_address text, requested_llc_name text` : ""}
     );
     CREATE TABLE orders (order_id uuid PRIMARY KEY, filing_session_id uuid NOT NULL, payment_status text NOT NULL,
       paid_at timestamptz, authorized_at timestamptz, crm_deal_id text);
@@ -203,5 +204,40 @@ describe("field-only Deal update leaves Stage alone", () => {
     const r = await realZohoClient.updateDealStage({ crm_deal_id: "deal-9", expected_email: "", server_created: true, extra_fields: { Registered_Agent_Status: RA_STATUS_ACCEPTED } });
     expect(r.ok).toBe(true);
     expect(JSON.parse(bodies[0])).toEqual({ data: [{ Registered_Agent_Status: RA_STATUS_ACCEPTED }] });
+  });
+});
+
+describe("re-review follow-ups (T144 D12)", () => {
+  const base = { acceptanceId: 1, filingSessionId: S1, ip: null, userAgent: null, acceptedAt: at, requireSignature: false };
+
+  it("records the address and LLC the email named, not filing_data changed after it was sent", async () => {
+    const pool = await db(true, true);
+    await pool.query(`UPDATE registered_agent_acceptances SET requested_agent_address = '1 SE 3rd Ave, Suite 1500, Miami, FL 33131', requested_llc_name = 'TEST DISPATCH TWELVE LLC' WHERE id = 1`);
+    await pool.query(`UPDATE filing_sessions SET filing_data = $2 WHERE filing_session_id = $1`,
+      [S1, JSON.stringify({ ...fd, llc_name: "Changed LLC", registered_agent_florida_address: "9 Other St, Tampa, FL 33602" })]);
+    expect(await recordAcceptance(pool, { ...base, signatureName: "Riley Test Agent" })).toEqual({ kind: "accepted", signed: true });
+    expect(await loadStoredAcceptance(pool, S1)).toMatchObject({
+      accepted_agent_address: "1 SE 3rd Ave, Suite 1500, Miami, FL 33131", accepted_llc_name: "TEST DISPATCH TWELVE LLC" });
+  });
+
+  it("cannot turn a committed acceptance into a decline", async () => {
+    const pool = await db();
+    await recordAcceptance(pool, { ...base, signatureName: null });
+    expect(await recordDecline(pool, { acceptanceId: 1, filingSessionId: S1 })).toEqual({ kind: "not_actionable", status: "accepted" });
+    expect((await pool.query(`SELECT registered_agent_status FROM filing_sessions WHERE filing_session_id = $1`, [S1])).rows[0].registered_agent_status).toBe("accepted");
+  });
+
+  it("declines an open request", async () => {
+    const pool = await db();
+    expect(await recordDecline(pool, { acceptanceId: 1, filingSessionId: S1 })).toEqual({ kind: "declined" });
+    expect((await pool.query(`SELECT status FROM registered_agent_acceptances WHERE id = 1`)).rows[0].status).toBe("declined");
+  });
+
+  it("queues the agent-status job with the verified order", async () => {
+    const pool = await db();
+    await pool.query(`INSERT INTO orders VALUES ($1, $2, 'authorized', NULL, '2026-11-25T10:00:00Z', 'verified-deal')`, [O1, S1]);
+    await pool.query(`INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot, status) VALUES ($1, $2, 'order_deal', '{}', 'synced')`, [S1, O1]);
+    await queueRaDealStatus(pool, S1, {});
+    expect((await pool.query(`SELECT order_id FROM crm_sync_queue WHERE sync_type = $1`, [RA_DEAL_SYNC_TYPE])).rows[0].order_id).toBe(O1);
   });
 });

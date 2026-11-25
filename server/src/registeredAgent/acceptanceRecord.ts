@@ -180,9 +180,9 @@ export function raDealSyncEnabled(env: NodeJS.ProcessEnv = process.env): boolean
 }
 
 /** The Deal of the session's earliest held or paid order whose Deal id a sync job verified (#26's rule). */
-async function verifiedDealId(db: Pool | PoolClient, filingSessionId: string): Promise<string | null> {
-  const { rows } = await db.query<{ crm_deal_id: string }>(
-    `SELECT o.crm_deal_id
+async function verifiedDeal(db: Pool | PoolClient, filingSessionId: string): Promise<{ crm_deal_id: string; order_id: string } | null> {
+  const { rows } = await db.query<{ crm_deal_id: string; order_id: string }>(
+    `SELECT o.crm_deal_id, o.order_id
      FROM orders o
      ${VERIFIED_DEAL_JOIN}
      WHERE o.filing_session_id = $1
@@ -192,7 +192,11 @@ async function verifiedDealId(db: Pool | PoolClient, filingSessionId: string): P
      LIMIT 1`,
     [filingSessionId]
   );
-  return rows[0]?.crm_deal_id ?? null;
+  return rows[0] ?? null;
+}
+
+async function verifiedDealId(db: Pool | PoolClient, filingSessionId: string): Promise<string | null> {
+  return (await verifiedDeal(db, filingSessionId))?.crm_deal_id ?? null;
 }
 
 /**
@@ -209,7 +213,8 @@ export async function queueRaDealStatus(
   env: NodeJS.ProcessEnv = process.env
 ): Promise<{ queued: boolean; reason?: string }> {
   if (!raDealSyncEnabled(env)) return { queued: false, reason: "RA Deal status switched off (RA_DEAL_STATUS_FIELD=off)" };
-  if (!(await verifiedDealId(db, filingSessionId))) return { queued: false, reason: "no verified Deal (held or paid order) yet" };
+  const deal = await verifiedDeal(db, filingSessionId);
+  if (!deal) return { queued: false, reason: "no verified Deal (held or paid order) yet" };
   const pending = await db.query(
     `SELECT 1 FROM crm_sync_queue WHERE filing_session_id = $1 AND sync_type = $2 AND status = 'pending' LIMIT 1`,
     [filingSessionId, RA_DEAL_SYNC_TYPE]
@@ -223,8 +228,8 @@ export async function queueRaDealStatus(
     return { queued: true, reason: "pending job brought forward" };
   }
   await db.query(
-    `INSERT INTO crm_sync_queue (filing_session_id, sync_type, payload_snapshot) VALUES ($1, $2, $3)`,
-    [filingSessionId, RA_DEAL_SYNC_TYPE, JSON.stringify({ queued_at: new Date().toISOString() })]
+    `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot) VALUES ($1, $2, $3, $4)`,
+    [filingSessionId, deal.order_id, RA_DEAL_SYNC_TYPE, JSON.stringify({ queued_at: new Date().toISOString() })]
   );
   return { queued: true };
 }

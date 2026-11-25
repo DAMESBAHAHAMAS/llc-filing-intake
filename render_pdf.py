@@ -190,12 +190,29 @@ def generate_ss4():
     acroform = writer._root_object["/AcroForm"]
     if "/XFA" in acroform:
         del acroform["/XFA"]
+    # The IRS file carries a Reader-extensions usage-rights signature (/Perms /UR3).
+    # Any change invalidates it and Reader then warns that the document was altered
+    # and disables features. The filled copy is ours, so drop the stale signature.
+    if "/Perms" in writer._root_object:
+        del writer._root_object["/Perms"]
 
     # A smaller font for a field whose text would not fit (line 9a's write-in).
     for field, size in font_sizes.items():
         widget = widgets[field][0]
-        da = str(widget.get("/DA", ""))
-        widget[NameObject("/DA")] = TextStringObject(re.sub(r"[0-9.]+ Tf", f"{float(size):.2f} Tf", da, count=1))
+        # The widget's own /DA, else its field's (parent), else the form default.
+        da = ""
+        node = widget
+        while node is not None and not da:
+            da = str(node.get("/DA", "") or "")
+            parent = node.get("/Parent")
+            node = parent.get_object() if parent is not None else None
+        da = da or str(acroform.get("/DA", "") or "")
+        new_size = f"{float(size):.2f} Tf"
+        if re.search(r"[0-9.]+ Tf", da):
+            da = re.sub(r"[0-9.]+ Tf", new_size, da, count=1)
+        else:
+            da = f"/Helv {new_size} 0 g"
+        widget[NameObject("/DA")] = TextStringObject(da)
 
     writer.update_page_form_field_values(
         writer.pages[0], {SS4_PREFIX + k: v for k, v in text.items()}, auto_regenerate=False

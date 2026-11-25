@@ -99,6 +99,7 @@ async function syncWithOneFreeAuthRetry(client: ZohoClient, job: ClaimedJob): Pr
 async function recordOutcome(pool: Pool, job: ClaimedJob, result: ZohoSyncResult): Promise<void> {
   const client = await pool.connect();
   let deadLettered = false;
+  const touchesSession = job.sync_type !== RA_DEAL_SYNC_TYPE;
   try {
     await client.query("BEGIN");
 
@@ -109,7 +110,7 @@ async function recordOutcome(pool: Pool, job: ClaimedJob, result: ZohoSyncResult
          WHERE id = $1`,
         [job.id]
       );
-      if (job.order_id && result.dealId) {
+      if (job.order_id && result.dealId && job.sync_type !== RA_DEAL_SYNC_TYPE) {
         // Order-scoped job (paid_deal): the Deal belongs to the order,
         // not the session — orders.crm_deal_id is the one place a Deal
         // ID for THIS order is recorded, satisfying "exactly one Deal
@@ -118,7 +119,9 @@ async function recordOutcome(pool: Pool, job: ClaimedJob, result: ZohoSyncResult
         // different, session-level purpose).
         await client.query(`UPDATE orders SET crm_deal_id = $2 WHERE order_id = $1`, [job.order_id, result.dealId]);
       }
-      await client.query(
+      // T144 D12: the agent-status job writes a Deal field only; it must not touch
+      // the session's Lead/Deal ids or its CRM sync status.
+      if (touchesSession) await client.query(
         `UPDATE filing_sessions
          SET crm_lead_id = COALESCE($2, crm_lead_id),
              crm_deal_id = COALESCE($3, crm_deal_id),
@@ -144,7 +147,7 @@ async function recordOutcome(pool: Pool, job: ClaimedJob, result: ZohoSyncResult
            WHERE id = $1`,
           [job.id, newAttempts, result.error ?? "unknown error"]
         );
-        await client.query(
+        if (touchesSession) await client.query(
           `UPDATE filing_sessions SET crm_sync_status = 'dead_letter' WHERE filing_session_id = $1`,
           [job.filing_session_id]
         );
@@ -157,7 +160,7 @@ async function recordOutcome(pool: Pool, job: ClaimedJob, result: ZohoSyncResult
            WHERE id = $1`,
           [job.id, newAttempts, String(waitMs), result.error ?? "unknown error"]
         );
-        await client.query(
+        if (touchesSession) await client.query(
           `UPDATE filing_sessions SET crm_sync_status = 'failed' WHERE filing_session_id = $1`,
           [job.filing_session_id]
         );
@@ -189,7 +192,14 @@ export async function processOne(pool: Pool, zohoClient: ZohoClient, lockedBy: s
   // verified Deal (VERIFIED_DEAL_JOIN) and its CURRENT registered_agent_status,
   // so a retried or older job can never put "Awaiting" back over "Accepted".
   if (job.sync_type === RA_DEAL_SYNC_TYPE) {
-    const built = await raDealPayloadNow(pool, job.filing_session_id);
+    let built: Awaited<ReturnType<typeof raDealPayloadNow>>;
+    try {
+      built = await raDealPayloadNow(pool, job.filing_session_id);
+    } catch (err) {
+      // A database error: an ordinary failed attempt (retried with backoff), never stuck in 'processing'.
+      await recordOutcome(pool, job, { ok: false, error: `building the agent-status update failed: ${err instanceof Error ? err.message : String(err)}` });
+      return true;
+    }
     if (!built.ok) {
       await recordOutcome(pool, job, { ok: false, permanent: true, error: built.reason });
       return true;

@@ -44,10 +44,13 @@ export async function recordAcceptance(
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const { rows } = await client.query<{ status: string; registered_agent_name: string }>(
-      `SELECT status, registered_agent_name FROM registered_agent_acceptances WHERE id = $1 FOR UPDATE`,
-      [input.acceptanceId]
-    );
+    // SELECT *: the request snapshot columns (0035) may not exist yet.
+    const { rows } = await client.query<{
+      status: string;
+      registered_agent_name: string;
+      requested_agent_address?: string | null;
+      requested_llc_name?: string | null;
+    }>(`SELECT * FROM registered_agent_acceptances WHERE id = $1 FOR UPDATE`, [input.acceptanceId]);
     const row = rows[0];
     if (!row || row.status !== "acceptance_requested") {
       await client.query("ROLLBACK");
@@ -65,14 +68,20 @@ export async function recordAcceptance(
     );
 
     if (canStore) {
-      // What the agent saw on the page and accepted: the address and LLC as they
-      // stand now. The Articles print the signature only while these still match.
+      // What the agent accepted: the address and LLC the email named, stored on the
+      // request row when it was sent (0035). Requests sent before 0035 fall back to
+      // filing_data. The Articles print the signature only while these still match.
       const fd = await client.query<{ filing_data: Record<string, unknown> | null }>(
         `SELECT filing_data FROM filing_sessions WHERE filing_session_id = $1`,
         [input.filingSessionId]
       );
       const data = fd.rows[0]?.filing_data ?? {};
-      const str = (k: string) => (typeof data[k] === "string" ? (data[k] as string).trim() : "");
+      const fromFd = (k: string) => (typeof data[k] === "string" ? (data[k] as string).trim() : "");
+      const requested: Record<string, string> = {
+        registered_agent_florida_address: (row.requested_agent_address ?? "").trim(),
+        llc_name: (row.requested_llc_name ?? "").trim(),
+      };
+      const str = (k: string) => requested[k] || fromFd(k);
       await client.query(
         `UPDATE registered_agent_acceptances
          SET signature_name = $2, signature_consent = $3, accepted_user_agent = $4, statement_version = $5,
@@ -98,6 +107,40 @@ export async function recordAcceptance(
     ]);
     await client.query("COMMIT");
     return { kind: "accepted", signed: canStore && input.signatureName !== null };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Decline with the same row lock and status guard as accept, so a committed
+ * acceptance can never be turned into "declined" by a concurrent click.
+ */
+export async function recordDecline(
+  pool: Pool,
+  input: { acceptanceId: number; filingSessionId: string }
+): Promise<{ kind: "declined" } | { kind: "not_actionable"; status: string }> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query<{ status: string }>(
+      `SELECT status FROM registered_agent_acceptances WHERE id = $1 FOR UPDATE`,
+      [input.acceptanceId]
+    );
+    const status = rows[0]?.status;
+    if (status !== "acceptance_requested") {
+      await client.query("ROLLBACK");
+      return { kind: "not_actionable", status: status ?? "missing" };
+    }
+    await client.query(`UPDATE registered_agent_acceptances SET status = 'declined' WHERE id = $1`, [input.acceptanceId]);
+    await client.query(`UPDATE filing_sessions SET registered_agent_status = 'declined' WHERE filing_session_id = $1`, [
+      input.filingSessionId,
+    ]);
+    await client.query("COMMIT");
+    return { kind: "declined" };
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     throw err;
