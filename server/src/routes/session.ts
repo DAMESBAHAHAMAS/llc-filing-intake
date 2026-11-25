@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { Router } from "express";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
+import { stampEsignature } from "../filing/esignature.js";
+import { clientKey } from "../middleware/rateLimit.js";
 
 export const sessionRouter = Router();
 
@@ -97,6 +99,15 @@ sessionRouter.post("/api/session/stage", async (req, res) => {
 
   const requestedId = typeof body.filing_session_id === "string" ? body.filing_session_id : null;
   const patch = extractPatch(body);
+  if (patch.filing_data !== undefined) {
+    // T144 D9: server receipt time, IP and user agent on the e-signature record.
+    patch.filing_data = stampEsignature(patch.filing_data, {
+      now: new Date(),
+      // Render's proxies hide the client; clientKey reads True-Client-IP.
+      ip: ((ip) => (ip === "unknown" ? null : ip))(clientKey(req)),
+      userAgent: req.get("user-agent"),
+    });
+  }
 
   const client = await pool.connect();
   try {

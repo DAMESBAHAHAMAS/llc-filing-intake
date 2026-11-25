@@ -41,6 +41,24 @@ export interface FilingSessionRecord {
   annual_report_due_date?: string; // required if Future/Backdated
 
   other_provisions?: string;
+
+  /** T144 D9: e-signature audit record (src/filing/esignature.ts). Optional: older sessions have none. */
+  esignature?: ESignatureRecord;
+}
+
+export interface ESignatureRecord {
+  signer_name: string;
+  signer_title?: string;
+  over_18_confirmed?: boolean;
+  consent_text?: string;
+  consent_version?: string;
+  method?: string;
+  /** When the signed interview was submitted, by the browser's clock. */
+  signed_at: string;
+  /** Stamped by POST /api/session/stage: the authoritative signing time. */
+  server_received_at?: string;
+  ip?: string | null;
+  user_agent?: string;
 }
 
 /**
