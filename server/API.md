@@ -221,6 +221,34 @@ price) — checkout rejects it regardless of capacity.
 
 ---
 
+## Post-filing roadmap (Thank You page, A6Y2-T144 Dispatch 13)
+
+The three "Prepare your next steps" toggles on `/checkout/success`. Both calls need the
+filing session **and** one of its held or paid orders (the pair in the Stripe success
+URL); anything else is `404 { "error": "not_found" }`. `400 invalid_request` for a bad
+body, `503 not_open` when `POST_FILING_INTERESTS_ENABLED=false`, `429` past
+`RATE_LIMIT_POST_FILING_PER_10MIN` (default 30 per IP). The website shows the toggles
+only after a `200` from the GET.
+
+### `GET /api/post-filing-interests?filing_session_id=…&order_id=…`
+→ `{ "status": "open", "interests": { "bank_account": false, "licenses_permits": true, "tax_compliance": false }, "license_note": "Food truck, Miami" | null }`
+
+### `POST /api/post-filing-interests`
+`{ "filing_session_id", "order_id", "interest": "bank_account" | "licenses_permits" | "tax_compliance", "selected": true | false, "note"?: string }`
+→ `{ "status": "saved", "interests": {…}, "license_note": … }`. `note` is kept only for
+`licenses_permits` (control characters removed, at most 500 characters).
+
+Saved in `post_filing_interests` (migration 0032; until it is applied both calls answer
+`503 not_open`). A background job (every 60 s, `POST_FILING_SYNC_INTERVAL_MS`) writes the
+customer's current choices to the Deal in one v8 update: the multi-select
+`Post_Filing_Interests` (id 2654294000040656012; "Bank Account Setup", "Licenses and
+Permits", "Tax and Compliance") and the long text `Post_Filing_License_Note`
+(id 2654294000040639002; emptied when the licence check is off). Override the names with
+`POST_FILING_INTERESTS_FIELD` / `POST_FILING_NOTE_FIELD`. The Deal is never taken from the
+request: it is the Deal of the session's earliest held or paid order whose Deal id passed
+a sync job (the EIN portal's `VERIFIED_DEAL_JOIN`). Retries for about 3 days, then an ops
+alert (one per cause per 6 hours).
+
 ## Registered agent (Path B — customer's own RA)
 
 Path A (house RA) needs **none of these endpoints** — the server always

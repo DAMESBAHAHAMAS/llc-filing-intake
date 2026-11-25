@@ -46,7 +46,7 @@ export interface EinPortalClient {
 
 const V8 = "https://www.zohoapis.com/crm/v8";
 
-async function detail(res: Response): Promise<string> {
+export async function detail(res: Response): Promise<string> {
   const text = await res.text().catch(() => "");
   try {
     const j = JSON.parse(text) as { code?: unknown; message?: unknown; data?: Array<{ code?: unknown; message?: unknown }> };
@@ -57,7 +57,7 @@ async function detail(res: Response): Promise<string> {
 }
 
 /** Zoho answers 200/201 with a per-record status; a record-level error must not pass as success. */
-function recordOk(json: unknown): { ok: true } | { ok: false; error: string } {
+export function recordOk(json: unknown): { ok: true } | { ok: false; error: string } {
   const rec = (json as { data?: Array<{ status?: unknown; code?: unknown; message?: unknown }> })?.data?.[0];
   if (!rec || rec.status !== "success") {
     return { ok: false, error: `${String(rec?.code ?? "no record status")} ${String(rec?.message ?? "")}`.trim().slice(0, 300) };
@@ -67,7 +67,7 @@ function recordOk(json: unknown): { ok: true } | { ok: false; error: string } {
 
 /** Every Zoho call gives up after 20 seconds, well inside the invite job's one-hour claim. */
 const TIMEOUT_MS = 20_000;
-function timeout(): { signal: AbortSignal } {
+export function timeout(): { signal: AbortSignal } {
   return { signal: AbortSignal.timeout(TIMEOUT_MS) };
 }
 
@@ -77,7 +77,7 @@ function timeout(): { signal: AbortSignal } {
  * missing scope (e.g. clientportal on the invite) is not cured by a new token, and
  * refreshing for it would burn the shared refresh allowance.
  */
-async function zfetch(url: string, init: RequestInit): Promise<Response> {
+export async function zfetch(url: string, init: RequestInit): Promise<Response> {
   const res = await fetch(url, init);
   if (res.status === 401) {
     const code = await res
@@ -95,7 +95,7 @@ async function zfetch(url: string, init: RequestInit): Promise<Response> {
   return res;
 }
 
-async function auth(): Promise<Record<string, string>> {
+export async function auth(): Promise<Record<string, string>> {
   return { Authorization: `Zoho-oauthtoken ${await getZohoAccessToken()}` };
 }
 
