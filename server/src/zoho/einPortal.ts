@@ -19,7 +19,7 @@ import { getZohoAccessToken, invalidateZohoAccessToken } from "./client.js";
 
 export type ZohoCallResult<T = undefined> =
   | ({ ok: true } & (T extends undefined ? object : { value: T }))
-  | { ok: false; error: string; permanent?: boolean };
+  | { ok: false; error: string; permanent?: boolean; code?: string };
 
 export interface DealSnapshot {
   stage: string | null;
@@ -71,10 +71,27 @@ function timeout(): { signal: AbortSignal } {
   return { signal: AbortSignal.timeout(TIMEOUT_MS) };
 }
 
-/** fetch for Zoho API calls: a 401 drops the shared cached access token (client.ts). */
+/**
+ * fetch for Zoho API calls. A 401 drops the shared cached access token (client.ts),
+ * only if it is the token this request used, and never for OAUTH_SCOPE_MISMATCH: a
+ * missing scope (e.g. clientportal on the invite) is not cured by a new token, and
+ * refreshing for it would burn the shared refresh allowance.
+ */
 async function zfetch(url: string, init: RequestInit): Promise<Response> {
   const res = await fetch(url, init);
-  if (res.status === 401) invalidateZohoAccessToken();
+  if (res.status === 401) {
+    const code = await res
+      .clone()
+      .json()
+      .then((j: unknown) => {
+        const c = (j as { code?: unknown } | null)?.code;
+        return typeof c === "string" ? c : "";
+      })
+      .catch(() => "");
+    const auth = (init.headers as Record<string, string> | undefined)?.Authorization ?? "";
+    const token = auth.replace(/^Zoho-oauthtoken\s+/, "");
+    if (code !== "OAUTH_SCOPE_MISMATCH" && token) invalidateZohoAccessToken(token);
+  }
   return res;
 }
 
@@ -82,7 +99,7 @@ async function auth(): Promise<Record<string, string>> {
   return { Authorization: `Zoho-oauthtoken ${await getZohoAccessToken()}` };
 }
 
-export type InviteOutcome = { invited: true } | { invited: false; error: string; permanent: boolean };
+export type InviteOutcome = { invited: true } | { invited: false; error: string; permanent: boolean; code: string };
 
 /** portal_invite codes a person must resolve (retrying cannot help). */
 const PERMANENT_INVITE_CODES = new Set([
@@ -90,7 +107,8 @@ const PERMANENT_INVITE_CODES = new Set([
   "INVALID_DATA", // bad user type, record or language, or not a client/customer
   "REQUIRED_PARAM_MISSING",
   "LICENSE_LIMIT_EXCEEDED",
-  "NO_PERMISSION", // OAuth scope or profile lacks portal permission
+  "NO_PERMISSION", // the user's profile lacks portal permission
+  "OAUTH_SCOPE_MISMATCH", // the refresh token lacks ZohoCRM.settings.clientportal.CREATE
 ]);
 
 /**
@@ -118,7 +136,7 @@ export function inviteOutcome(httpStatus: number, body: string): InviteOutcome {
   if (httpStatus >= 200 && httpStatus < 300 && (rec.status === "success" || rec.status === undefined)) return { invited: true };
   if (code === "SUCCESS") return { invited: true };
   if (code === "DUPLICATE_DATA") return { invited: true };
-  return { invited: false, error: text, permanent: PERMANENT_INVITE_CODES.has(code) };
+  return { invited: false, error: text, permanent: PERMANENT_INVITE_CODES.has(code), code };
 }
 
 function fail(err: unknown): { ok: false; error: string } {
@@ -164,7 +182,12 @@ export const realEinPortalClient: EinPortalClient = {
       const text = await res.text().catch(() => "");
       const outcome = inviteOutcome(res.status, text);
       if (outcome.invited) return { ok: true, value: { contactId } };
-      return { ok: false, permanent: outcome.permanent, error: `Zoho portal invite failed: ${res.status} ${outcome.error.slice(0, 300)}` };
+      return {
+        ok: false,
+        permanent: outcome.permanent,
+        code: outcome.code,
+        error: `Zoho portal invite failed: ${res.status} ${outcome.error.slice(0, 300)}`,
+      };
     } catch (err) {
       return fail(err);
     }

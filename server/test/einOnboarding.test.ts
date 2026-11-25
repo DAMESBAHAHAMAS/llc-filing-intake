@@ -31,6 +31,7 @@ import {
 import { createEinOnboardingRouter } from "../src/routes/einOnboarding.js";
 import { buildOrderEmail, type OrderEmailRow } from "../src/orderEmails/templates.js";
 import { inviteOutcome, realEinPortalClient, type DealSnapshot, type EinPortalClient } from "../src/zoho/einPortal.js";
+import { resetZohoTokenCache } from "../src/zoho/client.js";
 
 /**
  * ST17 EIN onboarding through the Zoho CRM Portal: config rules, the portal-link
@@ -516,6 +517,26 @@ describe("portal invites", () => {
     expect(t.alerts).toHaveLength(1);
   });
 
+  it("treats CANNOT_PROCESS on a retry as invited (the timed-out first attempt reached Zoho)", async () => {
+    const t = setup([order()]);
+    t.zoho.inviteResult = { ok: false, error: "Zoho portal invite failed: timeout" };
+    await runEinPortalInvitesOnce(t.deps);
+    t.zoho.inviteResult = { ok: false, permanent: true, code: "CANNOT_PROCESS", error: "Zoho portal invite failed: 400 CANNOT_PROCESS already invited" };
+    t.setNow(new Date(NOW.getTime() + 2 * 3600_000));
+    expect((await runEinPortalInvitesOnce(t.deps)).invited).toEqual(["deal-1"]);
+    expect(t.deals.get("deal-1")?.invite_status).toBe("invited");
+    expect(t.alerts).toEqual([]);
+  });
+
+  it("on a first attempt, CANNOT_PROCESS or a missing OAuth scope asks a person, saying which", async () => {
+    for (const [code, hint] of [["CANNOT_PROCESS", "already invited or under a GDPR process"], ["OAUTH_SCOPE_MISMATCH", "clientportal scope"]]) {
+      const t = setup([order()]);
+      t.zoho.inviteResult = { ok: false, permanent: true, code, error: `Zoho portal invite failed: ${code}` };
+      expect((await runEinPortalInvitesOnce(t.deps)).blocked).toEqual(["deal-1"]);
+      expect(t.alerts[0].body).toContain(hint);
+    }
+  });
+
   it("keeps retrying an old failed invite: the lookback only limits new Deals", async () => {
     const t = setup([order()]);
     t.zoho.inviteResult = { ok: false, error: "Zoho portal invite failed: 500" };
@@ -717,20 +738,40 @@ describe("docs received and passport retention sweep", () => {
     expect(t.alerts[0].body).toContain("deal-1");
   });
 
-  it("alerts once when a Deal read keeps failing, and clears the failure after a good pass", async () => {
-    const zohoDeals = new Map<string, DealSnapshot>();
-    const t = sweepSetup(zohoDeals);
+  it("alerts once when a Deal read keeps failing, even as the error text changes, and resets after a good pass", async () => {
+    const t = sweepSetup(new Map([["deal-1", deal()]]));
+    let n = 0;
+    const realRead = t.zoho.readDeal.bind(t.zoho);
+    let failing = true;
+    t.zoho.readDeal = async (id, f) => (failing ? { ok: false, error: `Zoho Deal read failed: 50${n++ % 3} body-${n}` } : realRead(id, f));
     await runEinPortalSweepOnce(t.deps);
-    expect(t.deals.get("deal-1")).toMatchObject({ last_error: "Deal read failed: not found", failing_since: NOW });
-    for (const hours of [12, 24, 25, 30]) {
+    expect(t.deals.get("deal-1")).toMatchObject({ failing_since: NOW, next_check_at: NOW });
+    for (const hours of [12, 24, 25, 30, 48]) {
       t.setNow(new Date(NOW.getTime() + hours * 3600_000));
       await runEinPortalSweepOnce(t.deps);
     }
     expect(t.alerts.map((a) => a.subject)).toEqual(["EIN portal sweep keeps failing"]);
-    zohoDeals.set("deal-1", deal());
-    t.setNow(new Date(NOW.getTime() + 31 * 3600_000));
+    expect(t.deals.get("deal-1")?.alerted_error).toBe("Deal read failed");
+    failing = false;
+    t.setNow(new Date(NOW.getTime() + 49 * 3600_000));
     await runEinPortalSweepOnce(t.deps);
     expect(t.deals.get("deal-1")).toMatchObject({ last_error: null, failing_since: null, alerted_error: null });
+  });
+
+  it("checks a Deal Zoho no longer has daily, alerts once after a day, and retires it after 30 days", async () => {
+    const t = sweepSetup(new Map());
+    await runEinPortalSweepOnce(t.deps);
+    expect(t.deals.get("deal-1")).toMatchObject({ next_check_at: new Date(NOW.getTime() + DAY), failing_since: NOW });
+    t.setNow(new Date(NOW.getTime() + 3600_000));
+    await runEinPortalSweepOnce(t.deps);
+    expect(t.calls.filter((c) => c.startsWith("read"))).toHaveLength(1);
+    for (let day = 1; day <= 30; day++) {
+      t.setNow(new Date(NOW.getTime() + day * DAY));
+      await runEinPortalSweepOnce(t.deps);
+    }
+    expect(t.calls.filter((c) => c.startsWith("read"))).toHaveLength(31);
+    expect(t.alerts.map((a) => a.subject)).toEqual(["EIN portal sweep keeps failing"]);
+    expect(t.deals.get("deal-1")?.retired_at).not.toBeNull();
   });
 
   it("keeps going past an unreadable Deal", async () => {
@@ -780,6 +821,7 @@ describe("realEinPortalClient", () => {
   }
 
   beforeEach(() => {
+    resetZohoTokenCache();
     requests.length = 0;
     responses = [];
     vi.stubEnv("ZOHO_CLIENT_ID", "id");
@@ -827,10 +869,16 @@ describe("realEinPortalClient", () => {
     for (const code of ["CANNOT_PROCESS", "INVALID_DATA", "LICENSE_LIMIT_EXCEEDED", "REQUIRED_PARAM_MISSING"]) {
       expect(err(code, "x")).toMatchObject({ invited: false, permanent: true });
     }
-    expect(err("NO_PERMISSION", "permission denied", 403)).toEqual({ invited: false, permanent: true, error: "NO_PERMISSION permission denied" });
+    expect(err("NO_PERMISSION", "permission denied", 403)).toEqual({ invited: false, permanent: true, error: "NO_PERMISSION permission denied", code: "NO_PERMISSION" });
+    // The refresh token lacks the clientportal scope: a person must re-authorise.
+    expect(inviteOutcome(401, JSON.stringify({ code: "OAUTH_SCOPE_MISMATCH", message: "invalid oauth scope", status: "error" }))).toMatchObject({
+      invited: false,
+      permanent: true,
+      code: "OAUTH_SCOPE_MISMATCH",
+    });
     // Worth retrying.
     for (const code of ["RECORD_LOCKED", "NOT_REVIEWED", "NOT_APPROVED"]) expect(err(code, "x")).toMatchObject({ invited: false, permanent: false });
-    expect(inviteOutcome(500, "oops")).toEqual({ invited: false, permanent: false, error: "oops" });
+    expect(inviteOutcome(500, "oops")).toEqual({ invited: false, permanent: false, error: "oops", code: "" });
   });
 
   it("sends each Zoho call with a timeout", async () => {
@@ -842,6 +890,28 @@ describe("realEinPortalClient", () => {
     });
     await realEinPortalClient.readDeal("d-1", { docsReceived: "EIN_Docs_Received", passport: "Passport", einIssuedDate: "" });
     expect(seen[0]).toBeInstanceOf(AbortSignal);
+  });
+
+  it("drops the cached token on a 401, but not for a missing OAuth scope", async () => {
+    resetZohoTokenCache();
+    let mints = 0;
+    let dealStatus = 401;
+    let dealCode = "INVALID_TOKEN";
+    vi.stubGlobal("fetch", async (input: string | URL) => {
+      if (String(input).startsWith("https://accounts.zoho.com/")) return json({ access_token: `tok-${++mints}`, expires_in: 3600 });
+      return json({ code: dealCode, message: "x", status: "error" }, dealStatus);
+    });
+    const fields = { docsReceived: "EIN_Docs_Received", passport: "Passport", einIssuedDate: "" };
+    dealCode = "OAUTH_SCOPE_MISMATCH";
+    await realEinPortalClient.readDeal("d-1", fields);
+    await realEinPortalClient.readDeal("d-1", fields);
+    expect(mints).toBe(1);
+    dealCode = "INVALID_TOKEN";
+    await realEinPortalClient.readDeal("d-1", fields);
+    await realEinPortalClient.readDeal("d-1", fields);
+    expect(mints).toBe(2);
+    dealStatus = 200;
+    resetZohoTokenCache();
   });
 
   it("never invites a Contact whose email is not the customer's", async () => {

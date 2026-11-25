@@ -123,13 +123,18 @@ async function allEinOrdersRefunded(db: Db, dealId: string): Promise<boolean> {
  * invite needs a Contact on the Deal: Deals created at intake have one (llc-worker.js
  * links Contact_Name), and their id is on the order from payment time. Deals this
  * server creates at payment (an order_deal sync job) have no Contact, so their invite
- * would be blocked until a person links one.
+ * would be blocked until a person links one. The intake Deal id must also have a
+ * Deal ownership check (deal_stage_update) that has not dead-lettered: the invite job
+ * only uses Deals whose check succeeded (VERIFIED_DEAL_JOIN).
  */
 export async function einInviteExpected(db: Db, scope: { filingSessionId: string } | { orderId: string }): Promise<boolean> {
   const bySession = "filingSessionId" in scope;
   const { rows } = await db.query<{ line_items: LineItems }>(
     `SELECT o.line_items
      FROM orders o
+     JOIN crm_sync_queue v
+       ON v.order_id = o.order_id AND v.sync_type = 'deal_stage_update'
+      AND v.payload_snapshot->>'crm_deal_id' = o.crm_deal_id AND v.status <> 'dead_letter'
      LEFT JOIN crm_sync_queue q ON q.order_id = o.order_id AND q.sync_type = 'order_deal'
      WHERE ${bySession ? "o.filing_session_id" : "o.order_id"} = $1
        AND o.payment_status IN ('authorized', 'paid')
@@ -183,6 +188,17 @@ export async function runEinPortalInvitesOnce(deps: EinPortalDeps): Promise<{ in
       continue;
     }
 
+    // CANNOT_PROCESS means "already invited, or under GDPR". On a retry it almost
+    // certainly means our earlier attempt reached Zoho before timing out: invited.
+    if (!result.ok && result.code === "CANNOT_PROCESS" && attempts > 1) {
+      await deps.db.query(
+        `UPDATE ein_portal_deals SET invite_status = 'invited', invited_at = $2, last_error = $3, updated_at = $2 WHERE zoho_deal_id = $1`,
+        [row.zoho_deal_id, now, `treated as invited: ${result.error}`.slice(0, 500)],
+      );
+      out.invited.push(row.zoho_deal_id);
+      continue;
+    }
+
     const blocked = result.permanent === true || attempts >= INVITE_MAX_ATTEMPTS;
     await deps.db.query(`UPDATE ein_portal_deals SET invite_status = $2, last_error = $3, updated_at = $4 WHERE zoho_deal_id = $1`, [
       row.zoho_deal_id,
@@ -195,7 +211,12 @@ export async function runEinPortalInvitesOnce(deps: EinPortalDeps): Promise<{ in
       await deps.alert(
         "EIN portal invite needs a person",
         `Deal ${row.zoho_deal_id}: the customer was not invited to the Zoho CRM Portal after ${attempts} attempt(s).\n` +
-          `Reason: ${result.error}\nFix the Deal (linked Contact and its email), then invite the Contact from Zoho CRM. ` +
+          `Reason: ${result.error}\n` +
+          (result.code === "CANNOT_PROCESS"
+            ? "Zoho says the Contact is already invited or under a GDPR process: check the Contact, and re-invite it from Zoho CRM if needed. "
+            : result.code === "OAUTH_SCOPE_MISMATCH"
+              ? "The backend's Zoho OAuth token lacks the ZohoCRM.settings.clientportal scope: re-authorise it, then invite the Contact from Zoho CRM. "
+              : "Fix the Deal (linked Contact and its email), then invite the Contact from Zoho CRM. ") +
           `The passport on this Deal is still detected and cleared on schedule.`,
       );
     } else {
@@ -280,6 +301,8 @@ function dueSince(einIssuedDate: string | null, closedSeenAt: Date | null, days:
 export const SWEEP_LEASE_MS = 15 * 60 * 1000;
 /** A Deal read or docs-received write failing this long raises an alert (purge failures alert at once). */
 export const PERSISTENT_FAILURE_MS = DAY_MS;
+/** A Deal Zoho no longer has is retired after this many days of "not found". */
+export const DEAL_GONE_RETIRE_DAYS = 30;
 
 export async function runEinPortalSweepOnce(deps: EinPortalDeps): Promise<{ docsReceived: string[]; purged: string[]; errors: string[] }> {
   const out = { docsReceived: [] as string[], purged: [] as string[], errors: [] as string[] };
@@ -311,8 +334,10 @@ export async function runEinPortalSweepOnce(deps: EinPortalDeps): Promise<{ docs
     const row = lease.rows[0];
     if (!row) continue;
 
-    const errors: string[] = [];
+    // Each failure is a kind (for de-duplicating alerts) plus its detail text.
+    const errors: Array<{ kind: string; text: string }> = [];
     let purgeFailed = false;
+    let dealGone = false;
     let closedSeenAt = row.closed_seen_at;
     let purgedAt: Date | null = null;
     let due: Date | null = null;
@@ -324,7 +349,8 @@ export async function runEinPortalSweepOnce(deps: EinPortalDeps): Promise<{ docs
         einIssuedDate: cfg.einIssuedDateField,
       });
       if (!read.ok) {
-        errors.push(`Deal read failed: ${read.error}`);
+        dealGone = read.permanent === true;
+        errors.push({ kind: dealGone ? "Deal not found" : "Deal read failed", text: `Deal read failed: ${read.error}` });
       } else {
         const deal = read.value;
         hasPassport = deal.passportFiles.length > 0;
@@ -338,7 +364,7 @@ export async function runEinPortalSweepOnce(deps: EinPortalDeps): Promise<{ docs
             const mark = await deps.zoho.markDocsReceived(dealId, { docsReceived: cfg.docsReceivedField, docsReceivedAt: cfg.docsReceivedAtField }, now);
             if (!mark.ok) {
               marked = false;
-              errors.push(`EIN Docs Received update failed: ${mark.error}`);
+              errors.push({ kind: "EIN Docs Received update failed", text: `EIN Docs Received update failed: ${mark.error}` });
             }
           }
           if (marked) {
@@ -371,23 +397,26 @@ export async function runEinPortalSweepOnce(deps: EinPortalDeps): Promise<{ docs
             out.purged.push(dealId);
           } else {
             purgeFailed = true;
-            errors.push(`passport purge failed: ${cleared.error}`);
+            errors.push({ kind: "passport purge failed", text: `passport purge failed: ${cleared.error}` });
           }
         }
       }
     } catch (err) {
-      errors.push(describeError(err));
+      errors.push({ kind: "sweep error", text: describeError(err) });
     }
 
     // Failures: a purge failure alerts at once; a Deal read or docs-received write that
-    // keeps failing alerts after PERSISTENT_FAILURE_MS. Each distinct failure alerts once.
-    const lastError = errors.length ? errors.join("; ").slice(0, 500) : null;
+    // keeps failing alerts after PERSISTENT_FAILURE_MS. Alerts are de-duplicated by the
+    // kinds of failure (not the changing detail text), so each kind alerts once per run
+    // of failures; a clean pass resets it.
+    const lastError = errors.length ? errors.map((e) => e.text).join("; ").slice(0, 500) : null;
+    const alertKey = errors.length ? [...new Set(errors.map((e) => e.kind))].sort().join(", ") : null;
     const failingSince = lastError ? (row.failing_since ?? now) : null;
     let alertedError = lastError ? row.alerted_error : null;
     if (lastError) {
       out.errors.push(`${dealId}: ${lastError}`);
       const persistent = failingSince !== null && now.getTime() - failingSince.getTime() >= PERSISTENT_FAILURE_MS;
-      if ((purgeFailed || persistent) && alertedError !== lastError) {
+      if ((purgeFailed || persistent) && alertedError !== alertKey) {
         await deps.alert(
           purgeFailed ? "EIN passport purge failed" : "EIN portal sweep keeps failing",
           `Deal ${dealId}: ${lastError}
@@ -396,14 +425,18 @@ export async function runEinPortalSweepOnce(deps: EinPortalDeps): Promise<{ docs
               ? "The passport photo page is past its retention date. Delete it from the Deal in Zoho CRM by hand. The sweep keeps retrying hourly."
               : `Failing since ${failingSince!.toISOString()}. The sweep keeps retrying hourly.`),
         );
-        alertedError = lastError;
+        alertedError = alertKey;
       }
     }
 
     // Not due, or failing: check on the next pass. Due: daily (catches a re-upload), and
     // retired once nothing has been on the Deal for WATCH_AFTER_DUE_DAYS after it fell due.
-    const retire = !lastError && due !== null && !hasPassport && now.getTime() >= due.getTime() + WATCH_AFTER_DUE_DAYS * DAY_MS;
-    const nextCheck = due === null || lastError ? now : new Date(now.getTime() + DAY_MS);
+    // A Deal Zoho no longer has: daily, and retired after DEAL_GONE_RETIRE_DAYS (it was
+    // alerted after a day).
+    const goneTooLong = dealGone && failingSince !== null && now.getTime() - failingSince.getTime() >= DEAL_GONE_RETIRE_DAYS * DAY_MS;
+    const retire =
+      goneTooLong || (!lastError && due !== null && !hasPassport && now.getTime() >= due.getTime() + WATCH_AFTER_DUE_DAYS * DAY_MS);
+    const nextCheck = dealGone || (due !== null && !lastError) ? new Date(now.getTime() + DAY_MS) : now;
     await deps.db.query(
       `UPDATE ein_portal_deals
        SET closed_seen_at = $2, passport_purged_at = COALESCE($3, passport_purged_at), last_error = $4,

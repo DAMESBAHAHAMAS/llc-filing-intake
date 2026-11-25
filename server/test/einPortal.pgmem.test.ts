@@ -149,6 +149,11 @@ describe("EIN portal jobs against pg-mem", () => {
     expect(await einInviteExpected(t.pool, { orderId: O2 })).toBe(false);
     // O3 (DIY, no EIN): nothing to promise.
     expect(await einInviteExpected(t.pool, { orderId: O3 })).toBe(false);
+    // The intake Deal's ownership check dead-lettered: the invite job will never use it.
+    await t.pool.query(`UPDATE crm_sync_queue SET status = 'dead_letter' WHERE order_id = $1`, [O1]);
+    expect(await einInviteExpected(t.pool, { orderId: O1 })).toBe(false);
+    await t.pool.query(`UPDATE crm_sync_queue SET status = 'pending' WHERE order_id = $1`, [O1]);
+    expect(await einInviteExpected(t.pool, { orderId: O1 })).toBe(true);
     // An EIN order with no Deal id yet: no promise.
     await t.pool.query(`UPDATE orders SET crm_deal_id = NULL WHERE order_id = $1`, [O1]);
     expect(await einInviteExpected(t.pool, { orderId: O1 })).toBe(false);
