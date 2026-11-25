@@ -9,6 +9,15 @@ import { houseAgentLineMissing } from "../offers/houseAgentRule.js";
 import { einLineIssue } from "../offers/einBundleRule.js";
 import { getEinUpsell, orderedOfferCodes } from "../offers/einUpsell.js";
 import { holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
+import {
+  KICKOFF_HOLD_CODES,
+  KICKOFF_PAYMENT_PLAN,
+  buildKickoffLines,
+  isKickoffCart,
+  kickoffDisclosure,
+  kickoffEnabled,
+  type KickoffLine,
+} from "../offers/financeReadyKickoff.js";
 import { einIncluded, einPortalConfig, invitesEnabled, packageFromCodes, portalUrlFor } from "../ein/onboarding.js";
 import { einInviteExpected } from "../ein/portalJobs.js";
 
@@ -49,7 +58,12 @@ function parseLineItems(body: Record<string, unknown>): RequestedLineItem[] | nu
 /**
  * POST /api/checkout/create
  *
- * Body: { filing_session_id: string, line_items: [{ offer_code, quantity? }] }
+ * Body: { filing_session_id: string, line_items: [{ offer_code, quantity? }], payment_plan? }
+ *
+ * payment_plan "finance_ready_kickoff" (offers/financeReadyKickoff.ts) is the only
+ * plan: line_items must then be exactly [{ offer_code: "PREMIUM" }], and the order
+ * is a card hold for the base Florida filing, with the rest of the Finance-Ready
+ * price left for Damian's scope review. Full-price PREMIUM stays closed.
  *
  * The browser sends offer_code identifiers ONLY — never an amount, price,
  * or total (frozen rule). Every offer_code is resolved server-side
@@ -79,9 +93,33 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
     return;
   }
 
+  // Finance-Ready kickoff hold: validated before any database or Stripe work.
+  const paymentPlan = body.payment_plan;
+  const kickoff = paymentPlan !== undefined && paymentPlan !== null;
+  if (kickoff) {
+    if (paymentPlan !== KICKOFF_PAYMENT_PLAN) {
+      res.status(400).json({ error: "unknown payment_plan", allowed_payment_plans: [KICKOFF_PAYMENT_PLAN] });
+      return;
+    }
+    if (!kickoffEnabled()) {
+      res.status(422).json({ error: "offer not currently available", payment_plan: KICKOFF_PAYMENT_PLAN });
+      return;
+    }
+    if (!isKickoffCart(requestedItems)) {
+      res.status(422).json({ error: "the Finance-Ready kickoff takes exactly one PREMIUM line and nothing else" });
+      return;
+    }
+    // The customer is told the amount is authorized, not collected, so the
+    // kickoff never runs with holds switched off (PAYMENT_CAPTURE_MODE=immediate).
+    if (!holdsEnabled()) {
+      res.status(503).json({ error: "card holds are switched off, so the Finance-Ready kickoff is unavailable" });
+      return;
+    }
+  }
+
   // Offers closed at launch (offers/closedOffers.ts): refused before any
-  // database or Stripe work.
-  const closedRequested = closedCodesIn(requestedItems.map((i) => i.offer_code));
+  // database or Stripe work. The kickoff is the one way PREMIUM is sold online.
+  const closedRequested = kickoff ? [] : closedCodesIn(requestedItems.map((i) => i.offer_code));
   if (closedRequested.length > 0) {
     res.status(422).json({ error: "offer not currently available", closed_offer_codes: closedRequested });
     return;
@@ -133,10 +171,11 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
       });
       return;
     }
-    const resolved = await resolveActiveOffers(pool, uniqueCodes);
+    const codesToResolve = kickoff ? [...uniqueCodes, ...KICKOFF_HOLD_CODES] : uniqueCodes;
+    const resolved = await resolveActiveOffers(pool, codesToResolve);
     const resolvedByCode = new Map(resolved.map((o) => [o.offer_code, o]));
 
-    const unknownCodes = uniqueCodes.filter((c) => !resolvedByCode.has(c));
+    const unknownCodes = codesToResolve.filter((c) => !resolvedByCode.has(c));
     if (unknownCodes.length > 0) {
       res.status(422).json({
         error: "one or more offer_code values do not resolve to a sellable offer",
@@ -156,17 +195,33 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
       }
     }
 
-    const lineItemSnapshots = requestedItems.map((item) => {
-      const offer = resolvedByCode.get(item.offer_code)!;
-      return {
-        offer_code: offer.offer_code,
-        offer_version: offer.offer_version,
-        display_name: offer.display_name,
-        stripe_price_id: offer.stripe_price_id,
-        unit_amount_cents: offer.unit_amount_cents,
-        quantity: item.quantity,
-      };
-    });
+    const kickoffPlan = kickoff ? buildKickoffLines(resolvedByCode) : null;
+    if (kickoffPlan && !kickoffPlan.ok) {
+      res.status(422).json({ error: kickoffPlan.error });
+      return;
+    }
+    const lineItemSnapshots: KickoffLine[] = kickoffPlan?.ok
+      ? kickoffPlan.lines
+      : requestedItems.map((item) => {
+          const offer = resolvedByCode.get(item.offer_code)!;
+          return {
+            offer_code: offer.offer_code,
+            offer_version: offer.offer_version,
+            display_name: offer.display_name,
+            stripe_price_id: offer.stripe_price_id,
+            unit_amount_cents: offer.unit_amount_cents,
+            quantity: item.quantity,
+          };
+        });
+    const kickoffTerms = kickoffPlan?.ok
+      ? {
+          selected_package: "PREMIUM",
+          package_price_cents: kickoffPlan.packagePriceCents,
+          initial_hold_cents: kickoffPlan.holdCents,
+          remaining_balance_cents: kickoffPlan.remainingCents,
+          disclosure: kickoffDisclosure(kickoffPlan.holdCents, kickoffPlan.remainingCents),
+        }
+      : null;
 
     const totalCents = lineItemSnapshots.reduce((sum, li) => sum + li.unit_amount_cents * li.quantity, 0);
     const primaryOffer = resolvedByCode.get(requestedItems[0].offer_code)!;
@@ -181,12 +236,15 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
 
     // Pay-after-filing: filing orders place a card hold that is collected
     // only when proof of filing is recorded (routes/orders.ts).
-    const captureMode = holdsEnabled() && requiresPayAfterFiling(lineItemSnapshots) ? "hold" : "immediate";
+    const captureMode = kickoff || (holdsEnabled() && requiresPayAfterFiling(lineItemSnapshots)) ? "hold" : "immediate";
 
     try {
       const stripeSession = await createCheckoutSession({
         filingSessionId,
-        lineItems: lineItemSnapshots.map((li) => ({ price: li.stripe_price_id, quantity: li.quantity })),
+        // Only priced lines go to Stripe; the kickoff's selected-package line is a record.
+        lineItems: lineItemSnapshots
+          .filter((li): li is KickoffLine & { stripe_price_id: string } => typeof li.stripe_price_id === "string")
+          .map((li) => ({ price: li.stripe_price_id, quantity: li.quantity })),
         successUrl: `${frontendBaseUrl}/checkout/success?filing_session_id=${encodeURIComponent(filingSessionId)}&order_id=${encodeURIComponent(orderId)}&stripe_session_id={CHECKOUT_SESSION_ID}`,
         // /checkout/cancel — matches the route the frontend actually
         // registers (App.tsx). This previously read "/checkout/cancelled",
@@ -201,7 +259,18 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         // second one. See zoho/client.ts's updateDealStage comment.
         metadata: session.rows[0].crm_deal_id ? { crm_deal_id: session.rows[0].crm_deal_id } : undefined,
         captureMode,
-        paymentIntentMetadata: { order_id: orderId, filing_session_id: filingSessionId },
+        paymentIntentMetadata: {
+          order_id: orderId,
+          filing_session_id: filingSessionId,
+          ...(kickoffTerms
+            ? {
+                selected_package: "Finance-Ready",
+                initial_hold_cents: String(kickoffTerms.initial_hold_cents),
+                remaining_balance_cents: String(kickoffTerms.remaining_balance_cents),
+              }
+            : {}),
+        },
+        customText: kickoffTerms?.disclosure,
       });
 
       await pool.query(
@@ -215,6 +284,7 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
         stripe_checkout_session_id: stripeSession.id,
         total_cents: totalCents,
         capture_mode: captureMode,
+        ...(kickoffTerms ? { payment_plan: KICKOFF_PAYMENT_PLAN, kickoff: kickoffTerms } : {}),
       });
     } catch (stripeErr) {
       const reason = stripeErr instanceof StripeApiError ? stripeErr.message : describeError(stripeErr);
