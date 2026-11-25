@@ -4,6 +4,7 @@ import { newDb } from "pg-mem";
 import { describe, expect, it, vi } from "vitest";
 import {
   generateForOrder,
+  loadSunbizFilingDate,
   OA_STATUS,
   oaDealField,
   packageIncludesOperatingAgreement,
@@ -25,7 +26,8 @@ const base = {
   registered_agent_path: "house",
   effective_date_option: "Immediate",
 };
-const sm = { ...base, llc_name: "Test Dispatch Ten SM llc", authorized_persons: [{ article_iv_title: "AR", name: "Jordan Test Rivera", address: base.principal_address }], operating_agreement_requested: true };
+const sm = { ...base, llc_name: "Test Dispatch Ten SM llc", authorized_persons: [{ article_iv_title: "AR", name: "Jordan Test Rivera", address: base.principal_address }], operating_agreement_requested: true,
+  management_structure: "Member-Managed", member_count: "Single" };
 const fileIt = { ...sm, llc_name: "TEST DISPATCH TEN FILE IT LLC" };
 const mgr = { ...base, llc_name: "TEST DISPATCH TEN MGR LLC", authorized_persons: [{ article_iv_title: "MGR", name: "Casey Test Morgan", address: base.principal_address }] };
 
@@ -42,19 +44,20 @@ async function setup(env: NodeJS.ProcessEnv = {}) {
     CREATE TABLE filing_sessions (filing_session_id uuid PRIMARY KEY, filing_data jsonb);
     CREATE TABLE orders (order_id uuid PRIMARY KEY, filing_session_id uuid NOT NULL, line_items jsonb NOT NULL,
       payment_status text NOT NULL, paid_at timestamptz, authorized_at timestamptz, crm_deal_id text,
-      proof_of_filing_ref text, proof_of_filing_at timestamptz);
+      proof_of_filing_ref text, proof_of_filing_at timestamptz, sunbiz_filing_date date);
     CREATE TABLE crm_sync_queue (id bigserial PRIMARY KEY, filing_session_id uuid NOT NULL, order_id uuid, sync_type text NOT NULL,
       payload_snapshot jsonb NOT NULL, status text NOT NULL DEFAULT 'pending');
   `);
   await pool.query(migration("0034_formation_documents.sql"));
+  await pool.query(migration("0036_formation_followups.sql"));
   for (const [s, fd] of [[S1, sm], [S2, fileIt], [S3, mgr]] as const) {
     await pool.query(`INSERT INTO filing_sessions VALUES ($1, $2)`, [s, JSON.stringify(fd)]);
   }
   const li = (c: string) => JSON.stringify([{ offer_code: c }]);
   await pool.query(`INSERT INTO orders VALUES
-    ($1, $4, $7, 'authorized', NULL, '2026-11-25T10:00:00Z', 'deal-1', NULL, NULL),
-    ($2, $5, $8, 'paid', '2026-11-25T11:00:00Z', NULL, 'deal-2', NULL, NULL),
-    ($3, $6, $9, 'authorized', NULL, '2026-11-25T12:00:00Z', 'deal-3', NULL, NULL)`,
+    ($1, $4, $7, 'authorized', NULL, '2026-11-25T10:00:00Z', 'deal-1', NULL, NULL, NULL),
+    ($2, $5, $8, 'paid', '2026-11-25T11:00:00Z', NULL, 'deal-2', NULL, NULL, NULL),
+    ($3, $6, $9, 'authorized', NULL, '2026-11-25T12:00:00Z', 'deal-3', NULL, NULL, NULL)`,
     [O1, O2, O3, S1, S2, S3, li("FASTTRACK"), li("DIY_STATE_FEE"), li("PREMIUM")]);
   for (const o of [O1, O2, O3]) {
     await pool.query(`INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot, status) SELECT filing_session_id, order_id, 'order_deal', '{}'::jsonb, 'synced' FROM orders WHERE order_id = $1`, [o]);
@@ -107,7 +110,7 @@ describe("Operating Agreement job (T144 D10)", () => {
   it("generates after proof of filing and moves the Deal to Generated", async () => {
     const { pool, deps, updates } = await setup();
     await runOperatingAgreementJobOnce(deps);
-    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10', proof_of_filing_at = '2026-11-30T15:00:00Z' WHERE order_id = $1`, [O1]);
+    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10', proof_of_filing_at = '2026-11-30T15:00:00Z', sunbiz_filing_date = '2026-11-28' WHERE order_id = $1`, [O1]);
     const r = await runOperatingAgreementJobOnce(deps);
     expect(r.generated).toBe(1);
     expect(await statusOf(pool, "deal-1")).toMatchObject({ status: OA_STATUS.generated, deal_synced_status: OA_STATUS.generated });
@@ -120,7 +123,7 @@ describe("Operating Agreement job (T144 D10)", () => {
   it("asks ops once for the answers a manager-managed agreement needs, then generates with them", async () => {
     const { pool, deps, alerts } = await setup({ BANKING_RESOLUTION_ENABLED: "true" });
     await runOperatingAgreementJobOnce(deps);
-    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST11', proof_of_filing_at = '2026-11-30T15:00:00Z' WHERE order_id = $1`, [O3]);
+    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST11', proof_of_filing_at = '2026-11-30T15:00:00Z', sunbiz_filing_date = '2026-11-28' WHERE order_id = $1`, [O3]);
     await runOperatingAgreementJobOnce(deps);
     await runOperatingAgreementJobOnce(deps);
     expect(alerts.filter((a) => a.includes(O3))).toHaveLength(1);
@@ -149,7 +152,7 @@ describe("Operating Agreement job (T144 D10)", () => {
     const { pool, deps, updates } = await setup();
     (deps.zoho.updateDeal as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: false, error: "503" });
     await runOperatingAgreementJobOnce(deps);
-    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10', proof_of_filing_at = '2026-11-30T15:00:00Z' WHERE order_id = $1`, [O1]);
+    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10', proof_of_filing_at = '2026-11-30T15:00:00Z', sunbiz_filing_date = '2026-11-28' WHERE order_id = $1`, [O1]);
     await runOperatingAgreementJobOnce(deps); // generated, but the Deal is still in its 1-hour backoff
     deps.now = () => new Date("2026-11-30T17:00:00Z");
     await runOperatingAgreementJobOnce(deps);
@@ -196,10 +199,12 @@ describe("review fixes (T144 D10)", () => {
   it("treats an already stored agreement as generated, so the status cannot stick", async () => {
     const { pool, deps } = await setup();
     await runOperatingAgreementJobOnce(deps);
-    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10', proof_of_filing_at = '2026-11-30T15:00:00Z' WHERE order_id = $1`, [O1]);
+    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10', proof_of_filing_at = '2026-11-30T15:00:00Z', sunbiz_filing_date = '2026-11-28' WHERE order_id = $1`, [O1]);
     await pool.query(`INSERT INTO formation_documents (order_id, filing_session_id, kind, template, draft, byte_size, sha256, pdf_bytes)
                       VALUES ($1, $2, 'operating_agreement', 'operating_agreement_single_member', true, 3, 'abc', '\\x00')`, [O1, S1]);
-    expect(await generateForOrder(deps, O1)).toMatchObject({ ok: true, operating_agreement: { sha256: "abc" } });
+    expect(await generateForOrder(deps, O1, { reuseExisting: true })).toMatchObject({ ok: true, operating_agreement: { sha256: "abc" } });
+    // The operator route never silently returns the old PDF.
+    expect(await generateForOrder(deps, O1, { inputs: { successor_name: "X" } })).toMatchObject({ ok: false, status: 409 });
     expect((await statusOf(pool, "deal-1")).status).toBe(OA_STATUS.generated);
   });
 
@@ -217,6 +222,70 @@ describe("review fixes (T144 D10)", () => {
     const { pool, deps } = await setup();
     await pool.query(`UPDATE orders SET payment_status = 'refunded', proof_of_filing_ref = 'L1' WHERE order_id = $1`, [O1]);
     expect(await generateForOrder(deps, O1)).toMatchObject({ ok: false, status: 409 });
+  });
+});
+
+describe("dispatcher review before 0034 (T144 D10)", () => {
+  it("prints the Sunbiz filing date, not the day proof was recorded, and waits for it", async () => {
+    const { pool, deps, alerts } = await setup();
+    await runOperatingAgreementJobOnce(deps);
+    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10', proof_of_filing_at = '2026-11-30T15:00:00Z' WHERE order_id = $1`, [O1]);
+    await runOperatingAgreementJobOnce(deps);
+    expect((await statusOf(pool, "deal-1")).status).toBe(OA_STATUS.pending);
+    expect(alerts.some((a) => a.includes("Sunbiz filing date"))).toBe(true);
+    await pool.query(`UPDATE orders SET sunbiz_filing_date = '2026-11-28' WHERE order_id = $1`, [O1]);
+    await runOperatingAgreementJobOnce(deps);
+    const ctx = (deps.renderOperatingAgreement as ReturnType<typeof vi.fn>).mock.calls.at(-1)![1] as Record<string, unknown>;
+    expect(ctx).toMatchObject({ filing_date: "November 28, 2026", effective_date: "November 28, 2026" });
+  });
+
+  it("refuses a future filing date and stores a valid one given by the operator", async () => {
+    const { pool, deps } = await setup();
+    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10' WHERE order_id = $1`, [O1]);
+    expect(await generateForOrder(deps, O1, { filingDate: "2027-01-01" })).toMatchObject({ ok: false, status: 422 });
+    expect(await generateForOrder(deps, O1, { filingDate: "2026-11-27" })).toMatchObject({ ok: true });
+    expect(await loadSunbizFilingDate(pool as never, O1)).toBe("2026-11-27");
+  });
+
+  it("never infers the members: without the customer's single-member answer it asks", async () => {
+    const { pool, deps } = await setup();
+    await pool.query(`UPDATE filing_sessions SET filing_data = $2 WHERE filing_session_id = $1`,
+      [S1, JSON.stringify({ ...sm, management_structure: undefined, member_count: undefined })]);
+    await pool.query(`UPDATE orders SET proof_of_filing_ref = 'L26000TEST10', sunbiz_filing_date = '2026-11-28' WHERE order_id = $1`, [O1]);
+    expect(await generateForOrder(deps, O1)).toMatchObject({ ok: false, status: 422, error: "the members are not confirmed" });
+    expect(await generateForOrder(deps, O1, { confirmMembers: true })).toMatchObject({ ok: true });
+  });
+
+  it("decides the package per Deal across all its orders, with the start date on the Deal", async () => {
+    const { pool, deps } = await setup({ OA_JOB_START_DATE: "2026-11-25" });
+    const O4 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4";
+    // Bank-Ready held before the start date, EIN add-on after it, same Deal.
+    await pool.query(`UPDATE orders SET authorized_at = '2026-11-24T10:00:00Z' WHERE order_id = $1`, [O1]);
+    await pool.query(`INSERT INTO orders VALUES ($1, $2, $3, 'paid', '2026-11-26T10:00:00Z', NULL, 'deal-1', NULL, NULL, NULL)`, [O4, S1, JSON.stringify([{ offer_code: "EIN_FILING" }])]);
+    await pool.query(`INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot, status) VALUES ($1, $2, 'order_deal', '{}'::jsonb, 'synced')`, [S1, O4]);
+    await runOperatingAgreementJobOnce(deps);
+    expect(await statusOf(pool, "deal-1")).toBeUndefined(); // the Deal started before the start date: left alone
+    const { pool: p2, deps: d2 } = await setup();
+    await p2.query(`INSERT INTO orders VALUES ($1, $2, $3, 'paid', '2026-11-26T10:00:00Z', NULL, 'deal-1', NULL, NULL, NULL)`, [O4, S1, JSON.stringify([{ offer_code: "EIN_FILING" }])]);
+    await p2.query(`INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot, status) VALUES ($1, $2, 'order_deal', '{}'::jsonb, 'synced')`, [S1, O4]);
+    await runOperatingAgreementJobOnce(d2);
+    expect((await statusOf(p2, "deal-1")).status).toBe(OA_STATUS.pending); // the add-on does not make it Not Included
+  });
+
+  it("moves a Deal whose Bank-Ready order was released back to Not Included", async () => {
+    const { pool, deps } = await setup();
+    await runOperatingAgreementJobOnce(deps);
+    await pool.query(`UPDATE orders SET payment_status = 'released' WHERE order_id = $1`, [O1]);
+    await runOperatingAgreementJobOnce(deps);
+    expect(await statusOf(pool, "deal-1")).toMatchObject({ status: OA_STATUS.notIncluded });
+  });
+
+  it("keeps Deal-write failures out of last_error", async () => {
+    const { pool, deps } = await setup();
+    (deps.zoho.updateDeal as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: false, error: "503" });
+    await runOperatingAgreementJobOnce(deps);
+    const row = (await pool.query(`SELECT last_error, deal_sync_error FROM operating_agreement_status WHERE crm_deal_id = 'deal-1'`)).rows[0];
+    expect(row).toEqual({ last_error: null, deal_sync_error: "Deal update: 503" });
   });
 });
 

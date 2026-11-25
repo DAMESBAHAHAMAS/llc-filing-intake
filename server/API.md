@@ -324,3 +324,11 @@ expiring URL per decision boundary #1) is not yet built.
   - `409` when the package does not include the agreement, no proof of filing is recorded, or the agreement was already generated (pass `replace: true` to regenerate).
 - `GET /api/ops/formation-documents/:orderId/:kind` (`operating_agreement` | `banking_resolution`) returns the stored PDF. Headers: `X-Content-SHA256`, `X-Draft`.
 - Migration 0034 (`operating_agreement_status`, `formation_documents`). Until it is applied, the job logs once and stays idle.
+
+### Operating Agreement: before migration 0034 is applied (T144 D10 review, 25 Nov 2026)
+- `POST /api/orders/:orderId/proof-of-filing` also takes an optional `filing_date` (YYYY-MM-DD): the date Sunbiz filed the Articles. It is stored in `orders.sunbiz_filing_date` (migration 0036) after the proof is recorded, and never affects collection. The agreement's "Filed" date comes only from this date or from `filing_date` on the ops route, never from when the proof was recorded. "Effective" follows the Articles: the filing date for "Immediate", otherwise the chosen date. Without a filing date the job waits and alerts once.
+- The members are never inferred from Article IV. The job generates on its own only when the customer answered member-managed with a single member, and exactly one person is listed. Otherwise the ops route needs `inputs.members`, or `confirm_members: true` when the Article IV people are exactly the members (else `422`).
+- Re-posting the ops route for an agreement that is already generated returns `409` unless `replace: true`, so new answers are never dropped.
+- The package is decided per Deal across all its held or paid orders. `OA_JOB_START_DATE` applies to the Deal's first order. A Pending Deal whose qualifying order is released or refunded goes back to Not Included.
+- Deal-write failures go to `deal_sync_error` (0036), not `last_error`.
+- Apply 0034 and 0036 together.

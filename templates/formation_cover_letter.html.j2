@@ -6,6 +6,12 @@
 {% set footer_label = "Formation Package" %}
 {% set hide_page_numbers = true %}
 {% include "partials/document_styles.html.j2" %}
+{% if draft %}
+<style>
+  /* The review banner repeats on every page, not only page 1 (T144 D10 review). */
+  @page { @top-center { content: "Draft wording, not yet approved. Not for customer delivery."; font-size: 8pt; font-weight: 700; color: #b91c1c; } }
+</style>
+{% endif %}
 </head>
 <body>
 {#
@@ -50,7 +56,8 @@
   <tr><th>Principal address</th><td>{{ principal_address }}</td></tr>
 </table>
 
-<p><b>Your payment.</b> As promised, nothing was charged until your LLC was filed. Your card is charged {{ order_total }} today, and a receipt follows separately.</p>
+{# T144 D10 review: neutral wording; when a hold is captured follows the 25 Nov 2026 hold rule, not this letter. #}
+<p><b>Your payment.</b> Your order total is {{ order_total }}. Your receipt is sent separately.</p>
 
 <p>If anything here doesn't match what you expected, reply to this email or book a free 15-minute Formation Review: {{ booking_link }}.</p>
 

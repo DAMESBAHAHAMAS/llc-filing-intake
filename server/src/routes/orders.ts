@@ -13,6 +13,7 @@ import { holdNoLongerCapturable } from "../payments/holdState.js";
 import { sendOpsAlert } from "../ops/alerts.js";
 import { effectiveDateProblem, floridaToday, windowForFilingDate } from "../filing/effectiveDateWindow.js";
 import { alertEmailsNotQueued, enqueueCustomerEmails, listOrderEmails } from "../orderEmails/worker.js";
+import { saveSunbizFilingDate } from "../formation/operatingAgreementJob.js";
 
 export const ordersRouter = Router();
 
@@ -106,6 +107,15 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
     return;
   }
 
+  // T144 D10: optional Sunbiz filing date of the Articles (YYYY-MM-DD), used by
+  // the Operating Agreement. Stored separately below; nothing about recording the
+  // proof or collecting the hold depends on it.
+  const filingDate = typeof req.body?.filing_date === "string" ? req.body.filing_date.trim() : undefined;
+  if (filingDate !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(filingDate)) {
+    res.status(400).json({ error: "filing_date must be YYYY-MM-DD (the date Sunbiz filed the Articles)" });
+    return;
+  }
+
   const orderId = req.params.orderId;
   let order: ProofOrder;
   try {
@@ -118,6 +128,12 @@ ordersRouter.post("/api/orders/:orderId/proof-of-filing", async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: "could not record proof of filing", detail: describeError(err) });
     return;
+  }
+  if (filingDate) {
+    // Best effort, never blocks collection: before migration 0036 the column does not exist.
+    await saveSunbizFilingDate(pool, order.order_id, filingDate).catch((err) => {
+      console.error(`[proof of filing] Sunbiz filing date not saved for order ${order.order_id}:`, err);
+    });
   }
 
   if (order.payment_status === "paid") {

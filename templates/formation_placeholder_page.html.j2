@@ -6,6 +6,10 @@
 {% set footer_label = "Formation Package" %}
 {% set hide_page_numbers = true %}
 {% include "partials/document_styles.html.j2" %}
+<style>
+  /* The review banner repeats on every page, not only page 1 (T144 D10 review). */
+  @page { @top-center { content: "Sample only. Not for customer delivery."; font-size: 8pt; font-weight: 700; color: #b91c1c; } }
+</style>
 </head>
 <body>
 {#
