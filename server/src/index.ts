@@ -13,8 +13,8 @@ import { offersRouter } from "./routes/offers.js";
 import { filingDocumentRouter } from "./routes/filingDocument.js";
 import { ordersRouter } from "./routes/orders.js";
 import { scorecardRouter } from "./routes/scorecard.js";
-import { einOnboardingPreParse, einOnboardingRouter } from "./routes/einOnboarding.js";
-import { funnelRateLimiters } from "./middleware/rateLimit.js";
+import { einOnboardingRouter } from "./routes/einOnboarding.js";
+import { defaultEinPortalDeps, runEinPortalInvitesOnce, runEinPortalSweepOnce } from "./ein/portalJobs.js";
 import { runScorecardTick } from "./scorecard/service.js";
 import { realScorecardSender } from "./scorecard/sender.js";
 import { runHoldSweepOnce } from "./fulfillment/holdSweep.js";
@@ -48,17 +48,11 @@ app.use(corsMiddleware);
 app.use("/api/webhooks/stripe", express.raw({ type: "application/json" }));
 app.use(stripeWebhookRouter);
 
-// ST17: the EIN onboarding POST carries a base64 passport image (up to 10 MB, ~13.4 MB
-// encoded). Only that path gets the larger limit, and only after its rate limit and a
-// cheap gate (form open, declared size) so a closed form or a flood is refused before
-// any body is read. It must come before the global 100 kb parser.
-const funnelLimits = funnelRateLimiters();
-app.use("/api/onboarding/ein", funnelLimits.einOnboarding, einOnboardingPreParse(), express.json({ limit: "15mb" }));
 app.use(express.json());
 
 // Per-IP limits (429) and the Turnstile bot check on the public funnel
 // endpoints; see middleware/funnelProtection.ts.
-applyFunnelProtection(app, { limits: funnelLimits });
+applyFunnelProtection(app);
 
 app.use(healthRouter);
 app.use(sessionRouter);
@@ -156,4 +150,33 @@ if (scorecardPollerIntervalMs > 0) {
     });
   }, scorecardPollerIntervalMs);
   console.log(`Scorecard poller running every ${scorecardPollerIntervalMs}ms`);
+}
+
+/**
+ * ST17 EIN onboarding through the Zoho CRM Portal (ein/portalJobs.ts). Both jobs do
+ * nothing unless EIN_ONBOARDING_ENABLED=true and their settings are present.
+ * Invites every 10 minutes by default (EIN_PORTAL_INVITE_INTERVAL_MS). The
+ * docs-received / passport-retention sweep runs hourly by default
+ * (EIN_PORTAL_SWEEP_INTERVAL_MS), not daily: a 24-hour timer restarts on every
+ * deploy and could go days without firing. Each pass is idempotent. 0 disables either.
+ */
+const einInviteIntervalMs = Number(process.env.EIN_PORTAL_INVITE_INTERVAL_MS ?? 10 * 60_000);
+if (einInviteIntervalMs > 0) {
+  setInterval(() => {
+    runEinPortalInvitesOnce(defaultEinPortalDeps(pool)).catch((err) => {
+      console.error("[ein portal invites] tick failed", err);
+    });
+  }, einInviteIntervalMs);
+}
+const einSweepIntervalMs = Number(process.env.EIN_PORTAL_SWEEP_INTERVAL_MS ?? 60 * 60_000);
+if (einSweepIntervalMs > 0) {
+  setInterval(() => {
+    runEinPortalSweepOnce(defaultEinPortalDeps(pool))
+      .then((r) => {
+        if (r.errors.length > 0) console.error("[ein portal sweep] errors", r.errors);
+      })
+      .catch((err) => {
+        console.error("[ein portal sweep] tick failed", err);
+      });
+  }, einSweepIntervalMs);
 }

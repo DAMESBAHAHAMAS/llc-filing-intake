@@ -27,10 +27,9 @@ export function applyFunnelProtection(
   app.use("/api/registered-agent/request-acceptance", limits.raRequestAcceptance, botCheck);
   app.use(["/api/registered-agent", "/registered-agent"], limits.raOther);
   app.use("/api/filing-session/:filingSessionId/pdf", limits.filingPdf);
-  app.use(["/api/offers", "/api/ein-express"], limits.reads);
+  app.use(["/api/offers", "/api/ein-express", "/api/onboarding/ein"], limits.reads);
   // Scorecard sign-up sends email: capped like the other email-sending endpoint.
   app.use("/api/scorecard/signup", limits.scorecardSignup);
-  // /api/onboarding/ein (ST17) is limited in index.ts, before its 15 MB body parser.
 
   return limits;
 }
