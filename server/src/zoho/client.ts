@@ -231,7 +231,53 @@ export function buildDealRecord(payload: OrderSyncPayload): Record<string, unkno
   return record;
 }
 
-export async function getZohoAccessToken(): Promise<string> {
+/**
+ * Access tokens are cached until a minute before Zoho says they expire. Zoho
+ * limits how often a refresh token may mint access tokens (about 10 per 10
+ * minutes), and every Zoho caller here (CRM sync, scorecard, EIN portal jobs)
+ * shares this one refresh token, so minting per request would lock them all out.
+ *  - Concurrent callers share one in-flight refresh.
+ *  - The cache is keyed by the credentials, so changing them never reuses a token.
+ *  - A 401 drops the cached token only if it is the token that failed, and forced
+ *    refreshes are limited to one per FORCED_REFRESH_COOLDOWN_MS, so a burst of 401s
+ *    (e.g. a missing OAuth scope on one endpoint) cannot burn the refresh allowance.
+ *  - A failed refresh is remembered for TOKEN_FAILURE_COOLDOWN_MS, so callers do not
+ *    hammer Zoho during a rate-limit lockout.
+ */
+const TOKEN_TIMEOUT_MS = 15_000;
+const TOKEN_EARLY_EXPIRY_MS = 60_000;
+/** Zoho access tokens last 3600 s; never cache longer (some replies give ms, not s). */
+const TOKEN_MAX_LIFETIME_S = 3600;
+/** Used when Zoho's reply carries no expires_in. */
+const TOKEN_DEFAULT_LIFETIME_S = 3000;
+const FORCED_REFRESH_COOLDOWN_MS = 2 * 60_000;
+const TOKEN_FAILURE_COOLDOWN_MS = 60_000;
+
+let tokenCache: { key: string; token: string; expiresAt: number } | null = null;
+let tokenInFlight: { key: string; promise: Promise<string> } | null = null;
+let tokenFailure: { key: string; error: Error; until: number } | null = null;
+let lastForcedRefreshAt = Number.NEGATIVE_INFINITY;
+
+/**
+ * Called after Zoho answers 401 with `token`: drops the cached token if it is still
+ * that one, at most once per FORCED_REFRESH_COOLDOWN_MS.
+ */
+export function invalidateZohoAccessToken(token: string, now: number = Date.now()): void {
+  if (!tokenCache || tokenCache.token !== token) return;
+  if (now - lastForcedRefreshAt < FORCED_REFRESH_COOLDOWN_MS) return;
+  lastForcedRefreshAt = now;
+  tokenCache = null;
+}
+
+/** Test helper: forget every cached token, failure and cooldown. */
+export function resetZohoTokenCache(): void {
+  tokenCache = null;
+  tokenInFlight = null;
+  tokenFailure = null;
+  lastForcedRefreshAt = Number.NEGATIVE_INFINITY;
+}
+
+export async function getZohoAccessToken(now: () => number = Date.now): Promise<string> {
   const clientId = process.env.ZOHO_CLIENT_ID;
   const clientSecret = process.env.ZOHO_CLIENT_SECRET;
   const refreshToken = process.env.ZOHO_REFRESH_TOKEN;
@@ -240,22 +286,46 @@ export async function getZohoAccessToken(): Promise<string> {
     throw new Error("Zoho credentials not configured (ZOHO_CLIENT_ID/SECRET/REFRESH_TOKEN)");
   }
 
-  const res = await fetch("https://accounts.zoho.com/oauth/v2/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      client_id: clientId,
-      client_secret: clientSecret,
-      refresh_token: refreshToken,
-    }),
-  });
+  const key = `${clientId}\u0000${refreshToken}`;
+  if (tokenCache && tokenCache.key === key && now() < tokenCache.expiresAt) return tokenCache.token;
+  if (tokenInFlight && tokenInFlight.key === key) return tokenInFlight.promise;
+  if (tokenFailure && tokenFailure.key === key && now() < tokenFailure.until) throw tokenFailure.error;
 
-  const data = (await res.json()) as { access_token?: string };
-  if (!data.access_token) {
-    throw new Error("Zoho token refresh failed: " + JSON.stringify(data));
+  const promise = (async () => {
+    const res = await fetch("https://accounts.zoho.com/oauth/v2/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+      }),
+      signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
+    });
+
+    const data = (await res.json()) as { access_token?: string; expires_in?: unknown };
+    if (!data.access_token) {
+      throw new Error("Zoho token refresh failed: " + JSON.stringify(data));
+    }
+    const lifetimeS = Math.min(
+      typeof data.expires_in === "number" && data.expires_in > 0 ? data.expires_in : TOKEN_DEFAULT_LIFETIME_S,
+      TOKEN_MAX_LIFETIME_S,
+    );
+    tokenCache = { key, token: data.access_token, expiresAt: now() + lifetimeS * 1000 - TOKEN_EARLY_EXPIRY_MS };
+    tokenFailure = null;
+    return data.access_token;
+  })().catch((err: unknown) => {
+    const error = err instanceof Error ? err : new Error(String(err));
+    tokenFailure = { key, error, until: now() + TOKEN_FAILURE_COOLDOWN_MS };
+    throw error;
+  });
+  tokenInFlight = { key, promise };
+  try {
+    return await promise;
+  } finally {
+    if (tokenInFlight?.promise === promise) tokenInFlight = null;
   }
-  return data.access_token;
 }
 
 /**
@@ -321,6 +391,7 @@ export const realZohoClient: ZohoClient = {
       });
 
       if (leadRes.status === 401) {
+        invalidateZohoAccessToken(token);
         return { ok: false, httpStatus: 401, error: "Zoho returned 401" };
       }
       if (!leadRes.ok) {
@@ -377,7 +448,10 @@ export const realZohoClient: ZohoClient = {
             duplicate_check_fields: ["Email"],
           }),
         });
-        if (leadRes.status === 401) return { ok: false, httpStatus: 401, error: "Zoho returned 401" };
+        if (leadRes.status === 401) {
+          invalidateZohoAccessToken(token);
+          return { ok: false, httpStatus: 401, error: "Zoho returned 401" };
+        }
         if (!leadRes.ok) return { ok: false, httpStatus: leadRes.status, error: `Zoho Lead upsert (abandoned cart) failed: ${leadRes.status}` };
         const leadData = (await leadRes.json()) as { data?: Array<{ details?: { id?: string } }> };
         return { ok: true, leadId: leadData.data?.[0]?.details?.id };
@@ -389,7 +463,10 @@ export const realZohoClient: ZohoClient = {
         headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ data: [buildDealRecord(payload)] }),
       });
-      if (dealRes.status === 401) return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal creation" };
+      if (dealRes.status === 401) {
+        invalidateZohoAccessToken(token);
+        return { ok: false, httpStatus: 401, error: "Zoho returned 401 on Deal creation" };
+      }
       if (!dealRes.ok) return { ok: false, httpStatus: dealRes.status, error: `Zoho Deal create failed: ${dealRes.status}` };
       const dealData = (await dealRes.json()) as { data?: Array<{ details?: { id?: string } }> };
       const dealId = dealData.data?.[0]?.details?.id;
@@ -437,6 +514,7 @@ export const realZohoClient: ZohoClient = {
         { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
       );
       if (dealRes.status === 401) {
+        invalidateZohoAccessToken(token);
         return { ok: false, httpStatus: 401, error: `Zoho returned 401 on Deal ownership lookup: ${await zohoErrorDetail(dealRes)}` };
       }
       if (dealRes.status === 404) {
@@ -461,6 +539,7 @@ export const realZohoClient: ZohoClient = {
         headers: { Authorization: `Zoho-oauthtoken ${token}` },
       });
       if (contactRes.status === 401) {
+        invalidateZohoAccessToken(token);
         return { ok: false, httpStatus: 401, error: `Zoho returned 401 on Contact ownership lookup: ${await zohoErrorDetail(contactRes)}` };
       }
       if (!contactRes.ok) {
@@ -509,6 +588,7 @@ async function putDealUpdate(token: string, payload: DealStageUpdatePayload): Pr
   });
 
   if (updateRes.status === 401) {
+    invalidateZohoAccessToken(token);
     return { ok: false, httpStatus: 401, error: `Zoho returned 401 on Deal stage update: ${await zohoErrorDetail(updateRes)}` };
   }
   if (!updateRes.ok) {

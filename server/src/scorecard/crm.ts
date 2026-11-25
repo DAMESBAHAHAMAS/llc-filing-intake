@@ -1,4 +1,4 @@
-import { getZohoAccessToken, isTestEmail } from "../zoho/client.js";
+import { getZohoAccessToken, invalidateZohoAccessToken, isTestEmail } from "../zoho/client.js";
 
 export interface ScorecardLeadInput {
   email: string;
@@ -62,6 +62,7 @@ export const realScorecardCrm: ScorecardCrm = {
         headers,
         body: JSON.stringify({ data: [record], duplicate_check_fields: ["Email"] }),
       });
+      if (res.status === 401) invalidateZohoAccessToken(token);
       if (!res.ok) return { ok: false, error: `Zoho Leads upsert failed: ${res.status}` };
       const body = (await res.json()) as { data?: Array<{ status?: string; code?: string; details?: { id?: string } }> };
       const row = body.data?.[0];

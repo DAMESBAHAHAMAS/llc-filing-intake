@@ -5,6 +5,7 @@ import { backoffForAttempt, isDeadLetter } from "../sync/backoff.js";
 import type { OrderEmailSender } from "./sender.js";
 import { buildOrderEmail, type OrderEmailRow, type OrderEmailType, type PaymentMode } from "./templates.js";
 import { einIncluded, einPortalConfig, invitesEnabled, portalUrlFor } from "../ein/onboarding.js";
+import { einInviteExpected } from "../ein/portalJobs.js";
 
 /**
  * Customer order emails run through crm_sync_queue rather than a new
@@ -130,10 +131,11 @@ async function loadOrderRow(pool: Pool, orderId: string): Promise<OrderEmailRow 
   const row = rows[0];
   if (!row) return null;
   // ST17: the Zoho CRM Portal link, only for an order that includes the EIN and only
-  // once the portal is on and invites go out (the email promises an invitation).
+  // once the portal is on and this customer's invite can go out (the email promises one).
   const codes = (row.line_items ?? []).map((li) => li.offer_code).filter((c): c is string => typeof c === "string");
   const cfg = einPortalConfig();
-  row.ein_portal_url = einIncluded(codes) && invitesEnabled(cfg) ? portalUrlFor(cfg) : null;
+  row.ein_portal_url =
+    einIncluded(codes) && invitesEnabled(cfg) && (await einInviteExpected(pool, { orderId })) ? portalUrlFor(cfg) : null;
   return row;
 }
 

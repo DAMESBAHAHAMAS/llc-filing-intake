@@ -10,15 +10,20 @@ import { einLineIssue } from "../offers/einBundleRule.js";
 import { getEinUpsell, orderedOfferCodes } from "../offers/einUpsell.js";
 import { holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
 import { einIncluded, einPortalConfig, invitesEnabled, packageFromCodes, portalUrlFor } from "../ein/onboarding.js";
+import { einInviteExpected } from "../ein/portalJobs.js";
 
 export const checkoutRouter = Router();
 
-/** ST17: the portal link the success page may show: only once invites go out. */
-function successPagePortalUrl(): string | null {
+/**
+ * ST17: the portal link the success page may show: only once invites go out, and only
+ * when this customer's invite can actually be sent (ein/portalJobs.ts einInviteExpected),
+ * because the page tells them an invitation is on its way.
+ */
+async function successPagePortalUrl(filingSessionId: string): Promise<string | null> {
   const cfg = einPortalConfig();
-  return invitesEnabled(cfg) ? portalUrlFor(cfg) : null;
+  if (!invitesEnabled(cfg)) return null;
+  return (await einInviteExpected(pool, { filingSessionId })) ? portalUrlFor(cfg) : null;
 }
-
 interface RequestedLineItem {
   offer_code: string;
   quantity: number;
@@ -269,7 +274,7 @@ checkoutRouter.get("/api/checkout/order/:orderId", async (req, res) => {
         ein = {
           package: packageFromCodes(codes),
           ein_included: included,
-          ein_portal_url: included ? successPagePortalUrl() : null,
+          ein_portal_url: included ? await successPagePortalUrl(rows[0].filing_session_id) : null,
         };
       }
     } catch (einErr) {

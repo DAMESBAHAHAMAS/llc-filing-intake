@@ -15,6 +15,8 @@ import { ordersRouter } from "./routes/orders.js";
 import { scorecardRouter } from "./routes/scorecard.js";
 import { einOnboardingRouter } from "./routes/einOnboarding.js";
 import { defaultEinPortalDeps, runEinPortalInvitesOnce, runEinPortalSweepOnce } from "./ein/portalJobs.js";
+import { einPortalConfig, einPortalConfigIssues } from "./ein/onboarding.js";
+import { sendOpsAlert } from "./ops/alerts.js";
 import { runScorecardTick } from "./scorecard/service.js";
 import { realScorecardSender } from "./scorecard/sender.js";
 import { runHoldSweepOnce } from "./fulfillment/holdSweep.js";
@@ -160,6 +162,16 @@ if (scorecardPollerIntervalMs > 0) {
  * (EIN_PORTAL_SWEEP_INTERVAL_MS), not daily: a 24-hour timer restarts on every
  * deploy and could go days without firing. Each pass is idempotent. 0 disables either.
  */
+// Unusable EIN portal settings are reported once at startup, only when switched on.
+if (einPortalConfig().enabled) {
+  const issues = einPortalConfigIssues();
+  if (issues.length > 0) {
+    console.error("[ein portal] configuration issues:", issues);
+    sendOpsAlert("EIN portal settings need attention", issues.join("\n")).catch((err) => {
+      console.error("[ein portal] config alert failed", err);
+    });
+  }
+}
 const einInviteIntervalMs = Number(process.env.EIN_PORTAL_INVITE_INTERVAL_MS ?? 10 * 60_000);
 if (einInviteIntervalMs > 0) {
   setInterval(() => {

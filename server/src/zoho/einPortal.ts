@@ -1,4 +1,4 @@
-import { getZohoAccessToken } from "./client.js";
+import { getZohoAccessToken, invalidateZohoAccessToken } from "./client.js";
 
 /**
  * ST17: the Zoho CRM calls for EIN onboarding through the Zoho CRM Portal.
@@ -19,7 +19,7 @@ import { getZohoAccessToken } from "./client.js";
 
 export type ZohoCallResult<T = undefined> =
   | ({ ok: true } & (T extends undefined ? object : { value: T }))
-  | { ok: false; error: string; permanent?: boolean };
+  | { ok: false; error: string; permanent?: boolean; code?: string };
 
 export interface DealSnapshot {
   stage: string | null;
@@ -71,28 +71,72 @@ function timeout(): { signal: AbortSignal } {
   return { signal: AbortSignal.timeout(TIMEOUT_MS) };
 }
 
+/**
+ * fetch for Zoho API calls. A 401 drops the shared cached access token (client.ts),
+ * only if it is the token this request used, and never for OAUTH_SCOPE_MISMATCH: a
+ * missing scope (e.g. clientportal on the invite) is not cured by a new token, and
+ * refreshing for it would burn the shared refresh allowance.
+ */
+async function zfetch(url: string, init: RequestInit): Promise<Response> {
+  const res = await fetch(url, init);
+  if (res.status === 401) {
+    const code = await res
+      .clone()
+      .json()
+      .then((j: unknown) => {
+        const c = (j as { code?: unknown } | null)?.code;
+        return typeof c === "string" ? c : "";
+      })
+      .catch(() => "");
+    const auth = (init.headers as Record<string, string> | undefined)?.Authorization ?? "";
+    const token = auth.replace(/^Zoho-oauthtoken\s+/, "");
+    if (code !== "OAUTH_SCOPE_MISMATCH" && token) invalidateZohoAccessToken(token);
+  }
+  return res;
+}
+
 async function auth(): Promise<Record<string, string>> {
   return { Authorization: `Zoho-oauthtoken ${await getZohoAccessToken()}` };
 }
 
+export type InviteOutcome = { invited: true } | { invited: false; error: string; permanent: boolean; code: string };
+
+/** portal_invite codes a person must resolve (retrying cannot help). */
+const PERMANENT_INVITE_CODES = new Set([
+  "CANNOT_PROCESS", // already invited, or the record is under a GDPR process
+  "INVALID_DATA", // bad user type, record or language, or not a client/customer
+  "REQUIRED_PARAM_MISSING",
+  "LICENSE_LIMIT_EXCEEDED",
+  "NO_PERMISSION", // the user's profile lacks portal permission
+  "OAUTH_SCOPE_MISMATCH", // the refresh token lacks ZohoCRM.settings.clientportal.CREATE
+]);
+
 /**
- * Reads portal_invite's answer. Zoho's v8 sample is a top-level
- * { status: "success", code: "SUCCESS", details: { record_id } }; a data[0] wrapper
- * is accepted too, and so is a 2xx with no record status at all. A Contact who is already a portal user is treated as invited, so
- * repeat customers are not retried and blocked. Returns "invited", or the error text.
+ * Reads portal_invite's answer. Zoho's v8 docs: success is
+ * { "portal_invite": [ { "code": "SUCCESS", "details": { "record_id": … }, "message": …, "status": "success" } ] };
+ * errors carry the same fields with status "error". A data[0] wrapper or a bare object
+ * is read the same way.
+ *  - DUPLICATE_DATA ("a portal user exists with the same email ID"): the customer
+ *    already has portal access (a returning customer), so it counts as invited.
+ *  - CANNOT_PROCESS ("already invited, or under GDPR process") and other codes a
+ *    person must resolve are permanent; RECORD_LOCKED, NOT_REVIEWED, NOT_APPROVED and
+ *    server errors are retried.
+ *  - A 2xx with no record status counts as sent: retrying an unfamiliar success shape
+ *    would email the customer again and again.
  */
-export function inviteOutcome(httpStatus: number, body: string): "invited" | string {
+export function inviteOutcome(httpStatus: number, body: string): InviteOutcome {
   let rec: { status?: unknown; code?: unknown; message?: unknown } = {};
   try {
-    const j = JSON.parse(body) as { status?: unknown; code?: unknown; message?: unknown; data?: Array<typeof rec> };
-    rec = Array.isArray(j.data) && j.data[0] ? j.data[0] : j;
+    const j = JSON.parse(body) as { portal_invite?: unknown; data?: unknown; status?: unknown; code?: unknown; message?: unknown };
+    const list = Array.isArray(j.portal_invite) ? j.portal_invite : Array.isArray(j.data) ? j.data : null;
+    rec = (list?.[0] as typeof rec | undefined) ?? j;
   } catch { /* not JSON */ }
-  const text = `${String(rec.code ?? "")} ${String(rec.message ?? "")}`.trim() || body.slice(0, 200);
-  if (/already\s+(?:a\s+portal\s+user|invited|exists?|a\s+member)|ALREADY_/i.test(text)) return "invited";
-  // A 2xx without a record-level error counts as sent: retrying an unfamiliar success
-  // shape would email the customer again and again.
-  if (httpStatus >= 200 && httpStatus < 300 && (rec.status === "success" || rec.status === undefined)) return "invited";
-  return text || "no response body";
+  const code = typeof rec.code === "string" ? rec.code : "";
+  const text = `${code} ${String(rec.message ?? "")}`.trim() || body.slice(0, 200) || "no response body";
+  if (httpStatus >= 200 && httpStatus < 300 && (rec.status === "success" || rec.status === undefined)) return { invited: true };
+  if (code === "SUCCESS") return { invited: true };
+  if (code === "DUPLICATE_DATA") return { invited: true };
+  return { invited: false, error: text, permanent: PERMANENT_INVITE_CODES.has(code), code };
 }
 
 function fail(err: unknown): { ok: false; error: string } {
@@ -100,7 +144,7 @@ function fail(err: unknown): { ok: false; error: string } {
 }
 
 async function getDeal(dealId: string, fields: string[]): Promise<{ ok: true; deal: Record<string, unknown> } | { ok: false; error: string; permanent?: boolean }> {
-  const res = await fetch(`${V8}/Deals/${encodeURIComponent(dealId)}?fields=${fields.map(encodeURIComponent).join(",")}`, {
+  const res = await zfetch(`${V8}/Deals/${encodeURIComponent(dealId)}?fields=${fields.map(encodeURIComponent).join(",")}`, {
     headers: await auth(),
     ...timeout(),
   });
@@ -123,22 +167,27 @@ export const realEinPortalClient: EinPortalClient = {
       if (typeof contactId !== "string" || !contactId) {
         return { ok: false, permanent: true, error: `Deal ${dealId} has no linked Contact to invite` };
       }
-      const contactRes = await fetch(`${V8}/Contacts/${encodeURIComponent(contactId)}?fields=Email`, { headers: await auth(), ...timeout() });
+      const contactRes = await zfetch(`${V8}/Contacts/${encodeURIComponent(contactId)}?fields=Email`, { headers: await auth(), ...timeout() });
       if (!contactRes.ok) return { ok: false, error: `Zoho Contact read failed: ${await detail(contactRes)}` };
       const email = (((await contactRes.json().catch(() => ({}))) as { data?: Array<{ Email?: unknown }> }).data?.[0]?.Email ?? "");
       if (typeof email !== "string" || !email.trim() || email.trim().toLowerCase() !== expectedEmail.trim().toLowerCase()) {
         return { ok: false, permanent: true, error: `Deal ${dealId}: the linked Contact's email is not the customer's email` };
       }
       const qs = new URLSearchParams({ user_type_id: userTypeId, type: "invite", language: "en_US" });
-      const res = await fetch(`${V8}/Contacts/${encodeURIComponent(contactId)}/actions/portal_invite?${qs}`, {
+      const res = await zfetch(`${V8}/Contacts/${encodeURIComponent(contactId)}/actions/portal_invite?${qs}`, {
         method: "POST",
         headers: await auth(),
         ...timeout(),
       });
       const text = await res.text().catch(() => "");
       const outcome = inviteOutcome(res.status, text);
-      if (outcome === "invited") return { ok: true, value: { contactId } };
-      return { ok: false, error: `Zoho portal invite failed: ${res.status} ${outcome.slice(0, 300)}` };
+      if (outcome.invited) return { ok: true, value: { contactId } };
+      return {
+        ok: false,
+        permanent: outcome.permanent,
+        code: outcome.code,
+        error: `Zoho portal invite failed: ${res.status} ${outcome.error.slice(0, 300)}`,
+      };
     } catch (err) {
       return fail(err);
     }
@@ -171,7 +220,7 @@ export const realEinPortalClient: EinPortalClient = {
       const record: Record<string, unknown> = { [fields.docsReceived]: true };
       // Zoho DateTime format: ISO 8601 with offset, no milliseconds.
       if (fields.docsReceivedAt) record[fields.docsReceivedAt] = at.toISOString().replace(/\.\d{3}Z$/, "+00:00");
-      const res = await fetch(`${V8}/Deals/${encodeURIComponent(dealId)}`, {
+      const res = await zfetch(`${V8}/Deals/${encodeURIComponent(dealId)}`, {
         method: "PUT",
         headers: { ...(await auth()), "Content-Type": "application/json" },
         ...timeout(),
@@ -192,7 +241,7 @@ export const realEinPortalClient: EinPortalClient = {
         .filter((id): id is string => typeof id === "string" && id !== "")
         .map((id) => ({ id, _delete: null }));
       if (deletes.length !== images.length) return { ok: false, error: `Deal ${dealId}: passport image entries without ids` };
-      const res = await fetch(`${V8}/Deals/${encodeURIComponent(dealId)}`, {
+      const res = await zfetch(`${V8}/Deals/${encodeURIComponent(dealId)}`, {
         method: "PUT",
         headers: { ...(await auth()), "Content-Type": "application/json" },
         ...timeout(),
