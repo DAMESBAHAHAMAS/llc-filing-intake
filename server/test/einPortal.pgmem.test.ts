@@ -6,7 +6,7 @@ vi.hoisted(() => {
   process.env.DATABASE_URL ??= "postgres://unused.invalid/none";
 });
 import { einPortalConfig } from "../src/ein/onboarding.js";
-import { registerEinDeals, runEinPortalInvitesOnce, runEinPortalSweepOnce, type EinPortalDeps } from "../src/ein/portalJobs.js";
+import { einInviteExpected, registerEinDeals, runEinPortalInvitesOnce, runEinPortalSweepOnce, type EinPortalDeps } from "../src/ein/portalJobs.js";
 import type { DealSnapshot, EinPortalClient } from "../src/zoho/einPortal.js";
 
 /**
@@ -28,8 +28,8 @@ const BASE = `
   );
 `;
 
-function migration0030(): string {
-  return readFileSync(new URL("../migrations/0030_ein_portal_deals.sql", import.meta.url), "utf8")
+function migration(file: string): string {
+  return readFileSync(new URL(`../migrations/${file}`, import.meta.url), "utf8")
     .replace(/^--.*$/gm, "")
     .replace(/CREATE INDEX[^;]*;/g, "")
     .replace(/ALTER TABLE \w+ ENABLE ROW LEVEL SECURITY;/g, "");
@@ -48,7 +48,8 @@ async function setup() {
   const { Pool } = db.adapters.createPg();
   const pool = new Pool();
   await pool.query(BASE);
-  await pool.query(migration0030());
+  await pool.query(migration("0030_ein_portal_deals.sql"));
+  await pool.query(migration("0031_ein_portal_deals_failures.sql"));
   await pool.query(`INSERT INTO filing_sessions VALUES ('${S1}', 'ada@example.test'), ('${S2}', 'eve@example.test')`);
   const ein = JSON.stringify([{ offer_code: "FASTTRACK" }]);
   const diy = JSON.stringify([{ offer_code: "DIY_STATE_FEE" }]);
@@ -137,5 +138,34 @@ describe("EIN portal jobs against pg-mem", () => {
     await t.pool.query(`UPDATE orders SET payment_status = 'refunded' WHERE order_id = $1`, [O2]);
     await runEinPortalSweepOnce(t.deps);
     expect((await t.pool.query(`SELECT closed_seen_at FROM ein_portal_deals`)).rows[0].closed_seen_at).not.toBeNull();
+  });
+
+  it("expects an invite only for an EIN order whose Deal came from intake, not one this server created", async () => {
+    const t = await setup();
+    // O1 (EIN, Deal id set at payment, no order_deal job): an invite can go out.
+    expect(await einInviteExpected(t.pool, { orderId: O1 })).toBe(true);
+    expect(await einInviteExpected(t.pool, { filingSessionId: S1 })).toBe(true);
+    // O2 (EIN, Deal created by this server through an order_deal job): no Contact, no promise.
+    expect(await einInviteExpected(t.pool, { orderId: O2 })).toBe(false);
+    // O3 (DIY, no EIN): nothing to promise.
+    expect(await einInviteExpected(t.pool, { orderId: O3 })).toBe(false);
+    // An EIN order with no Deal id yet: no promise.
+    await t.pool.query(`UPDATE orders SET crm_deal_id = NULL WHERE order_id = $1`, [O1]);
+    expect(await einInviteExpected(t.pool, { orderId: O1 })).toBe(false);
+  });
+
+  it("records a failing Deal read in failing_since (migration 0031) and clears it after a good pass", async () => {
+    const t = await setup();
+    const readDeal = t.deps.zoho.readDeal;
+    t.deps.zoho = { ...t.deps.zoho, readDeal: async () => ({ ok: false, error: "Zoho Deal read failed: 500" }) };
+    await runEinPortalSweepOnce(t.deps);
+    let row = (await t.pool.query(`SELECT last_error, failing_since FROM ein_portal_deals`)).rows[0];
+    expect(row.last_error).toBe("Deal read failed: Zoho Deal read failed: 500");
+    expect(new Date(row.failing_since)).toEqual(NOW);
+    t.deps.zoho = { ...t.deps.zoho, readDeal };
+    t.setNow(new Date(NOW.getTime() + 3600_000));
+    await runEinPortalSweepOnce(t.deps);
+    row = (await t.pool.query(`SELECT last_error, failing_since FROM ein_portal_deals`)).rows[0];
+    expect(row).toEqual({ last_error: null, failing_since: null });
   });
 });

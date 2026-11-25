@@ -10,6 +10,7 @@ vi.hoisted(() => {
 import {
   einIncluded,
   einPortalConfig,
+  einPortalConfigIssues,
   invitesEnabled,
   packageFromCodes,
   portalUrlFor,
@@ -21,6 +22,7 @@ import {
   INVITE_MAX_ATTEMPTS,
   cancellationPurgeDue,
   daysPassedSinceDate,
+  newYorkMidnightUtc,
   registerEinDeals,
   runEinPortalInvitesOnce,
   runEinPortalSweepOnce,
@@ -110,11 +112,33 @@ describe("configuration", () => {
     expect(safeHttpsUrl(" https://clients.example.test/x ")).toBe("https://clients.example.test/x");
   });
 
-  it("rejects malformed user type ids and field names", () => {
-    const c = einPortalConfig({ EIN_PORTAL_USER_TYPE_ID: "12a", EIN_PASSPORT_FIELD: "Passport Photo", EIN_PASSPORT_PURGE_DAYS: "-3" });
+  it("falls back to the defaults for malformed or empty field names, lists and numbers, and reports them", () => {
+    const env = {
+      EIN_ONBOARDING_ENABLED: "true",
+      EIN_PORTAL_URL: "http://not-https.example.test",
+      EIN_PORTAL_USER_TYPE_ID: "12a",
+      EIN_PASSPORT_FIELD: "Passport Photo",
+      EIN_ISSUED_DATE_FIELD: "",
+      EIN_PURGE_STAGES: " , ",
+      EIN_PASSPORT_PURGE_DAYS: "-3",
+    };
+    const c = einPortalConfig(env);
     expect(c.portalUserTypeId).toBe("");
-    expect(c.passportField).toBe("");
+    expect(c.portalUrl).toBe("");
+    expect(c.passportField).toBe("Passport_Photo_Page");
+    expect(c.einIssuedDateField).toBe("EIN_Issued_Date");
+    expect(c.purgeStages).toEqual(["Cancelled"]);
     expect(c.purgeDays).toBe(30);
+    expect(sweepEnabled(c)).toBe(true);
+    expect(einPortalConfigIssues(env)).toEqual([
+      "EIN_PASSPORT_FIELD is not a Zoho API name; using Passport_Photo_Page",
+      "EIN_PORTAL_URL is not an https URL: no portal link, no invites",
+      "EIN_PORTAL_USER_TYPE_ID is not numeric: no invites",
+      "EIN_PASSPORT_PURGE_DAYS is not a positive whole number; using 30",
+    ]);
+    expect(
+      einPortalConfigIssues({ EIN_ONBOARDING_ENABLED: "true", EIN_PORTAL_URL: "https://mysecuredocuments.zcrmportals.com/portal/mysecuredocuments/crm/login.sas", EIN_PORTAL_USER_TYPE_ID: "2654294000099000001" }),
+    ).toEqual([]);
   });
 
   it("needs the user type for invites and the passport field for the sweep", () => {
@@ -126,9 +150,20 @@ describe("configuration", () => {
     expect(sweepEnabled(cfg({ enabled: false }))).toBe(false);
   });
 
-  it("dates the retention periods", () => {
-    expect(daysPassedSinceDate("2026-11-01", 30, new Date("2026-11-30T23:59:59Z"))).toBe(false);
-    expect(daysPassedSinceDate("2026-11-01", 30, new Date("2026-12-01T00:00:00Z"))).toBe(true);
+  it("dates the EIN retention period to midnight in New York, not UTC", () => {
+    // 1 Nov + 30 days = 1 Dec, midnight EST = 05:00 UTC.
+    expect(newYorkMidnightUtc("2026-12-01")).toBe(Date.parse("2026-12-01T05:00:00Z"));
+    expect(daysPassedSinceDate("2026-11-01", 30, new Date("2026-12-01T04:59:59Z"))).toBe(false);
+    expect(daysPassedSinceDate("2026-11-01", 30, new Date("2026-12-01T05:00:00Z"))).toBe(true);
+    // Summer (EDT, UTC-4): 1 Jun + 30 days = 1 Jul, midnight = 04:00 UTC.
+    expect(daysPassedSinceDate("2026-06-01", 30, new Date("2026-07-01T03:59:59Z"))).toBe(false);
+    expect(daysPassedSinceDate("2026-06-01", 30, new Date("2026-07-01T04:00:00Z"))).toBe(true);
+    // Across the November clock change and a month end.
+    expect(newYorkMidnightUtc("2026-11-01")).toBe(Date.parse("2026-11-01T04:00:00Z"));
+    expect(newYorkMidnightUtc("2026-11-02")).toBe(Date.parse("2026-11-02T05:00:00Z"));
+    expect(newYorkMidnightUtc("2026-03-08")).toBe(Date.parse("2026-03-08T05:00:00Z"));
+    expect(newYorkMidnightUtc("2026-03-09")).toBe(Date.parse("2026-03-09T04:00:00Z"));
+    expect(daysPassedSinceDate("not-a-date", 30, new Date())).toBe(false);
     const seen = new Date("2026-11-01T12:00:00Z");
     expect(cancellationPurgeDue(seen, 30, new Date("2026-11-30T11:59:59Z"))).toBe(false);
     expect(cancellationPurgeDue(seen, 30, new Date("2026-11-30T12:00:00Z"))).toBe(true);
@@ -237,6 +272,8 @@ interface DealRow {
   next_check_at: Date;
   retired_at: Date | null;
   last_error: string | null;
+  failing_since: Date | null;
+  alerted_error: string | null;
   created_at: Date;
 }
 
@@ -267,7 +304,7 @@ function memoryDb(orders: OrderRow[], deals: Map<string, DealRow>, emails: Recor
           zoho_deal_id: id, filing_session_id: sid, first_order_id: orderId,
           invite_status: "pending", invite_attempts: 0, invite_claimed_at: null, invited_at: null, zoho_contact_id: null,
           docs_received_at: null, closed_seen_at: null, passport_purged_at: null, next_check_at: now, retired_at: null,
-          last_error: null, created_at: now,
+          last_error: null, failing_since: null, alerted_error: null, created_at: now,
         });
         return { rows: [], rowCount: 1 };
       }
@@ -308,34 +345,32 @@ function memoryDb(orders: OrderRow[], deals: Map<string, DealRow>, emails: Recor
         const rows = [...deals.values()]
           .filter((d) => d.retired_at === null && d.next_check_at <= now)
           .sort((a, b) => a.next_check_at.getTime() - b.next_check_at.getTime())
-          .map((d) => ({
-            zoho_deal_id: d.zoho_deal_id,
-            docs_received_at: d.docs_received_at,
-            closed_seen_at: d.closed_seen_at,
-            passport_purged_at: d.passport_purged_at,
-            last_error: d.last_error,
-          }));
+          .map((d) => ({ zoho_deal_id: d.zoho_deal_id }));
         return { rows };
       }
-      if (sql.includes("SET docs_received_at = $2, updated_at = $2")) {
+      if (sql.includes("SET next_check_at = $3, updated_at = $2")) {
+        const [id, now, leaseUntil] = params as [string, Date, Date];
+        const d = deals.get(id)!;
+        if (d.retired_at !== null || d.next_check_at > now) return { rows: [] };
+        d.next_check_at = leaseUntil;
+        const { zoho_deal_id, docs_received_at, closed_seen_at, passport_purged_at, failing_since, alerted_error } = d;
+        return { rows: [{ zoho_deal_id, docs_received_at, closed_seen_at, passport_purged_at, failing_since, alerted_error }] };
+      }
+      if (sql.includes("SET docs_received_at = $2 WHERE zoho_deal_id = $1 AND docs_received_at IS NULL")) {
         const [id, now] = params as [string, Date];
         const d = deals.get(id)!;
-        if (d.docs_received_at) return { rows: [] };
-        d.docs_received_at = now;
-        return { rows: [{ zoho_deal_id: id }] };
-      }
-      if (sql.includes("SET docs_received_at = NULL")) {
-        deals.get(params[0] as string)!.docs_received_at = null;
+        if (!d.docs_received_at) d.docs_received_at = now;
         return { rows: [] };
       }
-      if (sql.includes("SET last_error = $2, next_check_at = $3")) {
-        const [id, error, next] = params as [string, string, Date];
-        Object.assign(deals.get(id)!, { last_error: error, next_check_at: next });
-        return { rows: [] };
-      }
-      if (sql.includes("SET closed_seen_at = $2, passport_purged_at = $3")) {
-        const [id, closed, purged, error, next, retired] = params as [string, Date | null, Date | null, string | null, Date, Date | null];
-        Object.assign(deals.get(id)!, { closed_seen_at: closed, passport_purged_at: purged, last_error: error, next_check_at: next, retired_at: retired });
+      if (sql.includes("SET closed_seen_at = $2, passport_purged_at = COALESCE($3, passport_purged_at)")) {
+        const [id, closed, purged, error, failingSince, alertedError, next, retired] = params as [
+          string, Date | null, Date | null, string | null, Date | null, string | null, Date, Date | null,
+        ];
+        const d = deals.get(id)!;
+        Object.assign(d, {
+          closed_seen_at: closed, passport_purged_at: purged ?? d.passport_purged_at, last_error: error,
+          failing_since: failingSince, alerted_error: alertedError, next_check_at: next, retired_at: retired,
+        });
         return { rows: [] };
       }
       throw new Error(`unexpected SQL: ${sql}`);
@@ -550,12 +585,12 @@ describe("docs received and passport retention sweep", () => {
   it("clears the passport 30 days after the EIN is issued, not before", async () => {
     const zohoDeals = new Map([["deal-1", deal({ passportFiles: [IMG], docsReceived: true, einIssuedDate: "2026-11-01" })]]);
     const t = sweepSetup(zohoDeals);
-    t.setNow(new Date("2026-11-30T23:00:00Z"));
+    t.setNow(new Date("2026-12-01T04:30:00Z")); // 23:30 on 30 Nov in New York
     expect((await runEinPortalSweepOnce(t.deps)).purged).toEqual([]);
-    t.setNow(new Date("2026-12-01T00:30:00Z"));
+    t.setNow(new Date("2026-12-01T05:30:00Z"));
     expect((await runEinPortalSweepOnce(t.deps)).purged).toEqual(["deal-1"]);
     expect(t.calls).toContain("clear deal-1 Passport_Photo_Page");
-    expect(t.deals.get("deal-1")).toMatchObject({ passport_purged_at: new Date("2026-12-01T00:30:00Z"), retired_at: null });
+    expect(t.deals.get("deal-1")).toMatchObject({ passport_purged_at: new Date("2026-12-01T05:30:00Z"), retired_at: null });
     expect(t.deals.get("deal-1")?.docs_received_at).not.toBeNull();
   });
 
@@ -646,7 +681,7 @@ describe("docs received and passport retention sweep", () => {
     const r = await runEinPortalSweepOnce(t.deps);
     expect(r.purged).toEqual([]);
     expect(r.errors[0]).toContain("still there");
-    expect(t.deals.get("deal-1")?.last_error).toBe("still there");
+    expect(t.deals.get("deal-1")?.last_error).toBe("passport purge failed: still there");
     t.setNow(new Date(NOW.getTime() + 3600_000));
     await runEinPortalSweepOnce(t.deps);
     expect(t.alerts.filter((a) => a.subject === "EIN passport purge failed")).toHaveLength(1);
@@ -656,15 +691,81 @@ describe("docs received and passport retention sweep", () => {
     expect(t.deals.get("deal-1")?.last_error).toBeNull();
   });
 
-  it("undoes the docs-received claim if the Deal write fails, and keeps going past an unreadable Deal", async () => {
+  it("still clears a due passport when the EIN Docs Received write fails, and alerts once if that keeps failing", async () => {
+    const zohoDeals = new Map([["deal-1", deal({ passportFiles: [IMG], einIssuedDate: "2026-10-01" })]]);
+    const t = sweepSetup(zohoDeals);
+    t.zoho.markDocsReceived = async () => ({ ok: false, error: "Zoho Deal update failed: 500" });
+    // Pass 1: the write fails, the purge still runs.
+    let r = await runEinPortalSweepOnce(t.deps);
+    expect(r.purged).toEqual(["deal-1"]);
+    expect(r.errors).toEqual(["deal-1: EIN Docs Received update failed: Zoho Deal update failed: 500"]);
+    expect(t.deals.get("deal-1")).toMatchObject({ docs_received_at: null, failing_since: NOW, next_check_at: NOW });
+    expect(t.alerts).toEqual([]);
+    // A fresh upload keeps the write failing; no alert until it has failed for a day.
+    zohoDeals.get("deal-1")!.passportFiles = [IMG];
+    t.setNow(new Date(NOW.getTime() + 23 * 3600_000));
+    r = await runEinPortalSweepOnce(t.deps);
+    expect(r.purged).toEqual(["deal-1"]);
+    expect(t.alerts).toEqual([]);
+    zohoDeals.get("deal-1")!.passportFiles = [IMG];
+    t.setNow(new Date(NOW.getTime() + 24 * 3600_000));
+    await runEinPortalSweepOnce(t.deps);
+    zohoDeals.get("deal-1")!.passportFiles = [IMG];
+    t.setNow(new Date(NOW.getTime() + 25 * 3600_000));
+    await runEinPortalSweepOnce(t.deps);
+    expect(t.alerts.map((a) => a.subject)).toEqual(["EIN portal sweep keeps failing"]);
+    expect(t.alerts[0].body).toContain("deal-1");
+  });
+
+  it("alerts once when a Deal read keeps failing, and clears the failure after a good pass", async () => {
+    const zohoDeals = new Map<string, DealSnapshot>();
+    const t = sweepSetup(zohoDeals);
+    await runEinPortalSweepOnce(t.deps);
+    expect(t.deals.get("deal-1")).toMatchObject({ last_error: "Deal read failed: not found", failing_since: NOW });
+    for (const hours of [12, 24, 25, 30]) {
+      t.setNow(new Date(NOW.getTime() + hours * 3600_000));
+      await runEinPortalSweepOnce(t.deps);
+    }
+    expect(t.alerts.map((a) => a.subject)).toEqual(["EIN portal sweep keeps failing"]);
+    zohoDeals.set("deal-1", deal());
+    t.setNow(new Date(NOW.getTime() + 31 * 3600_000));
+    await runEinPortalSweepOnce(t.deps);
+    expect(t.deals.get("deal-1")).toMatchObject({ last_error: null, failing_since: null, alerted_error: null });
+  });
+
+  it("keeps going past an unreadable Deal", async () => {
     const zohoDeals = new Map([["deal-2", deal({ passportFiles: [IMG] })]]);
     const t = sweepSetup(zohoDeals, [order(), order({ order_id: "ord-2", filing_session_id: "sess-2", crm_deal_id: "deal-2" })]);
-    t.zoho.markDocsReceived = async () => ({ ok: false, error: "Zoho Deal update failed: 500" });
     const r = await runEinPortalSweepOnce(t.deps);
-    expect(r.errors).toEqual(["deal-1: not found", "deal-2: Zoho Deal update failed: 500"]);
-    expect(t.deals.get("deal-2")?.docs_received_at).toBeNull();
-    expect(t.deals.get("deal-1")?.next_check_at).toEqual(new Date(NOW.getTime() + DAY));
-    expect(t.alerts).toEqual([]);
+    expect(r.errors).toEqual(["deal-1: Deal read failed: not found"]);
+    expect(r.docsReceived).toEqual(["deal-2"]);
+  });
+
+  it("an overlapping pass skips a row another pass has leased, and never un-purges it", async () => {
+    const zohoDeals = new Map([["deal-1", deal({ passportFiles: [IMG], docsReceived: true, einIssuedDate: "2026-10-01" })]]);
+    const t = sweepSetup(zohoDeals);
+    await registerEinDeals(t.deps);
+    // Pass A leases the row and is slow inside Zoho; pass B starts meanwhile.
+    let releaseA: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (releaseA = resolve));
+    const realRead = t.zoho.readDeal.bind(t.zoho);
+    let first = true;
+    t.zoho.readDeal = async (id, f) => {
+      if (first) {
+        first = false;
+        await gate;
+      }
+      return realRead(id, f);
+    };
+    const passA = runEinPortalSweepOnce(t.deps);
+    await new Promise((r) => setTimeout(r, 0));
+    const passB = await runEinPortalSweepOnce(t.deps);
+    expect(passB).toEqual({ docsReceived: [], purged: [], errors: [] });
+    releaseA();
+    expect((await passA).purged).toEqual(["deal-1"]);
+    expect(t.calls.filter((c) => c.startsWith("clear"))).toHaveLength(1);
+    expect(t.deals.get("deal-1")?.passport_purged_at).toEqual(NOW);
+    expect(t.alerts.map((x) => x.subject)).toEqual(["EIN docs received"]);
   });
 });
 
@@ -712,12 +813,24 @@ describe("realEinPortalClient", () => {
   });
 
   it("reads portal_invite answers: top-level success, already a portal user, unfamiliar 2xx, errors", () => {
-    expect(inviteOutcome(200, JSON.stringify({ status: "success", code: "SUCCESS", details: { record_id: "c-9" } }))).toBe("invited");
-    expect(inviteOutcome(200, JSON.stringify({ data: [{ status: "success" }] }))).toBe("invited");
-    expect(inviteOutcome(202, "")).toBe("invited");
-    expect(inviteOutcome(400, JSON.stringify({ code: "ALREADY_INVITED", message: "user already invited", status: "error" }))).toBe("invited");
-    expect(inviteOutcome(200, JSON.stringify({ status: "error", code: "NO_PERMISSION", message: "permission denied" }))).toBe("NO_PERMISSION permission denied");
-    expect(inviteOutcome(500, "oops")).toBe("oops");
+    const err = (code: string, message: string, http = 400) => inviteOutcome(http, JSON.stringify({ portal_invite: [{ code, details: {}, message, status: "error" }] }));
+    // Zoho's documented v8 wrapper.
+    expect(
+      inviteOutcome(200, JSON.stringify({ portal_invite: [{ code: "SUCCESS", details: { record_id: "c-9" }, message: "An Invite has been sent to the personality.", status: "success" }] })),
+    ).toEqual({ invited: true });
+    expect(inviteOutcome(200, JSON.stringify({ data: [{ status: "success" }] }))).toEqual({ invited: true });
+    expect(inviteOutcome(200, JSON.stringify({ status: "success", code: "SUCCESS" }))).toEqual({ invited: true });
+    expect(inviteOutcome(202, "")).toEqual({ invited: true });
+    // A portal user already has this email: a returning customer, already has access.
+    expect(err("DUPLICATE_DATA", "The invitation failed as a portal user exists with the same email ID")).toEqual({ invited: true });
+    // Already invited or under GDPR, and other codes a person must fix: permanent.
+    for (const code of ["CANNOT_PROCESS", "INVALID_DATA", "LICENSE_LIMIT_EXCEEDED", "REQUIRED_PARAM_MISSING"]) {
+      expect(err(code, "x")).toMatchObject({ invited: false, permanent: true });
+    }
+    expect(err("NO_PERMISSION", "permission denied", 403)).toEqual({ invited: false, permanent: true, error: "NO_PERMISSION permission denied" });
+    // Worth retrying.
+    for (const code of ["RECORD_LOCKED", "NOT_REVIEWED", "NOT_APPROVED"]) expect(err(code, "x")).toMatchObject({ invited: false, permanent: false });
+    expect(inviteOutcome(500, "oops")).toEqual({ invited: false, permanent: false, error: "oops" });
   });
 
   it("sends each Zoho call with a timeout", async () => {
