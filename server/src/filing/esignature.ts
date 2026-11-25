@@ -4,8 +4,9 @@
  *
  * The website (florida-business-launchpad src/lib/canonicalFilingData.ts,
  * buildEsignature) sends filing_data.esignature once the Signature step is
- * complete: the typed full legal name, the signer's title, the 18+ and
- * consent confirmations, the consent wording and its version, and signed_at
+ * complete: the typed full legal name, the signer's title, the consent
+ * confirmation (plus the 18+ confirmation on records sent before Dispatch 7B
+ * removed that box), the consent wording and its version, and signed_at
  * (the browser's clock). The browser's clock is not trusted on its own, so
  * POST /api/session/stage stamps the server's receipt time, the client IP
  * and the user agent onto the same record before it is stored.
@@ -49,7 +50,10 @@ export function stampEsignature(
   const record: ESignatureRecord = {
     signer_name: signerName,
     signer_title: cleanText(r.signer_title, 100),
-    over_18_confirmed: r.over_18_confirmed === true,
+    // 7B: the website no longer has an 18+ box, so new records omit the
+    // field. Keep it only when the client actually sent a boolean, so an
+    // absent answer is never stored as "false" (a refusal).
+    over_18_confirmed: typeof r.over_18_confirmed === "boolean" ? r.over_18_confirmed : undefined,
     consent_text: cleanText(r.consent_text),
     consent_version: cleanText(r.consent_version, 60),
     method: cleanText(r.method, 40),
