@@ -388,7 +388,8 @@
 
   <div class="signature-block">
     <p class="signature-label">Signature of Authorized Person / Authorized Representative</p>
-    {% if esignature %}
+    {# 'is defined' first: render_pdf.py uses StrictUndefined, and llc-pdf-generator can deploy before llc-data-spine. #}
+    {% if esignature is defined and esignature %}
     {# T144 D9: typed electronic signature captured at intake. The audit record (time, IP, consent) is kept by the data spine, never printed here. #}
     <p class="esignature">/s/ {{ esignature.signer_name }}</p>
     <p class="esignature-detail">{{ esignature.signer_name }}{% if esignature.signer_title %}, {{ esignature.signer_title }}{% endif %} &middot; Electronically signed {{ esignature.signed_date }}</p>

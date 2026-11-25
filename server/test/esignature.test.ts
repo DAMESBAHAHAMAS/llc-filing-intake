@@ -80,6 +80,11 @@ describe("buildPdfContext e-signature and name case (T144 D9)", () => {
     expect(r.ok && r.context.esignature).toEqual({ signer_name: "Jordan Test Rivera", signer_title: "Manager", signed_date: "November 25, 2026" });
   });
 
+  it("ignores a non-string title instead of throwing", () => {
+    const r = buildPdfContext({ ...record, esignature: { ...signed, signer_title: 7 as unknown as string } }, null);
+    expect(r.ok && r.context.esignature).toMatchObject({ signer_title: "" });
+  });
+
   it("never puts the IP or user agent into the PDF context", () => {
     const fd = stampEsignature({ ...record, esignature: signed }, stamp) as Partial<FilingSessionRecord>;
     const r = buildPdfContext(fd, null);

@@ -112,7 +112,11 @@ export function buildPdfContext(
   const sigTime = sig?.server_received_at ?? sig?.signed_at;
   const esignature =
     sig && isNonEmptyString(sig.signer_name) && isNonEmptyString(sigTime) && !Number.isNaN(Date.parse(sigTime))
-      ? { signer_name: sig.signer_name.trim(), signer_title: sig.signer_title?.trim() ?? "", signed_date: floridaLongDate(sigTime) }
+      ? {
+          signer_name: sig.signer_name.trim(),
+          signer_title: typeof sig.signer_title === "string" ? sig.signer_title.trim() : "",
+          signed_date: floridaLongDate(sigTime),
+        }
       : null;
 
   return {
