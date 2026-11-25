@@ -9,9 +9,15 @@ import { houseAgentLineMissing } from "../offers/houseAgentRule.js";
 import { einLineIssue } from "../offers/einBundleRule.js";
 import { getEinUpsell, orderedOfferCodes } from "../offers/einUpsell.js";
 import { holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
-import { einIncluded, einPortalConfig, packageFromCodes, portalUrlFor } from "../ein/onboarding.js";
+import { einIncluded, einPortalConfig, invitesEnabled, packageFromCodes, portalUrlFor } from "../ein/onboarding.js";
 
 export const checkoutRouter = Router();
+
+/** ST17: the portal link the success page may show: only once invites go out. */
+function successPagePortalUrl(): string | null {
+  const cfg = einPortalConfig();
+  return invitesEnabled(cfg) ? portalUrlFor(cfg) : null;
+}
 
 interface RequestedLineItem {
   offer_code: string;
@@ -248,7 +254,8 @@ checkoutRouter.get("/api/checkout/order/:orderId", async (req, res) => {
     // ST17: the package and whether the EIN is included come from the session's held or
     // paid orders, so the success page never reads them from the URL. ein_portal_url is
     // the Zoho CRM Portal sign-in (the same for every customer, no customer data), set
-    // only for an order that includes the EIN and only once the portal is switched on.
+    // only for an order that includes the EIN and only once invites go out (the page
+    // tells the customer an invitation is on its way).
     // Like the upsell, a failure here never breaks the page.
     let ein: { package: string | null; ein_included: boolean; ein_portal_url: string | null } = {
       package: null,
@@ -262,7 +269,7 @@ checkoutRouter.get("/api/checkout/order/:orderId", async (req, res) => {
         ein = {
           package: packageFromCodes(codes),
           ein_included: included,
-          ein_portal_url: included ? portalUrlFor(einPortalConfig()) : null,
+          ein_portal_url: included ? successPagePortalUrl() : null,
         };
       }
     } catch (einErr) {
