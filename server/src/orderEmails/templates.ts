@@ -36,6 +36,9 @@ export interface OrderEmailRow {
   entity_name_backup: string | null;
   filing_data: Record<string, unknown> | null;
   registered_agent_status: string | null;
+  /** ST17: the Zoho CRM Portal sign-in URL, set only when this order includes the EIN
+   *  and the portal is switched on (worker.ts). */
+  ein_portal_url?: string | null;
 }
 
 interface Person {
@@ -65,6 +68,7 @@ interface OrderEmailContext {
   agentName: string;
   agentAddress: string;
   agentAcceptancePending: boolean;
+  einPortalUrl: string;
 }
 
 export interface RenderedEmail {
@@ -132,6 +136,7 @@ function buildContext(row: OrderEmailRow, paymentMode: PaymentMode): OrderEmailC
         ? customerText(data.registered_agent_florida_address)
         : "",
     agentAcceptancePending: customerAgent && row.registered_agent_status !== "accepted",
+    einPortalUrl: row.ein_portal_url ?? "",
   };
 }
 
@@ -283,6 +288,17 @@ function orderConfirmation(ctx: OrderEmailContext): RenderedEmail {
     ]),
     heading("Payment"),
     ...paymentTerms(ctx),
+    // ST17: identity documents go through the Zoho CRM Portal, never by email.
+    ...(ctx.einPortalUrl
+      ? [
+          heading("Next Step: Your EIN"),
+          rich(
+            "Your order includes your IRS EIN. You'll get a separate email inviting you to our secure client portal. ",
+            { link: "Sign in to the portal", href: ctx.einPortalUrl },
+            " to confirm your details and upload your passport photo page, so we can file your Form SS-4 as soon as your LLC is approved. Please don't send your passport by email.",
+          ),
+        ]
+      : []),
   ], { separateFooter: true });
 }
 

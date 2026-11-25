@@ -13,6 +13,8 @@ import { offersRouter } from "./routes/offers.js";
 import { filingDocumentRouter } from "./routes/filingDocument.js";
 import { ordersRouter } from "./routes/orders.js";
 import { scorecardRouter } from "./routes/scorecard.js";
+import { einOnboardingRouter } from "./routes/einOnboarding.js";
+import { defaultEinPortalDeps, runEinPortalInvitesOnce, runEinPortalSweepOnce } from "./ein/portalJobs.js";
 import { runScorecardTick } from "./scorecard/service.js";
 import { realScorecardSender } from "./scorecard/sender.js";
 import { runHoldSweepOnce } from "./fulfillment/holdSweep.js";
@@ -62,6 +64,7 @@ app.use(offersRouter);
 app.use(filingDocumentRouter);
 app.use(ordersRouter);
 app.use(scorecardRouter);
+app.use(einOnboardingRouter);
 
 const port = Number(process.env.PORT ?? 3000);
 app.listen(port, () => {
@@ -147,4 +150,33 @@ if (scorecardPollerIntervalMs > 0) {
     });
   }, scorecardPollerIntervalMs);
   console.log(`Scorecard poller running every ${scorecardPollerIntervalMs}ms`);
+}
+
+/**
+ * ST17 EIN onboarding through the Zoho CRM Portal (ein/portalJobs.ts). Both jobs do
+ * nothing unless EIN_ONBOARDING_ENABLED=true and their settings are present.
+ * Invites every 10 minutes by default (EIN_PORTAL_INVITE_INTERVAL_MS). The
+ * docs-received / passport-retention sweep runs hourly by default
+ * (EIN_PORTAL_SWEEP_INTERVAL_MS), not daily: a 24-hour timer restarts on every
+ * deploy and could go days without firing. Each pass is idempotent. 0 disables either.
+ */
+const einInviteIntervalMs = Number(process.env.EIN_PORTAL_INVITE_INTERVAL_MS ?? 10 * 60_000);
+if (einInviteIntervalMs > 0) {
+  setInterval(() => {
+    runEinPortalInvitesOnce(defaultEinPortalDeps(pool)).catch((err) => {
+      console.error("[ein portal invites] tick failed", err);
+    });
+  }, einInviteIntervalMs);
+}
+const einSweepIntervalMs = Number(process.env.EIN_PORTAL_SWEEP_INTERVAL_MS ?? 60 * 60_000);
+if (einSweepIntervalMs > 0) {
+  setInterval(() => {
+    runEinPortalSweepOnce(defaultEinPortalDeps(pool))
+      .then((r) => {
+        if (r.errors.length > 0) console.error("[ein portal sweep] errors", r.errors);
+      })
+      .catch((err) => {
+        console.error("[ein portal sweep] tick failed", err);
+      });
+  }, einSweepIntervalMs);
 }
