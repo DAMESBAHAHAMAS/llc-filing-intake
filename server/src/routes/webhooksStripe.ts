@@ -6,6 +6,7 @@ import { verifyStripeSignature, WebhookSignatureError } from "../stripe/webhookS
 import { orderDealFields } from "../zoho/client.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
+import { shouldSendAfterPayment } from "../registeredAgent/acceptancePolicy.js";
 import { alertEmailsNotQueued, CHECKOUT_EMAIL_TYPES, enqueueCustomerEmails } from "../orderEmails/worker.js";
 import {
   classifyCheckoutCompletion,
@@ -256,7 +257,10 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
             processingResult = held ? "held_deal_enqueued" : "paid_deal_enqueued";
           }
 
-          shouldSendRegisteredAgentEmail = blockedOnRegisteredAgent;
+          // Not when a request is already live: since the website's ST06
+          // change the customer can send it from the interview, and a
+          // second send would expire the link the agent already has.
+          shouldSendRegisteredAgentEmail = shouldSendAfterPayment(registeredAgentPath, registeredAgentStatus);
           paidFilingSessionId = order.filing_session_id;
 
           // Welcome, order confirmation and intake summary. Queued here so

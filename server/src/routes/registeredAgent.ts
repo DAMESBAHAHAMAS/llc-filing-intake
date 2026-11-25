@@ -3,6 +3,7 @@ import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
+import { isDuplicateAcceptanceRequest, type LatestAcceptanceRow } from "../registeredAgent/acceptancePolicy.js";
 
 export const registeredAgentRouter = Router();
 
@@ -203,6 +204,22 @@ registeredAgentRouter.post("/api/registered-agent/request-acceptance", async (re
       return;
     }
 
+    // Idempotent: a live request to this same agent is not sent again (a
+    // repeat click, a second device, a retry). Each send expires the last
+    // link, so a duplicate would break the one the agent already has.
+    // { force: true } resends anyway (an operator "resend now").
+    if (body.force !== true) {
+      const latest = await pool.query<LatestAcceptanceRow>(
+        `SELECT status, registered_agent_email, registered_agent_name, requested_at
+         FROM registered_agent_acceptances WHERE filing_session_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [filingSessionId]
+      );
+      if (isDuplicateAcceptanceRequest(latest.rows[0], registeredAgentName, registeredAgentEmail)) {
+        res.status(200).json({ email_sent: false, already_requested: true });
+        return;
+      }
+    }
+
     // registered_agent_florida_address may already be set (e.g. this
     // session already went through POST /registered-agent/select) — do
     // not clobber a real address with an empty one if this caller only
@@ -224,7 +241,7 @@ registeredAgentRouter.post("/api/registered-agent/request-acceptance", async (re
       registered_agent_email: registeredAgentEmail,
     });
 
-    const result = await dispatchAcceptanceEmail(pool, filingSessionId);
+    const result = await dispatchAcceptanceEmail(pool, filingSessionId, { email: registeredAgentEmail });
     if (!result.ok) {
       res.status(502).json({ error: "request-acceptance email failed to send", detail: result.reason });
       return;
