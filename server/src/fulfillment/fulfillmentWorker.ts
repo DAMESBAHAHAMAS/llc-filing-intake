@@ -1,6 +1,7 @@
 import type { Pool } from "pg";
 import { backoffForAttempt, isDeadLetter } from "../sync/backoff.js";
 import { buildPdfContext } from "../pdf/context.js";
+import { loadStoredAcceptance } from "../registeredAgent/acceptanceRecord.js";
 import type { FilingSessionRecord } from "../pdf/types.js";
 import { generateArticlesOfOrganizationPdf } from "../pdf/serviceClient.js";
 import { effectiveDateProblem, floridaToday } from "../filing/effectiveDateWindow.js";
@@ -103,7 +104,9 @@ export async function processClaimedOrder(pool: Pool, order: ClaimedOrder, deps:
     return;
   }
 
-  const contextResult = buildPdfContext(filingData, registeredAgentStatus);
+  const contextResult = buildPdfContext(filingData, registeredAgentStatus, {
+    registeredAgentAcceptance: await loadStoredAcceptance(pool, order.filing_session_id),
+  });
   if (!contextResult.ok) {
     await pool.query(
       `UPDATE orders

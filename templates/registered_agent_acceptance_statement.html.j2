@@ -4,7 +4,8 @@
 <meta charset="utf-8">
 <title>Registered Agent Acceptance Statement — {{ llc_name }}</title>
 <style>
-  @page { size: letter; margin: 0.9in 0.9in 0.8in; @bottom-center { content: "Registered Agent Acceptance Statement · {{ llc_name }} · Page " counter(page) " of " counter(pages); font-size: 8pt; color: #64748b; } }
+  /* No context values inside CSS strings: autoescaped entities (&amp;, &#39;) would print literally there. */
+  @page { size: letter; margin: 0.9in 0.9in 0.8in; @bottom-center { content: "Registered Agent Acceptance Statement · Page " counter(page) " of " counter(pages); font-size: 8pt; color: #64748b; } }
   body { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 10.5pt; color: #0f172a; line-height: 1.5; }
   h1 { font-size: 16pt; margin: 0 0 4px; color: #12395a; text-transform: uppercase; letter-spacing: .5px; }
   .sub { color: #1f5ea8; font-style: italic; margin: 0 0 22px; }

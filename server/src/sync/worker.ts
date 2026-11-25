@@ -1,5 +1,5 @@
 import type { Pool } from "pg";
-import { RA_DEAL_SYNC_TYPE } from "../registeredAgent/acceptanceRecord.js";
+import { RA_DEAL_SYNC_TYPE, raDealPayloadNow } from "../registeredAgent/acceptanceRecord.js";
 import type { DealStageUpdatePayload, OrderSyncPayload, ZohoClient, ZohoSyncResult } from "../zoho/client.js";
 import { backoffForAttempt, isDeadLetter } from "./backoff.js";
 import { sendOpsAlert } from "../ops/alerts.js";
@@ -70,8 +70,8 @@ function dispatchSync(client: ZohoClient, job: ClaimedJob): Promise<ZohoSyncResu
   if (job.sync_type === "order_deal" || job.sync_type === "abandoned_cart") {
     return client.syncOrderEvent(job.payload_snapshot as unknown as OrderSyncPayload);
   }
-  // T144 D12: the registered agent's status, a field-only update through the
-  // same Deal ownership check (no Stage in the payload).
+  // T144 D12: the registered agent's status. processOne has already replaced the
+  // payload with the verified Deal and the current status; field-only (no Stage).
   if (job.sync_type === "deal_stage_update" || job.sync_type === RA_DEAL_SYNC_TYPE) {
     return client.updateDealStage(job.payload_snapshot as unknown as DealStageUpdatePayload);
   }
@@ -184,6 +184,18 @@ async function recordOutcome(pool: Pool, job: ClaimedJob, result: ZohoSyncResult
 export async function processOne(pool: Pool, zohoClient: ZohoClient, lockedBy: string): Promise<boolean> {
   const job = await claimNextJob(pool, lockedBy);
   if (!job) return false;
+
+  // T144 D12: an agent-status job is built when it is sent, from the session's
+  // verified Deal (VERIFIED_DEAL_JOIN) and its CURRENT registered_agent_status,
+  // so a retried or older job can never put "Awaiting" back over "Accepted".
+  if (job.sync_type === RA_DEAL_SYNC_TYPE) {
+    const built = await raDealPayloadNow(pool, job.filing_session_id);
+    if (!built.ok) {
+      await recordOutcome(pool, job, { ok: false, permanent: true, error: built.reason });
+      return true;
+    }
+    job.payload_snapshot = built.payload as unknown as Record<string, unknown>;
+  }
 
   const result = await syncWithOneFreeAuthRetry(zohoClient, job);
   await recordOutcome(pool, job, result);

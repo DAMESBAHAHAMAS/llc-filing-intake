@@ -5,15 +5,14 @@ import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
 import { isDuplicateAcceptanceRequest, type LatestAcceptanceRow } from "../registeredAgent/acceptancePolicy.js";
 import {
-  buildAcceptanceRecord,
   checkSignature,
+  loadStoredAcceptance,
   queueRaDealStatus,
   RA_ACCEPTANCE_STATEMENT,
   RA_ACCEPTANCE_STATEMENT_VERSION,
-  RA_STATUS_ACCEPTED,
-  RA_STATUS_AWAITING,
   requireSignature,
 } from "../registeredAgent/acceptanceRecord.js";
+import { recordAcceptance } from "../registeredAgent/acceptTransaction.js";
 import { clientKey } from "../middleware/rateLimit.js";
 import { buildAcceptanceStatementContext } from "../registeredAgent/acceptanceStatement.js";
 import { renderTemplatePdf } from "../pdf/serviceClient.js";
@@ -25,10 +24,14 @@ function visitorIp(req: import("express").Request): string | null {
   return ip === "unknown" ? null : ip;
 }
 
-/** Logs and swallows: a Zoho status update must never fail the agent's answer. */
-async function queueRaStatusQuietly(filingSessionId: string, status: string, at: Date | null): Promise<void> {
+/**
+ * Logs and swallows: a Zoho status update must never fail the agent's answer.
+ * The job sends the session's status as it is when the job runs (see
+ * acceptanceRecord.ts raDealPayloadNow), so the order of jobs does not matter.
+ */
+async function queueRaStatusQuietly(filingSessionId: string): Promise<void> {
   try {
-    const r = await queueRaDealStatus(pool, filingSessionId, status, at);
+    const r = await queueRaDealStatus(pool, filingSessionId);
     if (!r.queued) console.log(`[ra status] Deal not updated for ${filingSessionId}: ${r.reason}`);
   } catch (err) {
     console.error(`[ra status] queueing failed for ${filingSessionId}:`, err);
@@ -286,7 +289,7 @@ registeredAgentRouter.post("/api/registered-agent/request-acceptance", async (re
       return;
     }
 
-    await queueRaStatusQuietly(filingSessionId, RA_STATUS_AWAITING, null);
+    await queueRaStatusQuietly(filingSessionId);
 
     const frontendBaseUrl = process.env.FRONTEND_BASE_URL ?? "";
     res.status(200).json({ email_sent: true, note: "Acceptance email sent via Resend." , frontend_base_url: frontendBaseUrl });
@@ -333,7 +336,7 @@ registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
   // RA_ACCEPT_REQUIRE_SIGNATURE=true; see registeredAgent/acceptanceRecord.ts).
   const signature = checkSignature(body);
   if (!signature.ok) {
-    res.status(signature.status).json({ error: signature.error });
+    res.status(signature.status).json({ error: signature.error, code: signature.code });
     return;
   }
 
@@ -348,29 +351,33 @@ registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
       return;
     }
 
-    const clientIp = visitorIp(req);
-    const acceptedAt = new Date();
-    await pool.query(
-      `UPDATE registered_agent_acceptances SET status = 'accepted', accepted_at = $3, accepted_ip = $2 WHERE id = $1`,
-      [resolved.row.id, clientIp, acceptedAt]
-    );
-    const fdRow = await pool.query<{ filing_data: Record<string, unknown> | null }>(
-      `SELECT filing_data FROM filing_sessions WHERE filing_session_id = $1`,
-      [resolved.row.filing_session_id]
-    );
-    await mergeIntoFilingData(resolved.row.filing_session_id, {
-      registered_agent_acceptance: buildAcceptanceRecord({
-        signatureName: signature.signatureName,
-        filingData: fdRow.rows[0]?.filing_data ?? {},
-        acceptedAt,
-        ip: clientIp,
-        userAgent: req.get("user-agent"),
-        token,
-      }),
+    // One transaction: uses the token, stores the signed acceptance on the
+    // acceptance row (never filing_data) and opens the filing gate.
+    const outcome = await recordAcceptance(pool, {
+      acceptanceId: resolved.row.id,
+      filingSessionId: resolved.row.filing_session_id,
+      signatureName: signature.signatureName,
+      ip: visitorIp(req),
+      userAgent: req.get("user-agent"),
+      acceptedAt: new Date(),
+      requireSignature: requireSignature(),
     });
-    await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'accepted' WHERE filing_session_id = $1`, [
-      resolved.row.filing_session_id,
-    ]);
+    if (outcome.kind === "not_actionable") {
+      res.status(409).json({ error: `token is not actionable (status=${outcome.status})` });
+      return;
+    }
+    if (outcome.kind === "signature_mismatch") {
+      res.status(400).json({
+        error: "signature_name must be the name of the registered agent named in this request",
+        code: "signature_mismatch",
+        registered_agent_name: outcome.agentName,
+      });
+      return;
+    }
+    if (outcome.kind === "signature_storage_unavailable") {
+      res.status(503).json({ error: "signatures cannot be stored yet (migration 0033 not applied)", code: "not_ready" });
+      return;
+    }
 
     // Best-effort, post-commit-equivalent: the acceptance itself is
     // already durable regardless of what happens here. A failure just
@@ -382,9 +389,9 @@ registeredAgentRouter.post("/api/registered-agent/accept", async (req, res) => {
       console.error(`Fulfillment re-evaluation failed for filing_session_id=${resolved.row.filing_session_id}:`, err);
     }
 
-    await queueRaStatusQuietly(resolved.row.filing_session_id, RA_STATUS_ACCEPTED, acceptedAt);
+    await queueRaStatusQuietly(resolved.row.filing_session_id);
 
-    res.status(200).json({ status: "accepted", signed: signature.signatureName !== null });
+    res.status(200).json({ status: "accepted", signed: outcome.signed });
   } catch (err) {
     res.status(500).json({ error: "accept failed", detail: describeError(err) });
   }
@@ -419,6 +426,11 @@ registeredAgentRouter.post("/api/registered-agent/acceptance/details", async (re
     );
     const fd = rows[0]?.filing_data ?? {};
     const s = (k: string) => (typeof fd[k] === "string" ? (fd[k] as string) : "");
+    // The agent name the signature is checked against: the one the request was sent to.
+    const named = await pool.query<{ registered_agent_name: string }>(
+      `SELECT registered_agent_name FROM registered_agent_acceptances WHERE id = $1`,
+      [resolved.row.id]
+    );
     const expiresAt = resolved.row.requested_at
       ? new Date(new Date(resolved.row.requested_at).getTime() + ACCEPTANCE_TOKEN_TTL_MS).toISOString()
       : null;
@@ -426,7 +438,7 @@ registeredAgentRouter.post("/api/registered-agent/acceptance/details", async (re
       actionable: resolved.actionable,
       status: resolved.row.status,
       llc_name: s("llc_name").toUpperCase(),
-      registered_agent_name: s("registered_agent_name"),
+      registered_agent_name: named.rows[0]?.registered_agent_name ?? s("registered_agent_name"),
       registered_agent_florida_address: s("registered_agent_florida_address"),
       statement: RA_ACCEPTANCE_STATEMENT,
       statement_version: RA_ACCEPTANCE_STATEMENT_VERSION,
@@ -460,6 +472,7 @@ registeredAgentRouter.post("/api/registered-agent/decline", async (req, res) => 
     await pool.query(`UPDATE filing_sessions SET registered_agent_status = 'declined' WHERE filing_session_id = $1`, [
       resolved.row.filing_session_id,
     ]);
+    await queueRaStatusQuietly(resolved.row.filing_session_id);
 
     res.status(200).json({ status: "declined" });
   } catch (err) {
@@ -478,15 +491,13 @@ registeredAgentRouter.post("/api/ops/registered-agent/acceptance-statement/:fili
     return;
   }
   try {
-    const { rows } = await pool.query<{ filing_data: Record<string, unknown> | null }>(
-      `SELECT filing_data FROM filing_sessions WHERE filing_session_id = $1`,
-      [req.params.filingSessionId]
-    );
-    if (!rows.length) {
+    const exists = await pool.query(`SELECT 1 FROM filing_sessions WHERE filing_session_id = $1`, [req.params.filingSessionId]);
+    if (!exists.rowCount) {
       res.status(404).json({ error: "unknown filing_session_id" });
       return;
     }
-    const ctx = buildAcceptanceStatementContext(rows[0].filing_data ?? {});
+    // Server-side acceptance row only (migration 0033), never filing_data.
+    const ctx = buildAcceptanceStatementContext(await loadStoredAcceptance(pool, req.params.filingSessionId));
     if (!ctx.ok) {
       res.status(422).json({ error: "no signed acceptance on file", missingFields: ctx.missingFields });
       return;
