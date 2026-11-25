@@ -144,8 +144,10 @@ def generate_ss4():
     if not _is_authorized(request):
         return jsonify({"error": "unauthorized"}), 401
 
-    body = request.get_json(silent=True) or {}
-    values = body.get("values") or {}
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("values"), dict):
+        return jsonify({"error": "body must be an object with a 'values' object"}), 400
+    values = body["values"]
     text = values.get("text") or {}
     checks = values.get("check") or []
     watermark = body.get("watermark")
@@ -170,6 +172,8 @@ def generate_ss4():
     )
     if unknown:
         return jsonify({"error": "unknown or mismatched SS-4 fields (form revised?)", "fields": unknown}), 422
+    if sum(1 for f, _ in checks if f.startswith("c1_3[")) > 1:
+        return jsonify({"error": "line 9a takes exactly one entity type"}), 422
     bad_states = sorted(f for f, on in checks if on not in widgets[f][2])
     if bad_states:
         return jsonify({"error": "checkbox on-state not on this form revision", "fields": bad_states}), 422
@@ -186,7 +190,7 @@ def generate_ss4():
     if watermark:
         mark = HTML(string=(
             "<style>@page{size:letter;margin:0}body{margin:0;height:11in;display:flex;align-items:center;"
-            "justify-content:center}p{transform:rotate(-30deg);font:bold 54pt sans-serif;"
+            "justify-content:center}p{transform:rotate(-30deg);font:bold 40pt sans-serif;"
             "color:rgba(200,0,0,.18);white-space:nowrap}</style>"
             f"<p>{watermark}</p>"
         )).write_pdf()

@@ -18,6 +18,9 @@ import type { FilingSessionRecord } from "../pdf/types.js";
 
 export const SS4_FORM_REVISION = "Rev. December 2025";
 
+/** Line 10's "specify type" box is about 57pt wide. */
+export const LINE10_MAX = 14;
+
 /** Text fields, by SS-4 line. */
 export const FIELD = {
   line1LegalName: "f1_2[0]",
@@ -69,7 +72,7 @@ export interface Ss4Designee {
 
 /** Answers the filing interview does not collect (EIN step, after filing). */
 export interface Ss4Inputs {
-  /** Line 7a: an individual who owns or controls the LLC. Defaults to the e-signer. */
+  /** Line 7a: the individual who owns or controls the LLC (never a nominee). Required: not taken from the Articles signer. */
   responsible_party_name?: string;
   /**
    * Line 7b. A foreign founder with no SSN or ITIN gets "Foreign" (Dispatch 11,
@@ -91,7 +94,7 @@ export interface Ss4Inputs {
   principal_activity?: string;
   /** Line 17. */
   principal_products_or_services?: string;
-  /** The applicant's title for the signature line, e.g. "Member". Defaults to the e-signer's title. */
+  /** The responsible party's title for the signature line, e.g. "Member". */
   applicant_title?: string;
   applicant_phone?: string;
   applicant_fax?: string;
@@ -138,20 +141,55 @@ export function ss4Date(iso: string): string | null {
  * into the form's street line and "City, ST ZIP" line. Returns null when the
  * address does not end in city, state and a 5- or 9-digit ZIP (e.g. foreign).
  */
-export function splitUsAddress(address: string): { street: string; cityStateZip: string } | null {
-  const parts = address.split(",").map((p) => p.trim()).filter(Boolean);
-  if (parts.length < 4) return null;
-  const zip = parts[parts.length - 1];
-  const state = parts[parts.length - 2];
-  const city = parts[parts.length - 3];
-  if (!/^\d{5}(-\d{4})?$/.test(zip) || !/^[A-Za-z .]{2,}$/.test(state)) return null;
-  return { street: parts.slice(0, -3).join(", "), cityStateZip: `${city}, ${state} ${zip}` };
+const US_STATES: Record<string, string> = {
+  AL: "Alabama", AK: "Alaska", AZ: "Arizona", AR: "Arkansas", CA: "California", CO: "Colorado", CT: "Connecticut",
+  DE: "Delaware", DC: "District of Columbia", FL: "Florida", GA: "Georgia", HI: "Hawaii", ID: "Idaho", IL: "Illinois",
+  IN: "Indiana", IA: "Iowa", KS: "Kansas", KY: "Kentucky", LA: "Louisiana", ME: "Maine", MD: "Maryland",
+  MA: "Massachusetts", MI: "Michigan", MN: "Minnesota", MS: "Mississippi", MO: "Missouri", MT: "Montana",
+  NE: "Nebraska", NV: "Nevada", NH: "New Hampshire", NJ: "New Jersey", NM: "New Mexico", NY: "New York",
+  NC: "North Carolina", ND: "North Dakota", OH: "Ohio", OK: "Oklahoma", OR: "Oregon", PA: "Pennsylvania",
+  RI: "Rhode Island", SC: "South Carolina", SD: "South Dakota", TN: "Tennessee", TX: "Texas", UT: "Utah",
+  VT: "Vermont", VA: "Virginia", WA: "Washington", WV: "West Virginia", WI: "Wisconsin", WY: "Wyoming",
+};
+
+/** "FL" or "Florida" (any case) -> "FL"; anything else -> null. */
+function stateCode(value: string): string | null {
+  const v = value.trim();
+  if (/^[A-Za-z]{2}$/.test(v) && US_STATES[v.toUpperCase()]) return v.toUpperCase();
+  const hit = Object.entries(US_STATES).find(([, name]) => name.toLowerCase() === v.toLowerCase());
+  return hit ? hit[0] : null;
 }
 
-/** The e-signature record (T144 D9, llc-filing-intake#28), read loosely so this works before and after it merges. */
-function esigner(filingData: object): { name: string; title: string } {
-  const e = (filingData as { esignature?: { signer_name?: unknown; signer_title?: unknown } }).esignature;
-  return { name: str(e?.signer_name), title: str(e?.signer_title) };
+/**
+ * Splits a canonical U.S. address into the form's street line and "City, ST ZIP"
+ * line. Accepts the website's "street, [unit,] city, ST, ZIP" and the older
+ * "street, city, ST ZIP", with an optional trailing "USA" / "United States".
+ * The state must be a real U.S. state code or name. Anything else (foreign
+ * addresses, a missing city) returns null, which the builder reports as a gap.
+ */
+export function splitUsAddress(address: string): { street: string; cityStateZip: string } | null {
+  let parts = address.split(",").map((p) => p.trim()).filter(Boolean);
+  if (parts.length && /^(usa|us|united states( of america)?)$/i.test(parts[parts.length - 1])) parts = parts.slice(0, -1);
+  let zip: string, state: string | null, city: string, street: string[];
+  const last = parts[parts.length - 1] ?? "";
+  const combined = /^([A-Za-z ]+?)\s+(\d{5}(?:-\d{4})?)$/.exec(last);
+  if (/^\d{5}(-\d{4})?$/.test(last)) {
+    if (parts.length < 4) return null;
+    zip = last;
+    state = stateCode(parts[parts.length - 2]);
+    city = parts[parts.length - 3];
+    street = parts.slice(0, -3);
+  } else if (combined) {
+    if (parts.length < 3) return null;
+    zip = combined[2];
+    state = stateCode(combined[1]);
+    city = parts[parts.length - 2];
+    street = parts.slice(0, -2);
+  } else {
+    return null;
+  }
+  if (!state || !city || street.length === 0 || /\d{5}/.test(city)) return null;
+  return { street: street.join(", "), cityStateZip: `${city}, ${state} ${zip}` };
 }
 
 export function buildSs4Values(
@@ -176,11 +214,14 @@ export function buildSs4Values(
   const county = str(inputs.county_and_state);
   if (!county) missing.push("county_and_state (line 6, e.g. \"Miami-Dade County, Florida\")");
 
-  // Line 7: responsible party. Defaults to the person who e-signed the Articles.
-  const responsible = str(inputs.responsible_party_name) || esigner(filingData).name;
-  if (!responsible) missing.push("responsible_party_name (line 7a)");
+  // Line 7: responsible party. Always given explicitly: whoever signed the
+  // Articles may be a representative, and the IRS rejects a nominee here.
+  const responsible = str(inputs.responsible_party_name);
+  if (!responsible) missing.push("responsible_party_name (line 7a, the owner who controls the LLC)");
   if (inputs.responsible_party_has_ssn_or_itin === true) {
     missing.push("responsible party has an SSN or ITIN: apply online or enter it by hand; this tool never holds U.S. tax numbers");
+  } else if (inputs.responsible_party_has_ssn_or_itin !== false) {
+    missing.push("responsible_party_has_ssn_or_itin (must be false: this form is for a founder with no SSN or ITIN)");
   }
 
   // Line 8: an LLC organized in the United States (Florida).
@@ -193,6 +234,7 @@ export function buildSs4Values(
   // Line 10/11.
   const businessType = str(inputs.business_type);
   if (!businessType) missing.push("business_type (line 10, \"Started new business (specify type)\")");
+  else if (businessType.length > LINE10_MAX) missing.push(`business_type (line 10 has room for ${LINE10_MAX} characters, e.g. "Consulting")`);
   const startIso =
     str(inputs.date_started) ||
     (filingData.effective_date_option && filingData.effective_date_option !== "Immediate" ? str(filingData.effective_date) : "") ||
@@ -208,7 +250,7 @@ export function buildSs4Values(
   const products = str(inputs.principal_products_or_services);
   if (!products) missing.push("principal_products_or_services (line 17)");
 
-  const title = str(inputs.applicant_title) || esigner(filingData).title;
+  const title = str(inputs.applicant_title);
   if (!title) missing.push("applicant_title (signature line, e.g. \"Member\")");
 
   const d = inputs.designee ?? {};

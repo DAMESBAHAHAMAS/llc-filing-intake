@@ -14,6 +14,9 @@ const filing = {
 
 const inputs = {
   member_count: 1,
+  responsible_party_name: "Jordan Test Rivera",
+  responsible_party_has_ssn_or_itin: false,
+  applicant_title: "Member",
   county_and_state: "Miami-Dade County, Florida",
   business_type: "Consulting",
   principal_activity: "Business consulting",
@@ -62,12 +65,12 @@ describe("buildSs4Values (T144 D11)", () => {
   });
 
   it("names every gap and never guesses", () => {
-    const r = buildSs4Values({ llc_name: "A LLC", principal_address: "Calle 1, Madrid", mailing_address: "" }, {}, {});
+    const r = buildSs4Values({ llc_name: "A LLC", principal_address: "Calle 1, Madrid", mailing_address: "", esignature: { signer_name: "X Y" } } as never, {}, {});
     expect(r.ok).toBe(false);
     if (r.ok) return;
     for (const g of ["mailing_address", "principal_address", "county_and_state", "responsible_party_name", "member_count",
       "business_type", "date_started", "principal_activity", "principal_products_or_services", "applicant_title",
-      "designee.name", "designee.phone", "designee.fax", "designee.address"]) {
+      "designee.name", "designee.phone", "designee.fax", "designee.address", "responsible_party_has_ssn_or_itin"]) {
       expect(r.missingFields.join("|")).toContain(g);
     }
   });
@@ -81,7 +84,24 @@ describe("buildSs4Values (T144 D11)", () => {
 describe("helpers", () => {
   it("splits a canonical U.S. address", () => {
     expect(splitUsAddress("1 Main St, Tampa, FL, 33602")).toEqual({ street: "1 Main St", cityStateZip: "Tampa, FL 33602" });
+    expect(splitUsAddress("1 Main St, Apt 4, Tampa, Florida, 33602")).toEqual({ street: "1 Main St, Apt 4", cityStateZip: "Tampa, FL 33602" });
+    expect(splitUsAddress("123 Main St, Miami, FL 33101")).toEqual({ street: "123 Main St", cityStateZip: "Miami, FL 33101" });
+    expect(splitUsAddress("123 Main St, Miami, FL 33131, USA")).toEqual({ street: "123 Main St", cityStateZip: "Miami, FL 33131" });
+  });
+  it("refuses what it cannot split safely", () => {
     expect(splitUsAddress("Calle 1, 28001 Madrid, Spain")).toBeNull();
+    expect(splitUsAddress("Unit 5, 123 Main St, Miami FL, 33101")).toBeNull();
+    expect(splitUsAddress("Miami, FL, 33101")).toBeNull();
+    expect(splitUsAddress("1 Main St, Tampa, ZZ, 33602")).toBeNull();
+  });
+  it("never takes the responsible party from the Articles signer", () => {
+    const { responsible_party_name: _r, ...rest } = inputs;
+    const r = buildSs4Values(filing, { filing_date: "2026-11-30" }, rest);
+    expect(r.ok).toBe(false);
+  });
+  it("refuses a line 10 type too long for its box", () => {
+    const r = buildSs4Values(filing, { filing_date: "2026-11-30" }, { ...inputs, business_type: "Consulting services for SaaS" });
+    expect(r.ok).toBe(false);
   });
   it("prints dates as MM/DD/YYYY", () => {
     expect(ss4Date("2026-11-30")).toBe("11/30/2026");
