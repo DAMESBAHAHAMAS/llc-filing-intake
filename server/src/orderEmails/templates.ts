@@ -36,6 +36,9 @@ export interface OrderEmailRow {
   entity_name_backup: string | null;
   filing_data: Record<string, unknown> | null;
   registered_agent_status: string | null;
+  /** ST17: the tokenized EIN / Form SS-4 onboarding link, set only when this order
+   *  includes the EIN and the onboarding form is open (worker.ts). */
+  ein_onboarding_url?: string | null;
 }
 
 interface Person {
@@ -65,6 +68,7 @@ interface OrderEmailContext {
   agentName: string;
   agentAddress: string;
   agentAcceptancePending: boolean;
+  einOnboardingUrl: string;
 }
 
 export interface RenderedEmail {
@@ -132,6 +136,7 @@ function buildContext(row: OrderEmailRow, paymentMode: PaymentMode): OrderEmailC
         ? customerText(data.registered_agent_florida_address)
         : "",
     agentAcceptancePending: customerAgent && row.registered_agent_status !== "accepted",
+    einOnboardingUrl: row.ein_onboarding_url ?? "",
   };
 }
 
@@ -283,6 +288,17 @@ function orderConfirmation(ctx: OrderEmailContext): RenderedEmail {
     ]),
     heading("Payment"),
     ...paymentTerms(ctx),
+    // ST17 magic link: no login, the link carries the filing session and a signed token.
+    ...(ctx.einOnboardingUrl
+      ? [
+          heading("Next Step: Your EIN"),
+          rich(
+            "Your order includes your IRS EIN. ",
+            { link: "Complete your EIN & identity details (2 min)", href: ctx.einOnboardingUrl },
+            " so we can file your Form SS-4 as soon as your LLC is approved. The link is private to you and expires in 14 days. Please don't send your passport by email.",
+          ),
+        ]
+      : []),
   ], { separateFooter: true });
 }
 

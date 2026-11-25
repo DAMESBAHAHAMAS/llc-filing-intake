@@ -9,6 +9,7 @@ import { houseAgentLineMissing } from "../offers/houseAgentRule.js";
 import { einLineIssue } from "../offers/einBundleRule.js";
 import { getEinUpsell, orderedOfferCodes } from "../offers/einUpsell.js";
 import { holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
+import { einIncluded, einOnboardingConfig, onboardingTokenFor, packageFromCodes } from "../ein/onboarding.js";
 
 export const checkoutRouter = Router();
 
@@ -227,7 +228,7 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
 checkoutRouter.get("/api/checkout/order/:orderId", async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT order_id, filing_session_id, checkout_status, payment_status, failure_reason,
+      `SELECT order_id, filing_session_id, product, checkout_status, payment_status, failure_reason,
               fulfillment_status, total_cents, currency, proof_of_filing_at, captured_at
        FROM orders WHERE order_id = $1`,
       [req.params.orderId]
@@ -244,7 +245,29 @@ checkoutRouter.get("/api/checkout/order/:orderId", async (req, res) => {
     } catch (upsellErr) {
       console.error("[checkout] EIN upsell eligibility failed:", describeError(upsellErr));
     }
-    res.status(200).json({ ...rows[0], ein_upsell: einUpsell });
+    // ST17: the package and whether the EIN is included come from the session's held or
+    // paid orders, so the success page never reads them from the URL. The onboarding token
+    // is issued only for a held or paid session that includes the EIN, and only while the
+    // EIN onboarding form is open. Like the upsell, a failure here never breaks the page.
+    let ein: { package: string | null; ein_included: boolean; ein_onboarding_token: string | null } = {
+      package: null,
+      ein_included: false,
+      ein_onboarding_token: null,
+    };
+    try {
+      if (rows[0].payment_status === "authorized" || rows[0].payment_status === "paid") {
+        const codes = await orderedOfferCodes(pool, rows[0].filing_session_id);
+        const included = einIncluded(codes);
+        ein = {
+          package: packageFromCodes(codes),
+          ein_included: included,
+          ein_onboarding_token: included ? onboardingTokenFor(einOnboardingConfig(), rows[0].filing_session_id) : null,
+        };
+      }
+    } catch (einErr) {
+      console.error("[checkout] EIN package lookup failed:", describeError(einErr));
+    }
+    res.status(200).json({ ...rows[0], ein_upsell: einUpsell, ...ein });
   } catch (err) {
     res.status(500).json({ error: "order lookup failed", detail: describeError(err) });
   }

@@ -13,6 +13,7 @@ import { offersRouter } from "./routes/offers.js";
 import { filingDocumentRouter } from "./routes/filingDocument.js";
 import { ordersRouter } from "./routes/orders.js";
 import { scorecardRouter } from "./routes/scorecard.js";
+import { einOnboardingRouter } from "./routes/einOnboarding.js";
 import { runScorecardTick } from "./scorecard/service.js";
 import { realScorecardSender } from "./scorecard/sender.js";
 import { runHoldSweepOnce } from "./fulfillment/holdSweep.js";
@@ -46,6 +47,10 @@ app.use(corsMiddleware);
 app.use("/api/webhooks/stripe", express.raw({ type: "application/json" }));
 app.use(stripeWebhookRouter);
 
+// ST17: the EIN onboarding POST carries a base64 passport image (up to 10 MB, ~13.4 MB
+// encoded). Only that path gets the larger limit; it must be parsed before the global
+// 100 kb parser, which would otherwise reject it with a 413.
+app.use("/api/onboarding/ein", express.json({ limit: "15mb" }));
 app.use(express.json());
 
 // Per-IP limits (429) and the Turnstile bot check on the public funnel
@@ -62,6 +67,7 @@ app.use(offersRouter);
 app.use(filingDocumentRouter);
 app.use(ordersRouter);
 app.use(scorecardRouter);
+app.use(einOnboardingRouter);
 
 const port = Number(process.env.PORT ?? 3000);
 app.listen(port, () => {

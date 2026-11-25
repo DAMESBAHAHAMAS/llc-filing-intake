@@ -122,6 +122,8 @@ export function funnelRateLimiters() {
     filingPdf: createRateLimiter({ name: "filing-pdf", windowMs: 10 * MINUTE, max: envInt("RATE_LIMIT_FILING_PDF_PER_10MIN", 10) }),
     // Scorecard sign-up: stores a lead and queues five emails.
     scorecardSignup: createRateLimiter({ name: "scorecard-signup", windowMs: 10 * MINUTE, max: envInt("RATE_LIMIT_SCORECARD_PER_10MIN", 10) }),
+    // ST17 EIN onboarding: identity documents behind a link token. Tight, to slow token guessing.
+    einOnboarding: createRateLimiter({ name: "ein-onboarding", windowMs: 10 * MINUTE, max: envInt("RATE_LIMIT_EIN_ONBOARDING_PER_10MIN", 30) }),
     // Cheap reads.
     reads: createRateLimiter({ name: "reads", windowMs: MINUTE, max: envInt("RATE_LIMIT_READS_PER_MIN", 120) }),
   };

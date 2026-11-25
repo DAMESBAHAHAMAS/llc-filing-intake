@@ -4,6 +4,7 @@ import { sendOpsAlert } from "../ops/alerts.js";
 import { backoffForAttempt, isDeadLetter } from "../sync/backoff.js";
 import type { OrderEmailSender } from "./sender.js";
 import { buildOrderEmail, type OrderEmailRow, type OrderEmailType, type PaymentMode } from "./templates.js";
+import { einIncluded, einOnboardingConfig, onboardingUrlFor } from "../ein/onboarding.js";
 
 /**
  * Customer order emails run through crm_sync_queue rather than a new
@@ -118,15 +119,21 @@ export async function claimNextEmailJob(pool: Pool, lockedBy: string): Promise<C
 }
 
 async function loadOrderRow(pool: Pool, orderId: string): Promise<OrderEmailRow | null> {
-  const { rows } = await pool.query<OrderEmailRow>(
-    `SELECT o.order_id, o.line_items, o.total_cents, o.proof_of_filing_ref,
+  const { rows } = await pool.query<OrderEmailRow & { filing_session_id: string }>(
+    `SELECT o.order_id, o.filing_session_id, o.line_items, o.total_cents, o.proof_of_filing_ref,
             fs.email, fs.full_name, fs.phone, fs.country, fs.entity_name_primary, fs.entity_name_backup,
             fs.filing_data, fs.registered_agent_status
      FROM orders o JOIN filing_sessions fs ON fs.filing_session_id = o.filing_session_id
      WHERE o.order_id = $1`,
     [orderId]
   );
-  return rows[0] ?? null;
+  const row = rows[0];
+  if (!row) return null;
+  // ST17: the EIN onboarding magic link, only for an order that includes the EIN and
+  // only while the onboarding form is open (null otherwise, so no dead link is sent).
+  const codes = (row.line_items ?? []).map((li) => li.offer_code).filter((c): c is string => typeof c === "string");
+  row.ein_onboarding_url = einIncluded(codes) ? onboardingUrlFor(einOnboardingConfig(), row.filing_session_id) : null;
+  return row;
 }
 
 interface SendOutcome {
