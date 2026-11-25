@@ -56,3 +56,14 @@ export function agentLineIssue(requestedCodes: string[], alreadyOrderedCodes: st
   if (coversHouseAgent(alreadyOrderedCodes)) return "already_included";
   return null;
 }
+
+/**
+ * The cart without the $98 agent line when a package in it already includes
+ * the service (a website build from before 25 Nov 2026 still sends the pair).
+ * Unchanged otherwise.
+ */
+export function dropBundledAgentLine<T extends { offer_code: string }>(items: T[]): T[] {
+  const codes = items.map((i) => i.offer_code);
+  if (agentLineIssue(codes, []) !== "bundled_in_cart") return items;
+  return items.filter((i) => i.offer_code !== HOUSE_AGENT_OFFER_CODE);
+}

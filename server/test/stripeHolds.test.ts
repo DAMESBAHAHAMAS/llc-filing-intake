@@ -25,7 +25,7 @@ function captureFetch() {
 }
 
 describe("card-hold Checkout Session", () => {
-  it("requests manual capture, an extended hold where available, and a saved card", async () => {
+  it("requests manual capture and never saves the card for off-session charges", async () => {
     process.env.STRIPE_SECRET_KEY = "sk_test_fake";
     const calls = captureFetch();
     await createCheckoutSession({
@@ -38,7 +38,8 @@ describe("card-hold Checkout Session", () => {
     });
     const body = decodeURIComponent(calls[0].init?.body as string);
     expect(body).toContain("payment_intent_data[capture_method]=manual");
-    expect(body).toContain("payment_intent_data[setup_future_usage]=off_session");
+    // Owner's final hold rule (25 Nov 2026): no off-session charges, so no "future charges" consent.
+    expect(body).not.toContain("setup_future_usage");
     expect(body).toContain("payment_intent_data[metadata][order_id]=ord_1");
     expect(body).toContain("customer_creation=always");
     expect(body).not.toContain("payment_method_types");

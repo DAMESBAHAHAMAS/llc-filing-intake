@@ -260,22 +260,28 @@ function paymentTerms(ctx: OrderEmailContext): Block[] {
   if (ctx.paymentMode === "paid") {
     return [p(`We charged ${total} to your card at checkout.`), p(REPLY_LINE)];
   }
-  // Hold wording: Damian's revision, 24 Nov 2026.
-  const filed = ctx.sunbizFiling
-    ? "the Florida Division of Corporations officially files your Articles of Organization"
-    : "your filing is complete";
-  const afterFiling = ctx.sunbizFiling
-    ? "As soon as your LLC is filed, we will email your filing confirmation and process the payment."
-    : "As soon as it is complete, we will email you and process the payment.";
+  // Hold wording: Damian's revision, 24 Nov 2026, brought in line with the
+  // owner's final hold rule (25 Nov 2026): a Sunbiz filing's hold is captured
+  // when the Articles are submitted to Sunbiz, never later; a lapsed hold is
+  // never charged.
+  const charged = ctx.sunbizFiling
+    ? rich(
+        "We charge your card ",
+        b("only when"),
+        " we submit your Articles of Organization to the Florida Division of Corporations (Sunbiz). As soon as your LLC is filed, we will email your filing confirmation."
+      )
+    : rich("We charge your card ", b("only after"), " your filing is complete. As soon as it is complete, we will email you and process the payment.");
+  const longer = ctx.sunbizFiling
+    ? " If we have not submitted your filing within 5 days, we release the hold, so nothing is charged, and email you a secure payment link for the same amount."
+    : " If your filing is not complete within 5 days, we release the hold, so nothing is charged, and email you a secure payment link for the same amount.";
   return [
     rich("We placed a temporary hold of ", b(total), " on your card. ", b("A hold is not a charge"), "\u2014no money leaves your account."),
     heading("When You Are Actually Charged"),
-    rich("We charge your card ", b("only after"), ` ${filed}. ${afterFiling}`),
+    charged,
     heading("How the Card Hold Works"),
     bullets(
       [b("Duration:"), " A card hold ", b("may last up to 7 days"), "."],
-      // Owner's final hold rule (25 Nov 2026): a lapsed hold is never charged.
-      [b("If Filing Takes Longer:"), " If your filing is not complete within 5 days, we release the hold, so nothing is charged, and email you a secure payment link for the same amount."]
+      [b("If Filing Takes Longer:"), longer]
     ),
     heading("Easy Cancellation"),
     p("You can cancel at any time before we submit your filing\u2014we will release the hold, and you will not be charged. To cancel, simply reply to this email."),
@@ -353,7 +359,7 @@ function intakeSummary(ctx: OrderEmailContext): RenderedEmail {
 function filingConfirmation(ctx: OrderEmailContext): RenderedEmail {
   const payment =
     ctx.paymentMode === "paid"
-      ? "You paid for this order at checkout."
+      ? "Your payment for this order is complete."
       : ctx.paymentMode === "released"
         ? "Your card hold was released before it could be collected, so nothing has been charged. We will email you, or have already emailed you, a secure link to pay for this order."
         : "We are now collecting payment for this order from the card you used at checkout, as your order confirmation explained.";
@@ -390,7 +396,7 @@ function holdReleased(ctx: OrderEmailContext, paymentLinkUrl: string): RenderedE
     greeting(ctx),
     rich("We released the temporary hold of ", b(total), " on your card. ", b("Nothing was charged.")),
     p(
-      "A card hold lasts only a few days. Your order was not completed within 5 days of the hold, so we released it instead of letting it lapse."
+      "A card hold lasts only a few days, and yours ended before we could collect the payment, so it was released."
     ),
     heading("Keep Your Order Moving"),
     rich("To continue, approve the payment with this secure Stripe link: ", { link: `Pay ${total} securely`, href: paymentLinkUrl }, "."),

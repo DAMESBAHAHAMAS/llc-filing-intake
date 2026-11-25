@@ -98,11 +98,11 @@ describe("order confirmation", () => {
     expect(text).toContain("We placed a temporary hold of $249.00 on your card. A hold is not a charge\u2014no money leaves your account.");
     expect(text).toContain("When You Are Actually Charged");
     expect(text).toContain(
-      "We charge your card only after the Florida Division of Corporations officially files your Articles of Organization. As soon as your LLC is filed, we will email your filing confirmation and process the payment."
+      "We charge your card only when we submit your Articles of Organization to the Florida Division of Corporations (Sunbiz). As soon as your LLC is filed, we will email your filing confirmation."
     );
     expect(text).toContain("- Duration: A card hold may last up to 7 days.");
     expect(text).toContain(
-      "- If Filing Takes Longer: If your filing is not complete within 5 days, we release the hold, so nothing is charged, and email you a secure payment link for the same amount."
+      "- If Filing Takes Longer: If we have not submitted your filing within 5 days, we release the hold, so nothing is charged, and email you a secure payment link for the same amount."
     );
     expect(text).toContain("To cancel, simply reply to this email.");
     expect(text).toContain("review our Payment Protection Promise (https://damianknowles.com/refund-policy).");
@@ -111,7 +111,7 @@ describe("order confirmation", () => {
     expect(text).toContain("---\nDamian Knowles is a Business Developer");
 
     expect(html).toContain("<strong>A hold is not a charge</strong>");
-    expect(html).toContain("<strong>only after</strong>");
+    expect(html).toContain("<strong>only when</strong>");
     expect(html).toContain("<li><strong>Duration:</strong> A card hold <strong>may last up to 7 days</strong>.</li>");
     expect(html).toContain('<a href="https://damianknowles.com/refund-policy" style="color: #1a5fb4;">Payment Protection Promise</a>');
     expect(html).toMatch(/<hr [^>]*><p style="font-style: italic; color: #666;">Damian Knowles is a Business Developer/);
@@ -194,9 +194,9 @@ describe("filing confirmation", () => {
     expect(text).toContain("We are now collecting payment");
   });
 
-  it("says nothing is being collected when the order was paid at checkout", () => {
+  it("says nothing is being collected when the order is already paid (at checkout, at submission or by link)", () => {
     const { text } = buildOrderEmail("filing_confirmation", row(), "paid");
-    expect(text).toContain("You paid for this order at checkout.");
+    expect(text).toContain("Your payment for this order is complete.");
     expect(text).not.toContain("now collecting");
   });
 

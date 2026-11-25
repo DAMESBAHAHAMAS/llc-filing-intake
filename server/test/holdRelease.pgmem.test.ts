@@ -64,6 +64,7 @@ async function setup(env: Record<string, string> = {}): Promise<Harness> {
   await pool.query(`ALTER TABLE orders ADD COLUMN released_at timestamptz`);
   await pool.query(`ALTER TABLE orders ADD COLUMN created_at timestamptz NOT NULL DEFAULT now()`);
   await pool.query(`ALTER TABLE orders ADD COLUMN captured_at timestamptz`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN capture_before timestamptz`); // migration 0018
   await pool.query(migration0038());
   await pool.query(
     `INSERT INTO filing_sessions (filing_session_id, email, full_name, entity_name_primary, filing_data)
@@ -125,7 +126,8 @@ beforeEach(() => vi.spyOn(console, "error").mockImplementation(() => undefined))
 describe("config", () => {
   it("defaults: on, start 25 Nov 2026 at midnight in Florida, 120 hours", () => {
     const cfg = holdReleaseConfig({});
-    expect(cfg).toEqual({ enabled: true, start: new Date("2026-11-25T05:00:00Z"), afterHours: 120 });
+    expect(cfg).toEqual({ enabled: true, start: new Date("2026-11-25T05:00:00Z"), afterHours: 120, zohoPaymentStatus: "Hold Released" });
+    expect(holdReleaseConfig({ HOLD_EXPIRED_ZOHO_VALUE: "Hold Expired" }).zohoPaymentStatus).toBe("Hold Expired");
     expect(floridaMidnight("2026-07-04")?.toISOString()).toBe("2026-07-04T04:00:00.000Z"); // EDT
   });
 
@@ -303,5 +305,96 @@ describe("runHoldReleaseOnce", () => {
     client.release();
     expect(out).toEqual({ processingResult: "collected_deal_update_enqueued", orderId: DUE });
     expect((await t.order(DUE)).payment_status).toBe("paid");
+  });
+  it("never releases an order submitted to Sunbiz (rule 1), even before proof of filing; it alerts instead", async () => {
+    const t = await setup();
+    await t.pool.query(`UPDATE orders SET sunbiz_submitted_at = $2, sunbiz_submission_ref = 'T123456' WHERE order_id = $1`, [DUE, new Date(NOW.getTime() - 50 * HOURS)]);
+    const r = await runHoldReleaseOnce(t.pool, t.deps);
+    expect(r.released).toEqual([KICKOFF]);
+    expect(r.alertedWithProof.sort()).toEqual([DUE, FILED].sort());
+    expect(t.stripe.cancel).not.toHaveBeenCalledWith("pi_1", expect.anything(), expect.anything());
+    expect((await t.order(DUE)).payment_status).toBe("authorized");
+  });
+
+  it("re-checks proof and submission when taking the order, so one recorded meanwhile wins", async () => {
+    const t = await setup();
+    const real = t.pool.query.bind(t.pool) as (...a: unknown[]) => Promise<unknown>;
+    const racing = Object.create(t.pool) as Pool;
+    (racing as unknown as { query: unknown }).query = async (...args: unknown[]) => {
+      if (typeof args[0] === "string" && args[0].includes("SET hold_release_started_at = COALESCE") && (args[1] as unknown[])[0] === DUE) {
+        await real(`UPDATE orders SET proof_of_filing_at = now() WHERE order_id = $1`, [DUE]);
+      }
+      return real(...args);
+    };
+    const r = await runHoldReleaseOnce(racing, t.deps);
+    expect(r.skipped).toContain(DUE);
+    expect(r.released).toEqual([KICKOFF]);
+    expect((await t.order(DUE)).hold_release_started_at).toBeNull();
+  });
+
+  it("releases before Stripe's own expiry when capture_before comes first", async () => {
+    const t = await setup();
+    await t.pool.query(`UPDATE orders SET capture_before = $2 WHERE order_id = $1`, [YOUNG, new Date(NOW.getTime() + 30 * 60 * 1000)]);
+    const r = await runHoldReleaseOnce(t.pool, t.deps);
+    expect(r.released).toContain(YOUNG);
+  });
+
+  it("sends the link for a hold that lapsed on its own before the job reached it, without cancelling anything", async () => {
+    const t = await setup();
+    await t.pool.query(
+      `UPDATE orders SET payment_status = 'released', fulfillment_status = 'not_ready', hold_cancellation_reason = 'automatic' WHERE order_id = $1`,
+      [YOUNG]
+    );
+    const r = await runHoldReleaseOnce(t.pool, t.deps);
+    expect(r.released).toContain(YOUNG);
+    expect(t.stripe.cancel).not.toHaveBeenCalledWith("pi_2", expect.anything(), expect.anything());
+    expect((await t.order(YOUNG)).payment_link_url).toBe("https://buy.stripe.com/test_2");
+    // An operator release (requested_by_customer) never gets a link.
+    expect((await t.order(OPERATOR)).payment_link_url).toBeNull();
+  });
+
+  it("writes the owner's Hold Expired marker once Zoho has it, and the webhook adds no second Deal update for the job's own cancel", async () => {
+    const t = await setup({ HOLD_EXPIRED_ZOHO_VALUE: "Hold Expired" });
+    // The job's cancel fires payment_intent.canceled while it is still running.
+    t.stripe.cancel.mockImplementation(async (id: string) => {
+      const c = await t.pool.connect();
+      await handlePaymentLifecycleEvent(c as never, { id: `evt_${id}`, type: "payment_intent.canceled", data: { object: { id, cancellation_reason: "abandoned" } } });
+      c.release();
+      return { id, status: "canceled" };
+    });
+    await runHoldReleaseOnce(t.pool, t.deps);
+    const deal = (await t.pool.query(`SELECT payload_snapshot FROM crm_sync_queue WHERE order_id = $1 AND sync_type = 'deal_stage_update'`, [DUE])).rows;
+    expect(deal).toHaveLength(1);
+    expect(deal[0].payload_snapshot.extra_fields).toMatchObject({ Payment_Status: "Hold Expired" });
+    expect((await t.order(DUE)).hold_cancellation_reason).toBe("abandoned");
+  });
+
+  it("paying the link restarts a filing the release stopped and records the PaymentIntent that collected", async () => {
+    const t = await setup();
+    await runHoldReleaseOnce(t.pool, t.deps);
+    expect((await t.order(DUE)).fulfillment_status).toBe("not_ready");
+    const client = await t.pool.connect();
+    await handlePaymentLifecycleEvent(client as never, {
+      id: "evt_2",
+      type: "payment_intent.succeeded",
+      data: { object: { id: "pi_from_link", metadata: { order_id: DUE } } },
+    });
+    client.release();
+    const due = await t.order(DUE);
+    expect(due.payment_status).toBe("paid");
+    expect(due.fulfillment_status).toBe("ready");
+    expect(due.collected_payment_intent_id).toBe("pi_from_link");
+  });
+
+  it("puts orders that keep failing behind newer holds", async () => {
+    const t = await setup();
+    await t.pool.query(`UPDATE orders SET hold_release_error = 'stuck' WHERE order_id = $1`, [DUE]);
+    const seen: string[] = [];
+    t.stripe.link.mockImplementation(async (p: { idempotencyKey: string; metadata: { order_id: string } }) => {
+      seen.push(p.metadata.order_id);
+      return { id: `plink_${p.idempotencyKey.slice(-1)}`, url: `https://buy.stripe.com/test_${p.idempotencyKey.slice(-1)}`, active: true };
+    });
+    await runHoldReleaseOnce(t.pool, t.deps);
+    expect(seen).toEqual([KICKOFF, DUE]);
   });
 });

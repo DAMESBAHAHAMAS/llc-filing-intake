@@ -105,7 +105,17 @@ async function setup(opts: { without0039?: boolean } = {}) {
   const app = express();
   app.use(express.json());
   let enabled = true;
-  app.use(createPostFilingInterestsRouter({ db: pool, config: () => ({ ...postFilingConfig({}), enabled }), now: () => now }));
+  const routeAlerts: string[] = [];
+  app.use(
+    createPostFilingInterestsRouter({
+      db: pool,
+      config: () => ({ ...postFilingConfig({}), enabled }),
+      now: () => now,
+      alert: async (subject, body) => {
+        routeAlerts.push(`${subject}: ${body}`);
+      },
+    }),
+  );
   const server: http.Server = await new Promise((resolve) => {
     const s = app.listen(0, () => resolve(s));
   });
@@ -122,6 +132,7 @@ async function setup(opts: { without0039?: boolean } = {}) {
     deps,
     calls,
     alerts,
+    routeAlerts,
     post,
     get,
     setNow: (d: Date) => (now = d),
@@ -394,6 +405,11 @@ describe("ST17 fourth card: Dedicated Filing Support & Strategy (migration 0039)
     });
     const { rows } = await t.pool.query(`SELECT filing_support, version FROM post_filing_interests WHERE filing_session_id = $1`, [S1]);
     expect(rows).toEqual([{ filing_support: true, version: 1 }]);
+    // Not on the Deal until the picklist value exists, so each request reaches a person.
+    expect(t.routeAlerts).toHaveLength(1);
+    expect(t.routeAlerts[0]).toContain(S1);
+    await t.post({ filing_session_id: S1, order_id: O1, interest: "bank_account", selected: true });
+    expect(t.routeAlerts).toHaveLength(1);
   });
 
   it("keeps it out of the Zoho multi-select until the picklist value is configured", async () => {

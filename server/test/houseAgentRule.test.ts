@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentLineIssue, coversHouseAgent, houseAgentLineMissing } from "../src/offers/houseAgentRule.js";
+import { agentLineIssue, coversHouseAgent, dropBundledAgentLine, houseAgentLineMissing } from "../src/offers/houseAgentRule.js";
 
 const DIY = ["DIY_STATE_FEE", "DIY_SERVICE_FEE", "DIY_CERT_OF_STATUS"];
 
@@ -49,5 +49,15 @@ describe("the $98 agent line is never sold twice", () => {
     expect(agentLineIssue([...DIY, "REGISTERED_AGENT_3YR"], [])).toBeNull();
     expect(agentLineIssue(["REGISTERED_AGENT_3YR"], DIY)).toBeNull();
     expect(agentLineIssue(["FASTTRACK"], ["FASTTRACK"])).toBeNull();
+  });
+});
+
+describe("dropBundledAgentLine", () => {
+  it("drops the $98 line only when a package in the cart includes it", () => {
+    const ra = { offer_code: "REGISTERED_AGENT_3YR", quantity: 1 };
+    expect(dropBundledAgentLine([{ offer_code: "FASTTRACK", quantity: 1 }, ra])).toEqual([{ offer_code: "FASTTRACK", quantity: 1 }]);
+    expect(dropBundledAgentLine([{ offer_code: "PREMIUM", quantity: 1 }, ra])).toEqual([{ offer_code: "PREMIUM", quantity: 1 }]);
+    const diy = [{ offer_code: "DIY_STATE_FEE", quantity: 1 }, ra];
+    expect(dropBundledAgentLine(diy)).toBe(diy);
   });
 });

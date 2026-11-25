@@ -283,7 +283,7 @@ describe("POST /api/checkout/create with the Finance-Ready kickoff", () => {
 
   it("refuses a kickoff cart with anything besides PREMIUM, an unknown plan, or the switch off", async () => {
     const fs = await newSession();
-    const extra = await create({ ...kickoffBody(fs), line_items: [{ offer_code: "PREMIUM" }, { offer_code: "REGISTERED_AGENT_3YR" }] });
+    const extra = await create({ ...kickoffBody(fs), line_items: [{ offer_code: "PREMIUM" }, { offer_code: "EIN_FILING" }] });
     expect(extra.status).toBe(422);
     expect((await create({ ...kickoffBody(fs), line_items: [{ offer_code: "FASTTRACK" }] })).status).toBe(422);
     expect((await create({ ...kickoffBody(fs), payment_plan: "pay_later" })).status).toBe(400);
@@ -334,11 +334,19 @@ describe("registered agent included in Bank-Ready and Finance-Ready (25 Nov 2026
     expect(withAgent.body.total_cents).toBe(13900 + 9800);
   });
 
-  it("refuses the $98 line on top of Bank-Ready, so nobody pays twice", async () => {
+  it("drops the $98 line sent beside Bank-Ready (website main before the 25 Nov change), so nobody pays twice", async () => {
     const r = await create({ filing_session_id: await newSession(), line_items: [{ offer_code: "FASTTRACK" }, { offer_code: "REGISTERED_AGENT_3YR" }] });
-    expect(r.status).toBe(422);
-    expect(r.body.reason).toBe("bundled_in_cart");
-    expect(stripeBodies).toHaveLength(0);
+    expect(r.status).toBe(200);
+    expect(r.body.total_cents).toBe(49900);
+    expect(stripeBodies[0]).toContain("line_items[0][price]=price_bank_499");
+    expect(stripeBodies[0]).not.toContain("price_ra");
+  });
+
+  it("drops it beside the Finance-Ready kickoff too: the hold stays $139", async () => {
+    const r = await create({ ...kickoffBody(await newSession()), line_items: [{ offer_code: "PREMIUM" }, { offer_code: "REGISTERED_AGENT_3YR" }] });
+    expect(r.status).toBe(200);
+    expect(r.body.total_cents).toBe(13900);
+    expect(stripeBodies[0]).not.toContain("price_ra");
   });
 
   it("after a held Bank-Ready order the $98 line is never sold to the same session", async () => {

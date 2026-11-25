@@ -23,6 +23,23 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS hold_release_error text;
 -- Set when an ops alert was sent INSTEAD of releasing the hold: a hold placed
 -- before HOLD_RELEASE_START, or one with proof of filing already recorded.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS hold_release_alerted_at timestamptz;
+-- Rule 1: the hold is captured when the Articles are submitted to Sunbiz
+-- (POST /api/orders/:orderId/sunbiz-submitted), not when Florida files them.
+-- A submitted order is never released by the Day-5 job.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS sunbiz_submitted_at timestamptz;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS sunbiz_submission_ref text;
+-- Stripe's cancellation_reason from payment_intent.canceled ("automatic" when
+-- the hold lapsed by itself, "abandoned" for the Day-5 job, "requested_by_customer"
+-- for an operator release). A lapsed hold still gets the Payment Link.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS hold_cancellation_reason text;
+-- The PaymentIntent that actually collected the money when it is not the hold
+-- (the customer paid the Day-5 Payment Link), so a later refund finds the order.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS collected_payment_intent_id text;
+-- Set when an operator closed (deactivated) the Day-5 Payment Link.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_link_closed_at timestamptz;
+
+CREATE INDEX IF NOT EXISTS idx_orders_collected_payment_intent_id
+  ON orders (collected_payment_intent_id) WHERE collected_payment_intent_id IS NOT NULL;
 
 COMMENT ON COLUMN orders.hold_auto_released_at IS
   'When the Day-5 job (payments/holdRelease.ts) released this uncaptured hold and queued the Payment Link email.';

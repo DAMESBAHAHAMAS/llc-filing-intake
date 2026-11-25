@@ -4,6 +4,12 @@
 -- Drops the Payment Link record of any order already released by the job;
 -- copy those rows first if they are needed.
 BEGIN;
+DROP INDEX IF EXISTS idx_orders_collected_payment_intent_id;
+ALTER TABLE orders DROP COLUMN IF EXISTS payment_link_closed_at;
+ALTER TABLE orders DROP COLUMN IF EXISTS collected_payment_intent_id;
+ALTER TABLE orders DROP COLUMN IF EXISTS hold_cancellation_reason;
+ALTER TABLE orders DROP COLUMN IF EXISTS sunbiz_submission_ref;
+ALTER TABLE orders DROP COLUMN IF EXISTS sunbiz_submitted_at;
 ALTER TABLE orders DROP COLUMN IF EXISTS hold_release_alerted_at;
 ALTER TABLE orders DROP COLUMN IF EXISTS hold_release_error;
 ALTER TABLE orders DROP COLUMN IF EXISTS payment_link_url;

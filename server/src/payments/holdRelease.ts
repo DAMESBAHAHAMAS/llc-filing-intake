@@ -17,14 +17,21 @@ import { fulfillmentAfterPaymentEnds } from "./holdState.js";
  * Day-5 card-hold release: the owner's final hold rule (Damian, 25 Nov 2026;
  * A6Y2-T144 final pre-launch round; memory "ffl-final-hold-rule"):
  *
- *  1. A hold is captured when the filing is submitted to Sunbiz (routes/orders.ts).
+ *  1. A hold is captured when the Articles are submitted to Sunbiz: the operator
+ *     calls POST /api/orders/:orderId/sunbiz-submitted (routes/orders.ts), which
+ *     records sunbiz_submitted_at and captures. A submitted order is never
+ *     released here, whatever Florida's turnaround.
  *  2. A lapsed or released hold is NEVER charged off-session.
- *  3. A hold still uncaptured 120 hours after it was placed is released here:
- *     the PaymentIntent is cancelled, the order is marked released, the Zoho Deal
- *     gets Payment_Status "Hold Released" and Hold_Expires (the release time), and
- *     the customer is emailed a one-time Stripe Payment Link for the same amount.
- *     Its PaymentIntent carries metadata.order_id, so the existing webhook
- *     (payment_intent.succeeded) marks the order paid when the customer pays.
+ *  3. A hold still uncaptured 120 hours after it was placed (or 1 hour before
+ *     Stripe's own capture_before, if that comes first) is released here: the
+ *     PaymentIntent is cancelled, the order is marked released, the Zoho Deal
+ *     gets Payment_Status = HOLD_EXPIRED_ZOHO_VALUE and Hold_Expires (the release
+ *     time), and the customer is emailed a one-time Stripe Payment Link for the
+ *     same amount. Its PaymentIntent carries metadata.order_id, so the existing
+ *     webhook (payment_intent.succeeded) marks the order paid when the customer pays.
+ *  4. A hold that lapsed on its own before the job reached it (Stripe's
+ *     payment_intent.canceled with cancellation_reason "automatic") gets the same
+ *     Deal update, link and email; nothing is cancelled, it is already gone.
  *
  * Safe rollout:
  *  - HOLD_RELEASE_START (default 2026-11-25, midnight Florida time): only holds
@@ -42,6 +49,16 @@ import { fulfillmentAfterPaymentEnds } from "./holdState.js";
 
 export const DEFAULT_HOLD_RELEASE_START = "2026-11-25";
 export const DEFAULT_HOLD_RELEASE_AFTER_HOURS = 120;
+/**
+ * The Zoho Deal Payment_Status value written when the job releases a hold.
+ * Owner decision: "Hold Expired". Zoho has no such picklist value yet, so the
+ * default is the existing "Hold Released" until Damian adds "Hold Expired" and
+ * sets HOLD_EXPIRED_ZOHO_VALUE=Hold Expired (merge checklist).
+ */
+export const DEFAULT_HOLD_EXPIRED_ZOHO_VALUE = "Hold Released";
+/** Stripe cancellation reasons that mean the hold lapsed by itself. */
+export const LAPSED_REASONS = ["automatic", "expired"] as const;
+const LAPSED_SQL = `('automatic', 'expired')`;
 /** A Stripe card hold lasts 7 days; releasing at or after that would be pointless. */
 const MAX_AFTER_HOURS = 7 * 24 - 1;
 const BATCH = 20;
@@ -53,6 +70,8 @@ export interface HoldReleaseConfig {
   afterHours: number;
   /** Set when an env value is unusable; the job then does nothing. */
   error?: string;
+  /** Zoho Deal Payment_Status for a released hold (HOLD_EXPIRED_ZOHO_VALUE). */
+  zohoPaymentStatus: string;
 }
 
 /** Midnight of a YYYY-MM-DD date in Florida (America/New_York), as an instant. */
@@ -76,14 +95,15 @@ export function holdReleaseConfig(env: Record<string, string | undefined> = proc
   const start = floridaMidnight(startRaw) ?? (/^\d{4}-\d{2}-\d{2}T/.test(startRaw) ? new Date(startRaw) : null);
   const afterRaw = (env.HOLD_RELEASE_AFTER_HOURS ?? "").trim();
   const afterHours = afterRaw ? Number(afterRaw) : DEFAULT_HOLD_RELEASE_AFTER_HOURS;
+  const zohoPaymentStatus = (env.HOLD_EXPIRED_ZOHO_VALUE ?? "").trim() || DEFAULT_HOLD_EXPIRED_ZOHO_VALUE;
 
   if (!start || Number.isNaN(start.getTime())) {
-    return { enabled: false, start: new Date(NaN), afterHours, error: `HOLD_RELEASE_START "${startRaw}" is not a date (YYYY-MM-DD)` };
+    return { enabled: false, start: new Date(NaN), afterHours, zohoPaymentStatus, error: `HOLD_RELEASE_START "${startRaw}" is not a date (YYYY-MM-DD)` };
   }
   if (!Number.isFinite(afterHours) || afterHours < 24 || afterHours > MAX_AFTER_HOURS) {
-    return { enabled: false, start, afterHours, error: `HOLD_RELEASE_AFTER_HOURS "${afterRaw}" must be between 24 and ${MAX_AFTER_HOURS}` };
+    return { enabled: false, start, afterHours, zohoPaymentStatus, error: `HOLD_RELEASE_AFTER_HOURS "${afterRaw}" must be between 24 and ${MAX_AFTER_HOURS}` };
   }
-  return { enabled, start, afterHours };
+  return { enabled, start, afterHours, zohoPaymentStatus };
 }
 
 export interface HoldReleaseDeps {
@@ -151,7 +171,7 @@ export function zohoDateTime(at: Date): string {
 
 function isMissingColumn(err: unknown): boolean {
   const e = err as { code?: string; message?: string };
-  return e?.code === "42703" || /column .*(hold_release|hold_auto_released|payment_link).* does not exist/i.test(e?.message ?? "");
+  return e?.code === "42703" || /column .*(hold_release|hold_auto_released|payment_link|sunbiz_submitted|hold_cancellation|capture_before).* does not exist/i.test(e?.message ?? "");
 }
 
 let missingColumnLogged = false;
@@ -197,7 +217,7 @@ async function alertOldHolds(pool: Pool, deps: HoldReleaseDeps, cfg: HoldRelease
 async function alertHeldWithProof(pool: Pool, deps: HoldReleaseDeps, cfg: HoldReleaseConfig, cutoff: Date): Promise<string[]> {
   const { rows } = await pool.query<{ order_id: string; capture_error: string | null }>(
     `SELECT order_id, capture_error FROM orders
-     WHERE payment_status = 'authorized' AND proof_of_filing_at IS NOT NULL
+     WHERE payment_status = 'authorized' AND (proof_of_filing_at IS NOT NULL OR sunbiz_submitted_at IS NOT NULL)
        AND authorized_at >= $1 AND authorized_at <= $2 AND hold_release_alerted_at IS NULL`,
     [cfg.start, cutoff]
   );
@@ -207,7 +227,7 @@ async function alertHeldWithProof(pool: Pool, deps: HoldReleaseDeps, cfg: HoldRe
   await deps.alert(
     "Filed orders still not collected at Day 5",
     [
-      "Proof of filing is recorded but the hold was not captured, so the Day-5 job leaves these alone. Retry the capture (POST /api/orders/:orderId/proof-of-filing) before the hold expires.",
+      "These orders were submitted to Sunbiz (or have proof of filing) but the hold was not captured, so the Day-5 job leaves them alone. Retry the capture (POST /api/orders/:orderId/sunbiz-submitted) before the hold expires.",
       ...rows.map((r) => `- ${r.order_id}${r.capture_error ? ` (last error: ${r.capture_error})` : ""}`),
     ].join("\n")
   );
@@ -238,7 +258,8 @@ async function finishRelease(
   pool: Pool,
   row: CandidateRow,
   link: StripePaymentLink,
-  at: Date
+  at: Date,
+  zohoPaymentStatus: string
 ): Promise<"released" | "changed" | "email_not_queued"> {
   const client: PoolClient = await pool.connect();
   let emailQueued = true;
@@ -263,13 +284,15 @@ async function finishRelease(
        WHERE order_id = $1`,
       [row.order_id, at, fulfillment, link.id, link.url]
     );
-    // Field-only Deal update (Stage unchanged). "Hold Released" is the existing
-    // Payment_Status value the webhook already writes; Hold_Expires is the existing
-    // Deals datetime field, set to the moment the hold was released.
+    // Field-only Deal update (Stage unchanged). Payment_Status is the owner's
+    // "Hold Expired" marker once Zoho has that value (HOLD_EXPIRED_ZOHO_VALUE);
+    // Hold_Expires is the existing Deals datetime field, set to the release time.
+    // The webhook skips its own Deal update for this job's cancel, so this is the
+    // only one for a Day-5 release.
     await enqueueDealUpdate(
       client,
       { order_id: row.order_id, filing_session_id: row.filing_session_id, crm_deal_id: current.crm_deal_id },
-      { extra_fields: { Payment_Status: "Hold Released", Hold_Expires: zohoDateTime(at) } }
+      { extra_fields: { Payment_Status: zohoPaymentStatus, Hold_Expires: zohoDateTime(at) } }
     );
     emailQueued = await enqueueCustomerEmails(client, {
       orderId: row.order_id,
@@ -304,18 +327,24 @@ export async function runHoldReleaseOnce(pool: Pool, deps: HoldReleaseDeps = def
   try {
     result.alertedLegacy = await alertOldHolds(pool, deps, cfg);
     result.alertedWithProof = await alertHeldWithProof(pool, deps, cfg, cutoff);
+    // Due: 120 h after authorization, or 1 h before Stripe's own expiry if that
+    // comes first (holdSweep records capture_before). Rows that keep failing go
+    // last, so they never starve newer holds of the batch.
     candidates = (
       await pool.query<CandidateRow>(
         `SELECT order_id, filing_session_id, stripe_payment_intent_id, line_items, total_cents, payment_status, hold_release_error
          FROM orders
          WHERE stripe_payment_intent_id IS NOT NULL AND hold_auto_released_at IS NULL
            AND (
-             (payment_status = 'authorized' AND proof_of_filing_at IS NULL AND authorized_at >= $1 AND authorized_at <= $2)
+             (payment_status = 'authorized' AND proof_of_filing_at IS NULL AND sunbiz_submitted_at IS NULL AND authorized_at >= $1
+               AND (authorized_at <= $2 OR (capture_before IS NOT NULL AND capture_before <= $3)))
+             OR (payment_status = 'released' AND hold_release_started_at IS NULL AND authorized_at >= $1
+               AND hold_cancellation_reason IN ${LAPSED_SQL})
              OR (hold_release_started_at IS NOT NULL AND payment_status IN ('authorized', 'released'))
            )
-         ORDER BY authorized_at ASC
+         ORDER BY (hold_release_error IS NOT NULL) ASC, authorized_at ASC
          LIMIT ${BATCH}`,
-        [cfg.start, cutoff]
+        [cfg.start, cutoff, new Date(now.getTime() + 3600 * 1000)]
       )
     ).rows;
   } catch (err) {
@@ -338,11 +367,17 @@ export async function runHoldReleaseOnce(pool: Pool, deps: HoldReleaseDeps = def
         continue;
       }
 
-      // Take the order before any Stripe call. Only a held order, or one this job already took.
+      // Take the order before any Stripe call: one this job already took, a held
+      // order still not filed or submitted (re-checked here, so proof or a Sunbiz
+      // submission recorded since the SELECT wins), or a hold that lapsed by itself.
       const taken = await pool.query(
         `UPDATE orders SET hold_release_started_at = COALESCE(hold_release_started_at, $2)
          WHERE order_id = $1 AND hold_auto_released_at IS NULL
-           AND (payment_status = 'authorized' OR (hold_release_started_at IS NOT NULL AND payment_status = 'released'))
+           AND (
+             (hold_release_started_at IS NOT NULL AND payment_status IN ('authorized', 'released'))
+             OR (payment_status = 'authorized' AND proof_of_filing_at IS NULL AND sunbiz_submitted_at IS NULL)
+             OR (payment_status = 'released' AND hold_cancellation_reason IN ${LAPSED_SQL})
+           )
          RETURNING order_id`,
         [row.order_id, now]
       );
@@ -351,7 +386,8 @@ export async function runHoldReleaseOnce(pool: Pool, deps: HoldReleaseDeps = def
         continue;
       }
 
-      const cancelled = await cancelHold(deps, row);
+      // A released order's hold is already gone (lapsed, or cancelled by an earlier run).
+      const cancelled = row.payment_status === "released" ? "ok" : await cancelHold(deps, row);
       if (cancelled === "captured") {
         // Collected meanwhile: the webhook marks it paid. Nothing to release.
         await pool.query(`UPDATE orders SET hold_release_started_at = NULL WHERE order_id = $1 AND hold_auto_released_at IS NULL`, [row.order_id]);
@@ -378,7 +414,7 @@ export async function runHoldReleaseOnce(pool: Pool, deps: HoldReleaseDeps = def
         continue;
       }
 
-      const outcome = await finishRelease(pool, row, link, now);
+      const outcome = await finishRelease(pool, row, link, now, cfg.zohoPaymentStatus);
       if (outcome === "changed") {
         result.skipped.push(row.order_id);
         continue;

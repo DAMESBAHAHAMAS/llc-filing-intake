@@ -45,7 +45,6 @@ async function placeHold(customer: string, label: string): Promise<StripePayment
     payment_method: "pm_card_visa",
     "payment_method_types[]": "card",
     capture_method: "manual",
-    setup_future_usage: "off_session",
     confirm: "true",
     "metadata[order_id]": label,
     "metadata[purpose]": "card-hold round trip (test mode)",

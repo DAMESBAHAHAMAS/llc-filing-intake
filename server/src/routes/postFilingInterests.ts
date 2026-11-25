@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
+import { sendOpsAlert } from "../ops/alerts.js";
 import {
   cleanNote,
   isInterest,
@@ -33,9 +34,10 @@ import {
  * Deal is never taken from the request: postFiling/interests.ts resolves it.
  */
 export function createPostFilingInterestsRouter(
-  deps: { db?: Db; config?: () => PostFilingConfig; now?: () => Date } = {},
+  deps: { db?: Db; config?: () => PostFilingConfig; now?: () => Date; alert?: (subject: string, body: string) => Promise<unknown> } = {},
 ): Router {
   const db = deps.db ?? pool;
+  const alert = deps.alert ?? sendOpsAlert;
   const config = deps.config ?? (() => postFilingConfig());
   const now = deps.now ?? (() => new Date());
   const router = Router();
@@ -108,6 +110,15 @@ export function createPostFilingInterestsRouter(
       const note = interest === "licenses_permits" && body.note !== undefined ? cleanNote(body.note) : undefined;
       const state = await saveInterest(db, sid as string, interest, selected, note, now());
       res.status(200).json({ status: "saved", ...view(state) });
+      // Until Zoho has a picklist value for the fourth card (POST_FILING_SUPPORT_ZOHO_VALUE),
+      // the Deal does not show it, so each request reaches a person instead. After the answer.
+      if (interest === "filing_support" && selected && !config().filingSupportValue) {
+        await alert(
+          "Customer asked for Dedicated Filing Support & Strategy",
+          `Filing session ${sid}, order ${oid}: chose "Dedicated Filing Support & Strategy" on the thank-you page. ` +
+            "It is saved in post_filing_interests but not on the Zoho Deal until POST_FILING_SUPPORT_ZOHO_VALUE is set.",
+        ).catch((err) => console.error("[post-filing-interests] alert failed:", describeError(err)));
+      }
     } catch (err) {
       failed(res, err, "save");
     }

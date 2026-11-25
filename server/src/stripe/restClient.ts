@@ -157,9 +157,11 @@ export async function createCheckoutSession(params: CreateCheckoutSessionParams)
     ...(params.captureMode === "hold"
       ? {
           customer_creation: "always",
+          // No setup_future_usage: the card is never saved for later
+          // off-session charges (owner's final hold rule, 25 Nov 2026), so
+          // Checkout shows no "allow future charges" consent.
           payment_intent_data: {
             capture_method: "manual",
-            setup_future_usage: "off_session",
             metadata: params.paymentIntentMetadata,
           },
           // Extended holds (up to 30 days) are opt-in: Stripe rejected the
@@ -293,6 +295,11 @@ export async function createPaymentLink(params: CreatePaymentLinkParams): Promis
     },
     params.idempotencyKey
   );
+}
+
+/** Closes a Day-5 Payment Link so it can no longer be paid (order closed, cancelled or paid another way). */
+export async function deactivatePaymentLink(paymentLinkId: string, idempotencyKey: string): Promise<StripePaymentLink> {
+  return stripeRequest<StripePaymentLink>("POST", `/payment_links/${encodeURIComponent(paymentLinkId)}`, { active: false }, idempotencyKey);
 }
 
 /** Reads the hold expiry and extended-hold status from an expanded

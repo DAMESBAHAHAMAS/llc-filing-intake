@@ -5,7 +5,7 @@ import { describeError } from "../db/describeError.js";
 import { resolveActiveOffers } from "../offers/catalog.js";
 import { createCheckoutSession, StripeApiError } from "../stripe/restClient.js";
 import { getEinExpressAvailability } from "../ein/capacity.js";
-import { agentLineIssue, coversHouseAgent, houseAgentLineMissing } from "../offers/houseAgentRule.js";
+import { agentLineIssue, coversHouseAgent, dropBundledAgentLine, HOUSE_AGENT_OFFER_CODE, houseAgentLineMissing } from "../offers/houseAgentRule.js";
 import { einLineIssue } from "../offers/einBundleRule.js";
 import { getEinUpsell, orderedOfferCodes } from "../offers/einUpsell.js";
 import { holdsEnabled, requiresPayAfterFiling } from "../offers/payAfterFiling.js";
@@ -87,10 +87,17 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
     return;
   }
 
-  const requestedItems = parseLineItems(body);
-  if (!requestedItems) {
+  const parsedItems = parseLineItems(body);
+  if (!parsedItems) {
     res.status(400).json({ error: "line_items must be a non-empty array of { offer_code, quantity? }" });
     return;
+  }
+  // Bank-Ready and Finance-Ready include the 3-year registered agent (25 Nov 2026).
+  // A website build from before that still adds the $98 line beside them; it is
+  // dropped here, not refused, so the customer is charged the package price only.
+  const requestedItems = dropBundledAgentLine(parsedItems);
+  if (requestedItems.length !== parsedItems.length) {
+    console.log(`[checkout] dropped ${HOUSE_AGENT_OFFER_CODE}: included in ${requestedItems.map((i) => i.offer_code).join(", ")}`);
   }
 
   // Finance-Ready kickoff hold: validated before any database or Stripe work.
@@ -156,7 +163,8 @@ checkoutRouter.post("/api/checkout/create", async (req, res) => {
       });
       return;
     }
-    // ...and the $98 line is never sold on top of a package that includes it.
+    // ...and the $98 line is never sold on top of a package that includes it
+    // (in the cart it was dropped above; this refuses it after an earlier order).
     const agentIssue = agentLineIssue(uniqueCodes, previousCodes);
     if (agentIssue) {
       res.status(422).json({
