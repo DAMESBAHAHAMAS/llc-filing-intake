@@ -1,9 +1,12 @@
 import hmac
+import io
 import os
 import re
 
 from flask import Flask, Response, jsonify, request
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, TemplateNotFound, UndefinedError
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import NameObject
 from weasyprint import HTML
 from werkzeug.utils import secure_filename
 
@@ -98,6 +101,103 @@ def generate_pdf():
         pdf_bytes,
         mimetype="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ── IRS Form SS-4 (T144 Dispatch 11) ─────────────────────────────────────
+# Fills the official fillable Form SS-4 (assets/irs/fss4.pdf, see SOURCE.md)
+# with values built by server/src/ein/ss4.ts. Fills only: nothing here faxes,
+# files or stores anything. An unknown field name is refused (422), so an IRS
+# revision of the form can never silently drop a line.
+SS4_PATH = os.path.join(BASE_DIR, "assets", "irs", "fss4.pdf")
+SS4_PREFIX = "topmostSubform[0].Page1[0]."
+_SS4_MAX_TEXT = 200
+_WATERMARK = re.compile(r"[A-Za-z0-9 .,:\-]{1,40}")
+
+
+def _ss4_widgets(writer):
+    """short field name -> (qualified name, field type, on-states) for every widget on page 1."""
+    out = {}
+    for annot in writer.pages[0].get("/Annots", []):
+        a = annot.get_object()
+        if a.get("/Subtype") != "/Widget" or "/T" not in a:
+            continue
+        name = str(a["/T"])
+        parent = a.get("/Parent")
+        qualified = name
+        while parent is not None:
+            p = parent.get_object()
+            if "/T" in p:
+                qualified = f"{p['/T']}.{qualified}"
+            parent = p.get("/Parent")
+        short = qualified[len(SS4_PREFIX):] if qualified.startswith(SS4_PREFIX) else qualified
+        states = []
+        ap = a.get("/AP", {}).get("/N") if a.get("/AP") else None
+        if ap is not None and hasattr(ap, "keys"):
+            states = [k for k in ap.keys() if k != "/Off"]
+        out[short] = (a, str(a.get("/FT", "")), states)
+    return out
+
+
+@app.route("/generate-ss4", methods=["POST"])
+def generate_ss4():
+    if not _is_authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    values = body.get("values") or {}
+    text = values.get("text") or {}
+    checks = values.get("check") or []
+    watermark = body.get("watermark")
+
+    if not isinstance(text, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in text.items()):
+        return jsonify({"error": "values.text must map field names to strings"}), 400
+    if not isinstance(checks, list) or not all(
+        isinstance(c, list) and len(c) == 2 and all(isinstance(x, str) for x in c) for c in checks
+    ):
+        return jsonify({"error": "values.check must be a list of [field, on_state] pairs"}), 400
+    if any(len(v) > _SS4_MAX_TEXT for v in text.values()):
+        return jsonify({"error": f"text values are limited to {_SS4_MAX_TEXT} characters"}), 422
+    if watermark is not None and not (isinstance(watermark, str) and _WATERMARK.fullmatch(watermark)):
+        return jsonify({"error": "watermark must be 1-40 letters, digits, spaces or . , : -"}), 422
+
+    writer = PdfWriter(clone_from=PdfReader(SS4_PATH))
+    widgets = _ss4_widgets(writer)
+
+    unknown = sorted(
+        [k for k in text if k not in widgets or widgets[k][1] != "/Tx"]
+        + [f for f, _ in checks if f not in widgets or widgets[f][1] != "/Btn"]
+    )
+    if unknown:
+        return jsonify({"error": "unknown or mismatched SS-4 fields (form revised?)", "fields": unknown}), 422
+    bad_states = sorted(f for f, on in checks if on not in widgets[f][2])
+    if bad_states:
+        return jsonify({"error": "checkbox on-state not on this form revision", "fields": bad_states}), 422
+
+    writer.update_page_form_field_values(
+        writer.pages[0], {SS4_PREFIX + k: v for k, v in text.items()}, auto_regenerate=False
+    )
+    for field, on in checks:
+        widget = widgets[field][0]
+        widget[NameObject("/V")] = NameObject(on)
+        widget[NameObject("/AS")] = NameObject(on)
+    writer.set_need_appearances_writer(True)
+
+    if watermark:
+        mark = HTML(string=(
+            "<style>@page{size:letter;margin:0}body{margin:0;height:11in;display:flex;align-items:center;"
+            "justify-content:center}p{transform:rotate(-30deg);font:bold 54pt sans-serif;"
+            "color:rgba(200,0,0,.18);white-space:nowrap}</style>"
+            f"<p>{watermark}</p>"
+        )).write_pdf()
+        writer.pages[0].merge_page(PdfReader(io.BytesIO(mark)).pages[0], over=True)
+
+    buf = io.BytesIO()
+    writer.write(buf)
+    return Response(
+        buf.getvalue(),
+        mimetype="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="Form_SS-4.pdf"'},
     )
 
 
