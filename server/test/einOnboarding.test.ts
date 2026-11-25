@@ -17,10 +17,11 @@ import {
   onboardingTokenFor,
   onboardingUrlFor,
   packageFromCodes,
+  successPageTokenFor,
   validateSubmission,
   type EinOnboardingConfig,
 } from "../src/ein/onboarding.js";
-import { createEinOnboardingRouter } from "../src/routes/einOnboarding.js";
+import { createEinOnboardingRouter, einOnboardingPreParse } from "../src/routes/einOnboarding.js";
 import { buildOrderEmail, type OrderEmailRow } from "../src/orderEmails/templates.js";
 
 /**
@@ -100,6 +101,20 @@ describe("configuration gate", () => {
   });
 });
 
+describe("success page token (the order endpoint is public)", () => {
+  const open: EinOnboardingConfig = { enabled: true, tokenSecret: SECRET, requireToken: true, einDocsReceivedField: "", frontendBaseUrl: "" };
+  const now = 1_800_000_000;
+
+  it("is issued only within two hours of the hold or charge, and expires with that window", () => {
+    const t = successPageTokenFor(open, SID, new Date((now - 60 * 60) * 1000), now)!;
+    expect(verifyEinOnboardingToken(SECRET, SID, t, now + 59 * 60)).toBe("ok");
+    expect(verifyEinOnboardingToken(SECRET, SID, t, now + 61 * 60)).toBe("expired");
+    expect(successPageTokenFor(open, SID, new Date((now - 3 * 60 * 60) * 1000), now)).toBeNull();
+    expect(successPageTokenFor(open, SID, null, now)).toBeNull();
+    expect(successPageTokenFor({ ...open, enabled: false }, SID, new Date(now * 1000), now)).toBeNull();
+  });
+});
+
 describe("Form SS-4 summary", () => {
   it("pre-fills what we hold, with the LLC name in ALL CAPS", () => {
     const lines = buildSs4Summary(
@@ -170,6 +185,21 @@ describe("validateSubmission", () => {
     expect(validateSubmission(body({ attestation_version: "old" })).ok).toBe(false);
   });
 
+  it("catches spaced and dotted SSNs, and the dashed shape even in phone and postal code", () => {
+    for (const v of ["123 45 6789", "123.45.6789", "123456789"]) {
+      const rp = { ...body().responsible_party, address_city: v };
+      expect(validateSubmission(body({ responsible_party: rp })).ok).toBe(false);
+    }
+    for (const key of ["phone", "address_postal_code"]) {
+      const rp = { ...body().responsible_party, [key]: "123-45-6789" };
+      expect(validateSubmission(body({ responsible_party: rp })).ok).toBe(false);
+    }
+    const ok = { ...body().responsible_party, phone: "+34 612 345 678", address_postal_code: "33139-1234" };
+    expect(validateSubmission(body({ responsible_party: ok })).ok).toBe(true);
+    const longPostal = { ...body().responsible_party, address_postal_code: "1234567890123" };
+    expect(validateSubmission(body({ responsible_party: longPostal })).ok).toBe(false);
+  });
+
   it("checks the passport by its bytes, type and size", () => {
     expect(validateSubmission(body({ passport: { content_type: "image/jpeg", data_base64: PNG.toString("base64") } })).ok).toBe(false);
     expect(validateSubmission(body({ passport: { content_type: "image/jpeg", data_base64: JPEG.toString("base64") } })).ok).toBe(true);
@@ -188,13 +218,15 @@ describe("validateSubmission", () => {
 interface FakeState {
   session: Record<string, unknown> | null;
   codes: string[];
-  deal: { crm_deal_id: string; order_id: string } | null;
+  deal: { crm_deal_id: string | null; order_id: string } | null;
   submissions: Map<string, Record<string, unknown>>;
   alerts: string[];
   attachOk: boolean;
   attached: number;
   marked: Array<{ field: string }>;
   config: EinOnboardingConfig;
+  dealQueryCodes?: string[];
+  failAfterUpload?: boolean;
 }
 
 let state: FakeState;
@@ -207,13 +239,25 @@ const fakeDb = {
       const row = state.submissions.get(params[0] as string);
       return { rows: row ? [row] : [] };
     }
-    if (sql.includes("SELECT crm_deal_id, order_id FROM orders")) return { rows: state.deal ? [state.deal] : [] };
+    if (sql.includes("SELECT crm_deal_id, order_id FROM orders")) {
+      state.dealQueryCodes = params[1] as string[];
+      return { rows: state.deal ? [state.deal] : [] };
+    }
+    if (sql.includes("DELETE FROM ein_onboarding_submissions")) {
+      state.submissions.delete(params[0] as string);
+      return { rows: [] };
+    }
     if (sql.includes("INSERT INTO ein_onboarding_submissions")) {
       const id = params[0] as string;
       if (state.submissions.has(id)) return { rows: [] };
       const row = { signed_at: new Date("2026-11-25T10:00:00Z"), params };
       state.submissions.set(id, row);
       return { rows: [row] };
+    }
+    if (sql.includes("SET zoho_attachment_id")) {
+      if (state.failAfterUpload) throw new Error("db went away");
+      Object.assign(state.submissions.get(params[0] as string) ?? {}, { zoho_attachment_id: params[1] });
+      return { rows: [] };
     }
     if (sql.includes("UPDATE ein_onboarding_submissions")) {
       Object.assign(state.submissions.get(params[0] as string) ?? {}, { crm_status: params[1], crm_error: params[2] });
@@ -228,7 +272,7 @@ let baseUrl: string;
 
 beforeAll(async () => {
   const app = express();
-  app.use("/api/onboarding/ein", express.json({ limit: "15mb" }));
+  app.use("/api/onboarding/ein", einOnboardingPreParse(() => state.config), express.json({ limit: "15mb" }));
   app.use(
     createEinOnboardingRouter({
       db: fakeDb,
@@ -312,6 +356,18 @@ describe("GET /api/onboarding/ein", () => {
   });
 });
 
+describe("POST /api/onboarding/ein/load (token in the body, out of request logs)", () => {
+  it("returns the same form as the GET", async () => {
+    const res = await fetch(`${baseUrl}/api/onboarding/ein/load`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filing_session_id: SID, t: token() }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: "open", llc_name: "SUNSHINE HOLDINGS LLC" });
+  });
+});
+
 describe("POST /api/onboarding/ein", () => {
   it("attaches the passport, records the signature with server time and IP, marks the Deal and alerts the team", async () => {
     const res = await post(body({ t: token() }));
@@ -320,11 +376,12 @@ describe("POST /api/onboarding/ein", () => {
     expect(state.attached).toBe(1);
     const saved = state.submissions.get(SID) as { params: unknown[]; crm_status: string };
     expect(saved.params[6]).toBe("deal-9"); // the verified order's Deal
-    expect(saved.params[8]).toBe("ada lovelace"); // the signature exactly as typed
-    expect(saved.params[10]).toMatch(/^[0-9a-f]{64}$/); // attestation hash
-    expect(saved.params[11]).toBe("203.0.113.7"); // signer IP, as seen by the server
+    expect(saved.params[7]).toBe("ada lovelace"); // the signature exactly as typed
+    expect(saved.params[9]).toMatch(/^[0-9a-f]{64}$/); // attestation hash
+    expect(saved.params[10]).toBe("203.0.113.7"); // signer IP, as seen by the server
     expect(JSON.stringify(saved.params)).not.toContain(PNG.toString("base64")); // image never stored
     expect(saved.crm_status).toBe("done_note");
+    expect(state.dealQueryCodes).toEqual(expect.arrayContaining(["FASTTRACK", "PREMIUM", "EIN_FILING"]));
     expect(state.marked).toEqual([{ field: "" }]);
     expect(state.alerts.at(-1)).toMatch(/^EIN details received — SUNSHINE HOLDINGS LLC/);
     expect(state.alerts.at(-1)).not.toMatch(/Ada|London/);
@@ -343,6 +400,20 @@ describe("POST /api/onboarding/ein", () => {
     expect(state.attached).toBe(1);
   });
 
+  it("still confirms to the customer when a step after the upload fails, and tells the team", async () => {
+    state.failAfterUpload = true;
+    const res = await post(body({ t: token() }));
+    expect(res.status).toBe(200);
+    expect(state.attached).toBe(1);
+    expect(state.alerts.at(-1)).toMatch(/follow-up failed/);
+  });
+
+  it("uploads once when two submits race", async () => {
+    const [a, b] = await Promise.all([post(body({ t: token() })), post(body({ t: token() }))]);
+    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    expect(state.attached).toBe(1);
+  });
+
   it("stores nothing when the Zoho upload fails, and tells the team", async () => {
     state.attachOk = false;
     const res = await post(body({ t: token() }));
@@ -352,6 +423,8 @@ describe("POST /api/onboarding/ein", () => {
   });
 
   it("waits for the verified Deal instead of using a client-supplied one", async () => {
+    state.deal = { crm_deal_id: null, order_id: "x" };
+    expect((await post(body({ t: token() }))).status).toBe(503);
     state.deal = null;
     const res = await post(body({ t: token() }));
     expect(res.status).toBe(503);
@@ -362,6 +435,20 @@ describe("POST /api/onboarding/ein", () => {
     const res = await post(body({ t: token(), no_ssn_confirmed: false }));
     expect(res.status).toBe(422);
     expect(state.attached).toBe(0);
+  });
+
+  it("refuses a closed form or an oversized body before reading it", async () => {
+    state.config.enabled = false;
+    expect(await (await post(body({ t: token() }))).json()).toEqual({ error: "not_open" });
+    state.config.enabled = true;
+    const res = await fetch(`${baseUrl}/api/onboarding/ein`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": String(16 * 1024 * 1024) },
+      body: "{}",
+    }).catch(() => null);
+    // Either the gate answers 413 or the client aborts the mismatched body; nothing is stored.
+    if (res) expect(res.status).toBe(413);
+    expect(state.submissions.size).toBe(0);
   });
 
   it("is closed and token-gated on POST too", async () => {

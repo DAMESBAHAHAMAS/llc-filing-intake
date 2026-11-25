@@ -1,4 +1,4 @@
-import { Router, type Request, type Response } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
 import { orderedOfferCodes, type Queryable } from "../offers/einUpsell.js";
@@ -6,6 +6,7 @@ import { sendOpsAlert } from "../ops/alerts.js";
 import { clientKey } from "../middleware/rateLimit.js";
 import { realEinDocsClient, type EinDocsClient } from "../zoho/einDocs.js";
 import { verifyEinOnboardingToken } from "../ein/onboardingToken.js";
+import { BUNDLES_EIN, EIN_OFFER_CODES } from "../offers/einBundleRule.js";
 import {
   ATTESTATION_VERSION,
   attestationText,
@@ -21,8 +22,10 @@ import {
 /**
  * ST17 (A6Y2-T144 item 6): tokenized EIN / Form SS-4 onboarding.
  *
- *   GET  /api/onboarding/ein?filing_session_id=…&t=…  → the pre-filled form
- *   POST /api/onboarding/ein                           → Responsible Party, passport, e-signature
+ *   POST /api/onboarding/ein/load { filing_session_id, t }  → the pre-filled form
+ *   GET  /api/onboarding/ein?filing_session_id=…&t=…       → same (kept for the first website
+ *        release; the body form keeps the token out of request logs)
+ *   POST /api/onboarding/ein                                → Responsible Party, passport, e-signature
  *
  * Closed (503 { error: "not_open" }) until EIN_ONBOARDING_ENABLED=true: the owner has
  * not yet approved passport storage, the access token and the SS-4 attestation text.
@@ -41,6 +44,28 @@ export interface EinOnboardingDeps {
   docs: EinDocsClient;
   alert: (subject: string, body: string) => Promise<unknown>;
   config: () => EinOnboardingConfig;
+}
+
+const MAX_BODY_BYTES = 15 * 1024 * 1024;
+
+/**
+ * Runs before the 15 MB JSON parser on this path (index.ts), after the rate limiter: a
+ * closed form, or a body that declares itself too large, is refused without reading it.
+ */
+export function einOnboardingPreParse(config: () => EinOnboardingConfig = () => einOnboardingConfig()) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (req.method === "OPTIONS") return next();
+    if (!onboardingOpen(config())) {
+      res.status(503).json({ error: "not_open" });
+      return;
+    }
+    const declared = Number(req.get("content-length") ?? 0);
+    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+      res.status(413).json({ error: "too_large" });
+      return;
+    }
+    next();
+  };
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -92,9 +117,9 @@ async function existingSubmission(db: Queryable, sessionId: string): Promise<str
 export function createEinOnboardingRouter(deps: EinOnboardingDeps): Router {
   const router = Router();
 
-  router.get("/api/onboarding/ein", async (req: Request, res: Response) => {
+  const load = async (res: Response, sessionIdRaw: unknown, token: unknown) => {
     try {
-      const g = await gate(deps, req.query.filing_session_id, req.query.t);
+      const g = await gate(deps, sessionIdRaw, token);
       if (!g.ok) {
         res.status(g.status).json(g.body);
         return;
@@ -113,9 +138,16 @@ export function createEinOnboardingRouter(deps: EinOnboardingDeps): Router {
         attestation: { version: ATTESTATION_VERSION, text: attestationText(g.llcName) },
       });
     } catch (err) {
-      res.status(500).json({ error: "lookup_failed", detail: describeError(err) });
+      console.error("[ein-onboarding] load failed:", describeError(err));
+      res.status(500).json({ error: "lookup_failed" });
     }
+  };
+
+  router.post("/api/onboarding/ein/load", (req: Request, res: Response) => {
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    return load(res, b.filing_session_id, b.t);
   });
+  router.get("/api/onboarding/ein", (req: Request, res: Response) => load(res, req.query.filing_session_id, req.query.t));
 
   router.post("/api/onboarding/ein", async (req: Request, res: Response) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
@@ -137,35 +169,32 @@ export function createEinOnboardingRouter(deps: EinOnboardingDeps): Router {
         return;
       }
 
-      // Only the Deal the verified Stripe webhook recorded on a held or paid order.
-      const { rows: dealRows } = await deps.db.query<{ crm_deal_id: string; order_id: string }>(
+      // Only the Deal the verified Stripe webhook recorded on the held or paid order that
+      // carries the EIN (never the client-suppliable filing_sessions.crm_deal_id).
+      const { rows: dealRows } = await deps.db.query<{ crm_deal_id: string | null; order_id: string }>(
         `SELECT crm_deal_id, order_id FROM orders
-         WHERE filing_session_id = $1 AND payment_status IN ('authorized', 'paid') AND crm_deal_id IS NOT NULL
-         ORDER BY created_at DESC LIMIT 1`,
-        [sessionId],
+         WHERE filing_session_id = $1 AND payment_status IN ('authorized', 'paid')
+           AND EXISTS (SELECT 1 FROM jsonb_array_elements(line_items) li WHERE li->>'offer_code' = ANY($2::text[]))
+         ORDER BY created_at ASC LIMIT 1`,
+        [sessionId, [...BUNDLES_EIN, ...EIN_OFFER_CODES]],
       );
       const deal = dealRows[0];
-      if (!deal) {
-        await deps.alert("EIN details could not be received", `Filing session ${sessionId} (${g.llcName}) tried to submit EIN details, but its order has no Zoho Deal yet.`);
+      if (!deal?.crm_deal_id) {
+        await deps.alert("EIN details could not be received", `Filing session ${sessionId} (${g.llcName}) tried to submit EIN details, but its EIN order has no Zoho Deal yet.`);
         res.status(503).json({ error: "crm_not_ready", message: "We are still setting up your file. Please try again in a few minutes." });
         return;
       }
+      const dealId = deal.crm_deal_id;
 
-      const { passport } = checked.value;
-      const attached = await deps.docs.attachToDeal(deal.crm_deal_id, passport);
-      if (!attached.ok) {
-        await deps.alert("EIN passport upload failed", `Filing session ${sessionId} (${g.llcName}), Deal ${deal.crm_deal_id}: ${attached.error}`);
-        res.status(502).json({ error: "upload_failed", message: "We couldn't save your passport. Please try again in a moment." });
-        return;
-      }
-
+      // Claim the row first: a double submit then cannot upload the passport twice.
       const v = checked.value;
-      const { rows: inserted } = await deps.db.query<{ signed_at: Date | string }>(
+      const { passport } = v;
+      const { rows: claimed } = await deps.db.query<{ signed_at: Date | string }>(
         `INSERT INTO ein_onboarding_submissions
            (filing_session_id, order_id, responsible_party, no_ssn_confirmed, passport_sha256, passport_bytes,
-            passport_content_type, zoho_deal_id, zoho_attachment_id, signature_typed_name, attestation_version,
-            attestation_sha256, signer_ip, signer_user_agent)
-         VALUES ($1, $2, $3, true, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            passport_content_type, zoho_deal_id, signature_typed_name, attestation_version,
+            attestation_sha256, signer_ip, signer_proxy_ip, signer_user_agent, crm_status)
+         VALUES ($1, $2, $3, true, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'uploading')
          ON CONFLICT (filing_session_id) DO NOTHING
          RETURNING signed_at`,
         [
@@ -175,43 +204,63 @@ export function createEinOnboardingRouter(deps: EinOnboardingDeps): Router {
           sha256Hex(passport.bytes),
           passport.bytes.length,
           passport.contentType,
-          deal.crm_deal_id,
-          attached.attachmentId,
+          dealId,
           v.signatureName,
           v.attestationVersion,
           sha256Hex(attestationText(g.llcName)),
-          clientKey(req),
+          clientKey(req).slice(0, 100),
+          (req.ip ?? req.socket?.remoteAddress ?? "").slice(0, 100) || null,
           (req.get("user-agent") ?? "").slice(0, 300),
         ],
       );
-      if (inserted.length === 0) {
+      if (claimed.length === 0) {
         res.status(409).json({ error: "already_submitted" });
         return;
       }
-      const signedAt = inserted[0].signed_at instanceof Date ? inserted[0].signed_at.toISOString() : String(inserted[0].signed_at);
+      const signedAt = claimed[0].signed_at instanceof Date ? claimed[0].signed_at.toISOString() : String(claimed[0].signed_at);
 
-      // The customer's part is done; a CRM problem from here on is the team's to fix.
-      const cfg = deps.config();
-      const marked = await deps.docs.markDocsReceived(
-        deal.crm_deal_id,
-        cfg.einDocsReceivedField,
-        `EIN Docs Received = Yes. Responsible Party details, passport photo page and signed Form SS-4 summary received ${signedAt}.`,
-      );
-      await deps.db.query(`UPDATE ein_onboarding_submissions SET crm_status = $2, crm_error = $3 WHERE filing_session_id = $1`, [
-        sessionId,
-        marked.ok ? `done_${marked.via}` : "failed",
-        marked.ok ? null : marked.error,
-      ]);
-      await deps.alert(
-        `EIN details received — ${g.llcName || "LLC"}`,
-        [
-          `Filing session ${sessionId}. Passport photo page attached to Zoho Deal ${deal.crm_deal_id}.`,
-          marked.ok
-            ? `Deal marked EIN Docs Received (${marked.via === "field" ? "field" : "note; the EIN Docs Received field is not configured yet"}).`
-            : `Could not mark the Deal: ${marked.error}`,
-          "Ready to prepare Form SS-4.",
-        ].join(" "),
-      );
+      const attached = await deps.docs.attachToDeal(dealId, passport);
+      if (!attached.ok) {
+        // Release the claim so the customer can try again; nothing reached Zoho.
+        await deps.db.query(`DELETE FROM ein_onboarding_submissions WHERE filing_session_id = $1 AND crm_status = 'uploading'`, [sessionId]);
+        await deps.alert("EIN passport upload failed", `Filing session ${sessionId} (${g.llcName}), Deal ${dealId}: ${attached.error}`);
+        res.status(502).json({ error: "upload_failed", message: "We couldn't save your passport. Please try again in a moment." });
+        return;
+      }
+
+      // The customer's part is done once the passport is on the Deal. Anything that fails
+      // from here on is the team's to fix: alert, and still confirm to the customer.
+      try {
+        await deps.db.query(`UPDATE ein_onboarding_submissions SET zoho_attachment_id = $2, crm_status = 'attached' WHERE filing_session_id = $1`, [
+          sessionId,
+          attached.attachmentId,
+        ]);
+        const cfg = deps.config();
+        const marked = await deps.docs.markDocsReceived(
+          dealId,
+          cfg.einDocsReceivedField,
+          `EIN Docs Received = Yes. Responsible Party details, passport photo page and signed Form SS-4 summary received ${signedAt}.`,
+        );
+        await deps.db.query(`UPDATE ein_onboarding_submissions SET crm_status = $2, crm_error = $3 WHERE filing_session_id = $1`, [
+          sessionId,
+          marked.ok ? `done_${marked.via}` : "failed",
+          marked.ok ? null : marked.error,
+        ]);
+        await deps.alert(
+          `EIN details received — ${g.llcName || "LLC"}`,
+          [
+            `Filing session ${sessionId}. Passport photo page attached to Zoho Deal ${dealId}.`,
+            marked.ok
+              ? `Deal marked EIN Docs Received (${marked.via === "field" ? "field" : "note; the EIN Docs Received field is not configured yet"}).`
+              : `Could not mark the Deal: ${marked.error}`,
+            "Ready to prepare Form SS-4.",
+          ].join(" "),
+        );
+      } catch (afterErr) {
+        await deps
+          .alert("EIN details received, follow-up failed", `Filing session ${sessionId} (${g.llcName}), Deal ${dealId}: passport attached, but ${describeError(afterErr)}`)
+          .catch(() => undefined);
+      }
       res.status(200).json({ status: "submitted", submitted_at: signedAt });
     } catch (err) {
       console.error(`[ein-onboarding] submit failed for ${sessionId || "unknown session"}:`, describeError(err));

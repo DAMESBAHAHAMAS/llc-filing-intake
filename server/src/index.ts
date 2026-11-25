@@ -13,7 +13,8 @@ import { offersRouter } from "./routes/offers.js";
 import { filingDocumentRouter } from "./routes/filingDocument.js";
 import { ordersRouter } from "./routes/orders.js";
 import { scorecardRouter } from "./routes/scorecard.js";
-import { einOnboardingRouter } from "./routes/einOnboarding.js";
+import { einOnboardingPreParse, einOnboardingRouter } from "./routes/einOnboarding.js";
+import { funnelRateLimiters } from "./middleware/rateLimit.js";
 import { runScorecardTick } from "./scorecard/service.js";
 import { realScorecardSender } from "./scorecard/sender.js";
 import { runHoldSweepOnce } from "./fulfillment/holdSweep.js";
@@ -48,14 +49,16 @@ app.use("/api/webhooks/stripe", express.raw({ type: "application/json" }));
 app.use(stripeWebhookRouter);
 
 // ST17: the EIN onboarding POST carries a base64 passport image (up to 10 MB, ~13.4 MB
-// encoded). Only that path gets the larger limit; it must be parsed before the global
-// 100 kb parser, which would otherwise reject it with a 413.
-app.use("/api/onboarding/ein", express.json({ limit: "15mb" }));
+// encoded). Only that path gets the larger limit, and only after its rate limit and a
+// cheap gate (form open, declared size) so a closed form or a flood is refused before
+// any body is read. It must come before the global 100 kb parser.
+const funnelLimits = funnelRateLimiters();
+app.use("/api/onboarding/ein", funnelLimits.einOnboarding, einOnboardingPreParse(), express.json({ limit: "15mb" }));
 app.use(express.json());
 
 // Per-IP limits (429) and the Turnstile bot check on the public funnel
 // endpoints; see middleware/funnelProtection.ts.
-applyFunnelProtection(app);
+applyFunnelProtection(app, { limits: funnelLimits });
 
 app.use(healthRouter);
 app.use(sessionRouter);

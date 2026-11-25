@@ -30,7 +30,7 @@ export function applyFunnelProtection(
   app.use(["/api/offers", "/api/ein-express"], limits.reads);
   // Scorecard sign-up sends email: capped like the other email-sending endpoint.
   app.use("/api/scorecard/signup", limits.scorecardSignup);
-  app.use("/api/onboarding/ein", limits.einOnboarding);
+  // /api/onboarding/ein (ST17) is limited in index.ts, before its 15 MB body parser.
 
   return limits;
 }

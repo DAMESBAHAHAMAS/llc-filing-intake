@@ -56,10 +56,32 @@ export function onboardingOpen(cfg: EinOnboardingConfig): boolean {
   return cfg.enabled && (!cfg.requireToken || cfg.tokenSecret.length >= 32);
 }
 
-/** Token for the success page and the confirmation email, or null when the form is not open. */
-export function onboardingTokenFor(cfg: EinOnboardingConfig, filingSessionId: string, nowSeconds?: number): string | null {
+/** Token for the confirmation email (14 days), or null when the form is not open. */
+export function onboardingTokenFor(cfg: EinOnboardingConfig, filingSessionId: string, nowSeconds?: number, ttlSeconds?: number): string | null {
   if (!onboardingOpen(cfg) || !cfg.tokenSecret) return null;
-  return signEinOnboardingToken(cfg.tokenSecret, filingSessionId, nowSeconds);
+  return signEinOnboardingToken(cfg.tokenSecret, filingSessionId, nowSeconds, ttlSeconds);
+}
+
+/**
+ * The success page's token. GET /api/checkout/order/:id is public to anyone holding the
+ * success URL (which also lands in browser history and analytics), so it may hand out a
+ * token only shortly after the card was held or charged, and only a short-lived one that
+ * ends with that window. Later, the customer uses the emailed link.
+ */
+export const SUCCESS_PAGE_TOKEN_WINDOW_SECONDS = 2 * 60 * 60;
+
+export function successPageTokenFor(
+  cfg: EinOnboardingConfig,
+  filingSessionId: string,
+  moneyTakenAt: Date | string | null,
+  nowSeconds = Math.floor(Date.now() / 1000),
+): string | null {
+  if (!moneyTakenAt) return null;
+  const takenSeconds = Math.floor(new Date(moneyTakenAt).getTime() / 1000);
+  if (!Number.isFinite(takenSeconds)) return null;
+  const remaining = takenSeconds + SUCCESS_PAGE_TOKEN_WINDOW_SECONDS - nowSeconds;
+  if (remaining <= 0 || takenSeconds > nowSeconds + 300) return null;
+  return onboardingTokenFor(cfg, filingSessionId, nowSeconds, remaining);
 }
 
 /**
@@ -167,7 +189,11 @@ export interface ValidSubmission {
 
 export type SubmissionCheck = { ok: true; value: ValidSubmission } | { ok: false; message: string };
 
-const SSN_LIKE = /\b\d{3}-?\d{2}-?\d{4}\b/;
+/** Nine digits grouped 3-2-4 with optional dash, space or dot separators. */
+const SSN_LIKE = /\b\d{3}[-\s.]?\d{2}[-\s.]?\d{4}\b/;
+/** In phone and postal fields only the unmistakable 3-2-4 dashed shape is refused. */
+const SSN_DASHED = /\b\d{3}-\d{2}-\d{4}\b/;
+const MAX_POSTAL = 12;
 const MAX_FIELD = 200;
 
 /** File signatures, so a renamed file of another type is refused. */
@@ -205,10 +231,12 @@ export function validateSubmission(body: unknown): SubmissionCheck {
   }
   for (const [key, value] of Object.entries(party) as Array<[keyof ResponsibleParty, string]>) {
     if (value.length > MAX_FIELD) return { ok: false, message: "One of your answers is too long." };
-    if (key !== "address_postal_code" && key !== "phone" && SSN_LIKE.test(value)) {
+    const lenient = key === "address_postal_code" || key === "phone";
+    if ((lenient ? SSN_DASHED : SSN_LIKE).test(value)) {
       return { ok: false, message: "Do not enter an SSN or ITIN on this page." };
     }
   }
+  if (party.address_postal_code.length > MAX_POSTAL) return { ok: false, message: "Please check your postal code." };
   if (!(RESPONSIBLE_PARTY_TITLES as readonly string[]).includes(party.title)) return { ok: false, message: "Choose your role in the LLC." };
   if (b.no_ssn_confirmed !== true) return { ok: false, message: "Confirm that you do not have an SSN or ITIN." };
 

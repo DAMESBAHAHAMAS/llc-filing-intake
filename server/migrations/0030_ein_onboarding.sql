@@ -26,13 +26,20 @@ CREATE TABLE ein_onboarding_submissions (
   attestation_version       text NOT NULL,
   attestation_sha256        text NOT NULL,
   signed_at                 timestamptz NOT NULL DEFAULT now(),
-  signer_ip                 text NOT NULL,
+  signer_ip                 text NOT NULL,          -- client IP as forwarded by the edge (True-Client-IP)
+  signer_proxy_ip           text,                   -- the socket/proxy address Express saw, for cross-checking
   signer_user_agent         text,
 
-  crm_status                text NOT NULL DEFAULT 'pending',
+  -- 'uploading' while the passport goes to Zoho (the row is claimed first so a
+  -- double submit cannot upload twice), then done_field / done_note / failed.
+  crm_status                text NOT NULL DEFAULT 'uploading',
   crm_error                 text,
   created_at                timestamptz NOT NULL DEFAULT now()
 );
+
+-- Same rule as every other table (DECISIONS.md, RLS): no Supabase anon/authenticated
+-- access. Only the data spine's own connection (which bypasses RLS) reads or writes it.
+ALTER TABLE ein_onboarding_submissions ENABLE ROW LEVEL SECURITY;
 
 COMMENT ON TABLE ein_onboarding_submissions IS
   'ST17 EIN onboarding. Passport image lives only on the Zoho Deal; this row holds metadata, the Responsible Party and the e-signature record.';
