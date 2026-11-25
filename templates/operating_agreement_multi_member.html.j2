@@ -4,6 +4,12 @@
 <meta charset="UTF-8">
 <title>Operating Agreement — {{ llc_name }}</title>
 {% include "partials/agreement_styles.html.j2" %}
+{% if draft %}
+<style>
+  /* The review banner repeats on every page, not only page 1 (T144 D10 review). */
+  @page { @top-center { content: "Review copy. Not for customer delivery."; font-size: 8pt; font-weight: 700; color: #b91c1c; } }
+</style>
+{% endif %}
 </head>
 <body>
 {% import "partials/agreement_macros.html.j2" as oa %}

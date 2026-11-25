@@ -1278,3 +1278,13 @@ Agreements needing answers the interview does not collect (owners and percentage
 **Banking Resolution:** single- and multi-member DRAFT templates (`templates/banking_resolution_*`). Every page prints "DRAFT – pending owner approval". They are generated only when `BANKING_RESOLUTION_ENABLED=true`, which is off by default. The wording for Damian's review is in the T144 artifacts (`artifacts/d10/Banking-Resolution_DRAFT-wording-for-review.md`).
 
 **Filing date:** the agreement's "Filed" date is the Florida date when proof of filing was recorded, unless the operator passes `filing_date`.
+
+## 2026-11-25 — Operating Agreement: real filing date, confirmed members (dispatcher review of #32, before 0034)
+- **Filed date.** The agreement's "Filed" date is the Sunbiz filing date: the operator supplies it with proof of filing, or on the ops route. It is never the day the proof was recorded (`proof_of_filing_at`). "Effective" follows the Articles.
+- **Members.** Members are never inferred from Article IV, which lists authorized persons, not owners. Generation needs one of: the customer's own answer (member-managed with one member, exactly one person listed), the operator's `inputs.members`, or `confirm_members: true`.
+- **Package per Deal.** The package is decided per Deal across all its orders. The start date applies to the Deal, and released or refunded orders no longer pin a row.
+- **Smaller fixes.**
+  - The review banner repeats on every page of draft documents.
+  - The cover letter's payment line is neutral ("Your order total is …"); when a hold is captured follows the 25 Nov hold rule.
+  - `markGenerated` uses the verified Deal.
+  - Deal-write failures use their own column.

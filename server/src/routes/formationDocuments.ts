@@ -50,6 +50,7 @@ formationDocumentsRouter.post("/api/ops/operating-agreement/:orderId", async (re
       bankingInputs: (body.banking_resolution_inputs ?? undefined) as never,
       filingDate,
       replace: body.replace === true,
+      confirmMembers: body.confirm_members === true,
     });
     if (!r.ok) {
       res.status(r.status).json({ error: r.error, ...(r.missingFields ? { missingFields: r.missingFields } : {}) });
