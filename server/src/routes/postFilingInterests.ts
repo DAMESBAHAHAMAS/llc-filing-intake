@@ -4,6 +4,7 @@ import { describeError } from "../db/describeError.js";
 import {
   cleanNote,
   isInterest,
+  isMissingTable,
   isUuid,
   postFilingConfig,
   readInterests,
@@ -26,7 +27,8 @@ import {
  * Both need the filing session and one of its held or paid orders (the pair in the
  * Stripe success URL); anything else is 404 "not_found", so the endpoint never says
  * whether a session exists. 400 for a malformed body, 503 "not_open" when switched
- * off (POST_FILING_INTERESTS_ENABLED=false). The website shows the toggles only after
+ * off (POST_FILING_INTERESTS_ENABLED=false) or before migration 0032 is applied.
+ * The website shows the toggles only after
  * a 200 from GET. Rate-limited per IP in middleware/funnelProtection.ts. The Zoho
  * Deal is never taken from the request: postFiling/interests.ts resolves it.
  */
@@ -49,12 +51,25 @@ export function createPostFilingInterestsRouter(
     };
   }
 
-  async function authorize(res: Response, filingSessionId: unknown, orderId: unknown): Promise<boolean> {
-    res.setHeader("Cache-Control", "no-store");
-    if (!config().enabled) {
+  function failed(res: Response, err: unknown, what: "read" | "save"): void {
+    // Merged before migration 0032 ran: behave as switched off, not as broken.
+    if (isMissingTable(err)) {
       res.status(503).json({ error: "not_open" });
-      return false;
+      return;
     }
+    console.error(`[post-filing-interests] ${what} failed:`, describeError(err));
+    res.status(500).json({ error: `${what}_failed` });
+  }
+
+  /** Every answer is no-store; switched off wins over everything else. */
+  function open(res: Response): boolean {
+    res.setHeader("Cache-Control", "no-store");
+    if (config().enabled) return true;
+    res.status(503).json({ error: "not_open" });
+    return false;
+  }
+
+  async function authorize(res: Response, filingSessionId: unknown, orderId: unknown): Promise<boolean> {
     if (!isUuid(filingSessionId) || !isUuid(orderId)) {
       res.status(400).json({ error: "invalid_request" });
       return false;
@@ -67,26 +82,23 @@ export function createPostFilingInterestsRouter(
   }
 
   router.get("/api/post-filing-interests", async (req: Request, res: Response) => {
+    if (!open(res)) return;
     try {
       const { filing_session_id: sid, order_id: oid } = req.query;
       if (!(await authorize(res, sid, oid))) return;
       res.status(200).json({ status: "open", ...view(await readInterests(db, sid as string)) });
     } catch (err) {
-      console.error("[post-filing-interests] read failed:", describeError(err));
-      res.status(500).json({ error: "read_failed" });
+      failed(res, err, "read");
     }
   });
 
   router.post("/api/post-filing-interests", async (req: Request, res: Response) => {
+    if (!open(res)) return;
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
       const { filing_session_id: sid, order_id: oid, interest, selected } = body;
-      if (!isInterest(interest) || typeof selected !== "boolean") {
-        res.setHeader("Cache-Control", "no-store");
-        res.status(400).json({ error: "invalid_request" });
-        return;
-      }
-      if (body.note !== undefined && body.note !== null && typeof body.note !== "string") {
+      const noteOk = body.note === undefined || body.note === null || typeof body.note === "string";
+      if (!isInterest(interest) || typeof selected !== "boolean" || !noteOk) {
         res.status(400).json({ error: "invalid_request" });
         return;
       }
@@ -96,8 +108,7 @@ export function createPostFilingInterestsRouter(
       const state = await saveInterest(db, sid as string, interest, selected, note, now());
       res.status(200).json({ status: "saved", ...view(state) });
     } catch (err) {
-      console.error("[post-filing-interests] save failed:", describeError(err));
-      res.status(500).json({ error: "save_failed" });
+      failed(res, err, "save");
     }
   });
 

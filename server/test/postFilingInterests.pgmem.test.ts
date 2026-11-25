@@ -2,17 +2,19 @@ import { readFileSync } from "node:fs";
 import type http from "node:http";
 import express from "express";
 import { newDb } from "pg-mem";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.hoisted(() => {
   process.env.DATABASE_URL ??= "postgres://unused.invalid/none";
 });
 import {
+  ALERT_REPEAT_MS,
   CLAIM_LEASE_MS,
   RETRY_DELAYS_MS,
   cleanNote,
   postFilingConfig,
   realPostFilingZohoClient,
+  resetPostFilingJobState,
   runPostFilingSyncOnce,
   type PostFilingDeps,
   type PostFilingZohoClient,
@@ -81,15 +83,10 @@ async function setup() {
 
   const calls: string[] = [];
   let setResult: ZohoResult = { ok: true };
-  let noteResult: ZohoResult = { ok: true };
   const zoho: PostFilingZohoClient = {
-    setInterests: async (dealId, field, labels) => {
-      calls.push(`set ${dealId} ${field} [${labels.join("|")}]`);
+    updateDeal: async (dealId, fields) => {
+      calls.push(`set ${dealId} ${JSON.stringify(fields)}`);
       return setResult;
-    },
-    addDealNote: async (dealId, title, content) => {
-      calls.push(`note ${dealId} ${title} :: ${content.split("Their note: ")[1]}`);
-      return noteResult;
     },
   };
   const alerts: string[] = [];
@@ -129,12 +126,12 @@ async function setup() {
     setNow: (d: Date) => (now = d),
     setEnabled: (v: boolean) => (enabled = v),
     failSet: (r: ZohoResult) => (setResult = r),
-    failNote: (r: ZohoResult) => (noteResult = r),
     verifyDeal: () => pool.query(`UPDATE crm_sync_queue SET status = 'synced' WHERE order_id = $1`, [O1]),
   };
 }
 
 const servers: http.Server[] = [];
+beforeEach(() => resetPostFilingJobState());
 afterEach(() => {
   for (const s of servers.splice(0)) s.close();
 });
@@ -194,7 +191,7 @@ describe("POST/GET /api/post-filing-interests", () => {
     expect(ok.status).toBe(200);
     await t.verifyDeal();
     await runPostFilingSyncOnce(t.deps);
-    expect(t.calls).toEqual(["set deal-1 Post_Filing_Interests [Bank Account Setup]"]);
+    expect(t.calls).toEqual([`set deal-1 {"Post_Filing_Interests":["Bank Account Setup"],"Post_Filing_License_Note":null}`]);
   });
 
   it("answers 503 not_open when switched off", async () => {
@@ -214,7 +211,7 @@ describe("POST/GET /api/post-filing-interests", () => {
 });
 
 describe("Zoho Deal copy", () => {
-  it("waits for a verified Deal, then writes the full set and adds the note once", async () => {
+  it("waits for a verified Deal, then writes the full set and the note in one update", async () => {
     const t = await setup();
     await t.post({ filing_session_id: S1, order_id: O1, interest: "bank_account", selected: true });
     await t.post({ filing_session_id: S1, order_id: O1, interest: "licenses_permits", selected: true, note: "Salon, Orlando" });
@@ -228,15 +225,19 @@ describe("Zoho Deal copy", () => {
     t.setNow(new Date(NOW.getTime() + RETRY_DELAYS_MS[0]));
     expect((await runPostFilingSyncOnce(t.deps)).synced).toEqual([S1]);
     expect(t.calls).toEqual([
-      "set deal-1 Post_Filing_Interests [Bank Account Setup|Licenses and Permits]",
-      "note deal-1 Post-filing roadmap: license and permit check :: Salon, Orlando",
+      `set deal-1 {"Post_Filing_Interests":["Bank Account Setup","Licenses and Permits"],"Post_Filing_License_Note":"Salon, Orlando"}`,
     ]);
 
-    // Turning one off rewrites the field without it; the note is not added again.
+    // Turning one off rewrites the set without it; turning the licence check off empties the note field.
     t.calls.length = 0;
     await t.post({ filing_session_id: S1, order_id: O1, interest: "bank_account", selected: false });
     expect((await runPostFilingSyncOnce(t.deps)).synced).toEqual([S1]);
-    expect(t.calls).toEqual(["set deal-1 Post_Filing_Interests [Licenses and Permits]"]);
+    await t.post({ filing_session_id: S1, order_id: O1, interest: "licenses_permits", selected: false });
+    expect((await runPostFilingSyncOnce(t.deps)).synced).toEqual([S1]);
+    expect(t.calls).toEqual([
+      `set deal-1 {"Post_Filing_Interests":["Licenses and Permits"],"Post_Filing_License_Note":"Salon, Orlando"}`,
+      `set deal-1 {"Post_Filing_Interests":[],"Post_Filing_License_Note":null}`,
+    ]);
     expect(await runPostFilingSyncOnce(t.deps)).toEqual({ synced: [], retried: [], blocked: [] });
   });
 
@@ -252,12 +253,12 @@ describe("Zoho Deal copy", () => {
     await t.verifyDeal();
     await t.post({ filing_session_id: S1, order_id: O1, interest: "bank_account", selected: true });
     const slow: PostFilingZohoClient = {
-      setInterests: async (dealId, field, labels) => {
+      updateDeal: async (_dealId, fields) => {
+        const labels = fields.Post_Filing_Interests as string[];
         t.calls.push(`set [${labels.join("|")}]`);
         if (labels.length === 1) await t.post({ filing_session_id: S1, order_id: O1, interest: "tax_compliance", selected: true });
         return { ok: true };
       },
-      addDealNote: async () => ({ ok: true }),
     };
     const deps = { ...t.deps, zoho: slow };
     expect((await runPostFilingSyncOnce(deps)).synced).toEqual([S1]);
@@ -298,6 +299,53 @@ describe("Zoho Deal copy", () => {
     expect(t.alerts).toHaveLength(1);
   });
 
+  it("retries a customer's newer change at once even when the attempt in flight failed", async () => {
+    const t = await setup();
+    await t.verifyDeal();
+    await t.post({ filing_session_id: S1, order_id: O1, interest: "bank_account", selected: true });
+    const flaky: PostFilingZohoClient = {
+      updateDeal: async () => {
+        await t.post({ filing_session_id: S1, order_id: O1, interest: "tax_compliance", selected: true });
+        return { ok: false, permanent: true, error: "INVALID_DATA" };
+      },
+    };
+    expect((await runPostFilingSyncOnce({ ...t.deps, zoho: flaky })).blocked).toEqual([]);
+    const { rows } = await t.pool.query(`SELECT crm_blocked_at, crm_attempts, crm_claimed_at FROM post_filing_interests`);
+    expect(rows).toEqual([{ crm_blocked_at: null, crm_attempts: 0, crm_claimed_at: null }]);
+    expect((await runPostFilingSyncOnce(t.deps)).synced).toEqual([S1]);
+  });
+
+  it("alerts once per cause, not once per customer", async () => {
+    const t = await setup();
+    await t.verifyDeal();
+    await t.pool.query(`INSERT INTO orders VALUES ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4', $1, '[]', 'paid', $2, NULL, 'deal-9')`, [S3, NOW]);
+    await t.pool.query(
+      `INSERT INTO crm_sync_queue (filing_session_id, order_id, sync_type, payload_snapshot, status) VALUES ($1, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4', 'order_deal', '{}', 'synced')`,
+      [S3],
+    );
+    await t.post({ filing_session_id: S1, order_id: O1, interest: "bank_account", selected: true });
+    await t.post({ filing_session_id: S3, order_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4", interest: "bank_account", selected: true });
+    t.failSet({ ok: false, permanent: true, error: "Zoho Deal update failed: INVALID_DATA invalid data" });
+    expect((await runPostFilingSyncOnce(t.deps)).blocked.sort()).toEqual([S1, S3].sort());
+    expect(t.alerts).toHaveLength(1);
+    t.setNow(new Date(NOW.getTime() + ALERT_REPEAT_MS + 1));
+    await t.post({ filing_session_id: S1, order_id: O1, interest: "tax_compliance", selected: true });
+    await runPostFilingSyncOnce(t.deps);
+    expect(t.alerts).toHaveLength(2);
+  });
+
+  it("behaves as switched off until migration 0032 is applied", async () => {
+    const t = await setup();
+    await t.pool.query(`DROP TABLE post_filing_interests`);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect((await t.get(S1, O1)).status).toBe(503);
+    expect((await t.post({ filing_session_id: S1, order_id: O1, interest: "bank_account", selected: true })).status).toBe(503);
+    expect(await runPostFilingSyncOnce(t.deps)).toEqual({ synced: [], retried: [], blocked: [] });
+    expect(await runPostFilingSyncOnce(t.deps)).toEqual({ synced: [], retried: [], blocked: [] });
+    expect(errors).toHaveBeenCalledTimes(1);
+    errors.mockRestore();
+  });
+
   it("leaves a claimed row alone until its lease ends", async () => {
     const t = await setup();
     await t.verifyDeal();
@@ -322,8 +370,12 @@ describe("Zoho Deal copy", () => {
 
 describe("config and limits", () => {
   it("is on by default with the created Deal field, and has its own per-IP limit", () => {
-    expect(postFilingConfig({})).toEqual({ enabled: true, dealField: "Post_Filing_Interests" });
-    expect(postFilingConfig({ POST_FILING_INTERESTS_ENABLED: "FALSE", POST_FILING_INTERESTS_FIELD: "X" })).toEqual({ enabled: false, dealField: "X" });
+    expect(postFilingConfig({})).toEqual({ enabled: true, dealField: "Post_Filing_Interests", noteField: "Post_Filing_License_Note" });
+    expect(postFilingConfig({ POST_FILING_INTERESTS_ENABLED: "FALSE", POST_FILING_INTERESTS_FIELD: "X", POST_FILING_NOTE_FIELD: "Y" })).toEqual({
+      enabled: false,
+      dealField: "X",
+      noteField: "Y",
+    });
     expect(typeof funnelRateLimiters().postFilingInterests).toBe("function");
   });
 });
@@ -335,32 +387,31 @@ describe("realPostFilingZohoClient", () => {
     resetZohoTokenCache();
   });
 
-  it("sends the multi-select as an array to v8 and reads the record status", async () => {
+  it("sends both fields in one v8 update and reads the record status", async () => {
     const seen: Array<{ url: string; method?: string; body?: string }> = [];
+    let reply: { status: number; body: unknown } = { status: 200, body: { data: [{ status: "success" }] } };
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string, init: RequestInit) => {
         if (url.includes("oauth")) return new Response(JSON.stringify({ access_token: "tok", expires_in: 3600 }), { status: 200 });
         seen.push({ url, method: init.method, body: init.body as string });
-        const failing = url.endsWith("/Notes");
-        return new Response(
-          JSON.stringify({ data: [failing ? { status: "error", code: "INVALID_DATA", message: "bad" } : { status: "success" }] }),
-          { status: 200 },
-        );
+        return new Response(JSON.stringify(reply.body), { status: reply.status });
       }),
     );
     vi.stubEnv("ZOHO_CLIENT_ID", "id");
     vi.stubEnv("ZOHO_CLIENT_SECRET", "secret");
     vi.stubEnv("ZOHO_REFRESH_TOKEN", "refresh");
-    expect(await realPostFilingZohoClient.setInterests("d-1", "Post_Filing_Interests", ["Tax and Compliance"])).toEqual({ ok: true });
-    const note = await realPostFilingZohoClient.addDealNote("d-1", "t", "c");
-    expect(note).toMatchObject({ ok: false, permanent: true });
-    expect(seen[0]).toEqual({
-      url: "https://www.zohoapis.com/crm/v8/Deals/d-1",
-      method: "PUT",
-      body: JSON.stringify({ data: [{ Post_Filing_Interests: ["Tax and Compliance"] }] }),
-    });
-    expect(seen[1].url).toBe("https://www.zohoapis.com/crm/v8/Deals/d-1/Notes");
-    expect(JSON.parse(seen[1].body ?? "{}")).toEqual({ data: [{ Note_Title: "t", Note_Content: "c" }] });
+    const fields = { Post_Filing_Interests: ["Tax and Compliance"], Post_Filing_License_Note: null };
+    expect(await realPostFilingZohoClient.updateDeal("d-1", fields)).toEqual({ ok: true });
+    expect(seen[0]).toEqual({ url: "https://www.zohoapis.com/crm/v8/Deals/d-1", method: "PUT", body: JSON.stringify({ data: [fields] }) });
+
+    reply = { status: 200, body: { data: [{ status: "error", code: "INVALID_DATA", message: "invalid data" }] } };
+    expect(await realPostFilingZohoClient.updateDeal("d-1", fields)).toMatchObject({ ok: false, permanent: true });
+    reply = { status: 401, body: { code: "OAUTH_SCOPE_MISMATCH", message: "scope" } };
+    expect(await realPostFilingZohoClient.updateDeal("d-1", fields)).toMatchObject({ ok: false, permanent: true });
+    reply = { status: 500, body: { code: "INTERNAL_ERROR" } };
+    expect(await realPostFilingZohoClient.updateDeal("d-1", fields)).toMatchObject({ ok: false, permanent: false });
+    reply = { status: 404, body: {} };
+    expect(await realPostFilingZohoClient.updateDeal("d-1", fields)).toMatchObject({ ok: false, permanent: true });
   });
 });

@@ -3,8 +3,8 @@
 -- One row per filing session: which of the three post-filing topics the
 -- customer flagged on /checkout/success, plus their optional note for the
 -- licence and permit check. Written by routes/postFilingInterests.ts; the
--- job in postFiling/interests.ts copies it to the Zoho Deal field
--- Post_Filing_Interests (multi-select) and adds the note as a Deal note.
+-- job in postFiling/interests.ts copies it to the Zoho Deal fields
+-- Post_Filing_Interests (multi-select) and Post_Filing_License_Note (long text).
 -- No identity data. Additive only; no existing table changes.
 --
 -- version / synced_version: every change bumps version; the job records the
@@ -21,7 +21,6 @@ CREATE TABLE post_filing_interests (
 
   version            integer NOT NULL DEFAULT 1,
   synced_version     integer NOT NULL DEFAULT 0,
-  note_synced        text,
   zoho_deal_id       text,
   crm_attempts       integer NOT NULL DEFAULT 0,
   crm_claimed_at     timestamptz,

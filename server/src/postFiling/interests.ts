@@ -9,10 +9,12 @@ import { auth, detail, recordOk, timeout, zfetch } from "../zoho/einPortal.js";
  *
  * The customer flags any of three topics for follow-up once their Articles are
  * filed. Each flag is saved against the filing session (table
- * post_filing_interests, migration 0032) and copied to the Zoho Deal: the
- * multi-select field Post_Filing_Interests gets the full current set (so turning a
- * flag off removes it), and the optional licence/permit note is added once as a
- * Deal note.
+ * post_filing_interests, migration 0032) and copied to the Zoho Deal in one update:
+ * the multi-select Post_Filing_Interests gets the full current set (so turning a
+ * flag off removes it) and the long-text Post_Filing_License_Note gets the optional
+ * licence/permit note (empty when that flag is off). Both are plain field writes, so
+ * a retry can never duplicate anything, and they need only the Deals update
+ * permission the service already uses.
  *
  * Trust rules:
  *   - A write needs a filing session AND an order of that session that is held or
@@ -26,7 +28,10 @@ import { auth, detail, recordOk, timeout, zfetch } from "../zoho/einPortal.js";
 export const INTERESTS = ["bank_account", "licenses_permits", "tax_compliance"] as const;
 export type Interest = (typeof INTERESTS)[number];
 
-/** Zoho picklist values (Deals.Post_Filing_Interests, field id 2654294000040656012). */
+/**
+ * Zoho picklist values (Deals.Post_Filing_Interests, field id 2654294000040656012).
+ * The note goes to Deals.Post_Filing_License_Note (long text, id 2654294000040639002).
+ */
 export const INTEREST_LABELS: Record<Interest, string> = {
   bank_account: "Bank Account Setup",
   licenses_permits: "Licenses and Permits",
@@ -42,12 +47,15 @@ export interface PostFilingConfig {
   enabled: boolean;
   /** API name of the Deal multi-select field. */
   dealField: string;
+  /** API name of the Deal long-text field for the licence note. */
+  noteField: string;
 }
 
 export function postFilingConfig(env: Record<string, string | undefined> = process.env): PostFilingConfig {
   return {
     enabled: (env.POST_FILING_INTERESTS_ENABLED ?? "true").trim().toLowerCase() !== "false",
     dealField: (env.POST_FILING_INTERESTS_FIELD ?? "").trim() || "Post_Filing_Interests",
+    noteField: (env.POST_FILING_NOTE_FIELD ?? "").trim() || "Post_Filing_License_Note",
   };
 }
 
@@ -146,9 +154,8 @@ export async function saveInterest(
 export type ZohoResult = { ok: true } | { ok: false; error: string; permanent?: boolean };
 
 export interface PostFilingZohoClient {
-  /** Replaces the Deal's multi-select value with exactly these labels. */
-  setInterests(dealId: string, field: string, labels: string[]): Promise<ZohoResult>;
-  addDealNote(dealId: string, title: string, content: string): Promise<ZohoResult>;
+  /** Sets exactly these Deal fields (the multi-select is replaced, not merged). */
+  updateDeal(dealId: string, fields: Record<string, unknown>): Promise<ZohoResult>;
 }
 
 export interface PostFilingDeps {
@@ -169,6 +176,8 @@ export const CLAIM_LEASE_MS = 10 * MINUTE_MS;
  */
 export const RETRY_DELAYS_MS = [1, 5, 15, 60, 6 * 60, 24 * 60, 48 * 60].map((m) => m * MINUTE_MS);
 const BATCH = 25;
+/** Repeated failures with the same cause alert once per this window, not once per customer. */
+export const ALERT_REPEAT_MS = 6 * 60 * MINUTE_MS;
 
 export function labelsFor(state: InterestState): string[] {
   return INTERESTS.filter((i) => state[i]).map((i) => INTEREST_LABELS[i]);
@@ -193,13 +202,56 @@ export async function verifiedDealFor(db: Db, filingSessionId: string): Promise<
 interface ClaimedRow extends InterestState {
   filing_session_id: string;
   version: number;
-  note_synced: string | null;
   crm_attempts: number;
+}
+
+/** The Deal fields for the customer's current choices. */
+export function dealFieldsFor(config: PostFilingConfig, state: InterestState): Record<string, unknown> {
+  return {
+    [config.dealField]: labelsFor(state),
+    [config.noteField]: state.licenses_permits && state.license_note ? state.license_note : null,
+  };
+}
+
+/**
+ * Postgres "relation does not exist" for this feature's table: migration 0032 has not
+ * been applied yet. (Code 42P01 on Postgres; pg-mem in tests sets only the message.)
+ */
+export function isMissingTable(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null;
+  const message = typeof e?.message === "string" ? e.message : "";
+  return message.includes('relation "post_filing_interests" does not exist') && (e?.code === undefined || e.code === "42P01");
+}
+
+let running = false;
+let missingTableLogged = false;
+const lastAlertAt = new Map<string, number>();
+
+/** For tests. */
+export function resetPostFilingJobState(): void {
+  running = false;
+  missingTableLogged = false;
+  lastAlertAt.clear();
 }
 
 export async function runPostFilingSyncOnce(deps: PostFilingDeps): Promise<{ synced: string[]; retried: string[]; blocked: string[] }> {
   const out = { synced: [] as string[], retried: [] as string[], blocked: [] as string[] };
-  if (!deps.config.enabled) return out;
+  // One pass at a time: a slow Zoho pass must not overlap the next timer tick.
+  if (!deps.config.enabled || running) return out;
+  running = true;
+  try {
+    await syncDue(deps, out);
+  } catch (err) {
+    if (!isMissingTable(err)) throw err;
+    if (!missingTableLogged) console.error("[post-filing sync] table post_filing_interests is missing: apply migration 0032");
+    missingTableLogged = true;
+  } finally {
+    running = false;
+  }
+  return out;
+}
+
+async function syncDue(deps: PostFilingDeps, out: { synced: string[]; retried: string[]; blocked: string[] }): Promise<void> {
   const now = deps.now();
   const leaseBefore = new Date(now.getTime() - CLAIM_LEASE_MS);
   const { rows: due } = await deps.db.query<{ filing_session_id: string }>(
@@ -213,9 +265,9 @@ export async function runPostFilingSyncOnce(deps: PostFilingDeps): Promise<{ syn
   for (const { filing_session_id: id } of due) {
     const claimed = await deps.db.query<ClaimedRow>(
       `UPDATE post_filing_interests SET crm_claimed_at = $2
-       WHERE filing_session_id = $1 AND synced_version < version AND crm_blocked_at IS NULL
+       WHERE filing_session_id = $1 AND synced_version < version AND crm_blocked_at IS NULL AND next_sync_at <= $2
          AND (crm_claimed_at IS NULL OR crm_claimed_at < $3)
-       RETURNING filing_session_id, bank_account, licenses_permits, tax_compliance, license_note, version, note_synced, crm_attempts`,
+       RETURNING filing_session_id, bank_account, licenses_permits, tax_compliance, license_note, version, crm_attempts`,
       [id, now, leaseBefore],
     );
     const row = claimed.rows[0];
@@ -224,10 +276,10 @@ export async function runPostFilingSyncOnce(deps: PostFilingDeps): Promise<{ syn
       const result = await copyToDeal(deps, row);
       if (result.ok) {
         await deps.db.query(
-          `UPDATE post_filing_interests SET synced_version = GREATEST(synced_version, $2), note_synced = $3, zoho_deal_id = $4,
-             crm_synced_at = $5, crm_attempts = 0, last_error = NULL, crm_claimed_at = NULL, updated_at = $5
+          `UPDATE post_filing_interests SET synced_version = GREATEST(synced_version, $2), zoho_deal_id = $3,
+             crm_synced_at = $4, crm_attempts = 0, last_error = NULL, crm_claimed_at = NULL, updated_at = $4
            WHERE filing_session_id = $1`,
-          [id, row.version, result.noteSynced, result.dealId, now],
+          [id, row.version, result.dealId, now],
         );
         out.synced.push(id);
         continue;
@@ -237,28 +289,16 @@ export async function runPostFilingSyncOnce(deps: PostFilingDeps): Promise<{ syn
       await recordFailure(deps, row, describeError(err), false, now, out);
     }
   }
-  return out;
 }
 
 async function copyToDeal(
   deps: PostFilingDeps,
   row: ClaimedRow,
-): Promise<{ ok: true; dealId: string; noteSynced: string | null } | { ok: false; error: string; permanent?: boolean }> {
+): Promise<{ ok: true; dealId: string } | { ok: false; error: string; permanent?: boolean }> {
   const dealId = await verifiedDealFor(deps.db, row.filing_session_id);
   if (!dealId) return { ok: false, error: "no verified Zoho Deal for this filing session yet" };
-  const set = await deps.zoho.setInterests(dealId, deps.config.dealField, labelsFor(row));
-  if (!set.ok) return set;
-  let noteSynced = row.note_synced;
-  if (row.licenses_permits && row.license_note && row.license_note !== row.note_synced) {
-    const note = await deps.zoho.addDealNote(
-      dealId,
-      "Post-filing roadmap: license and permit check",
-      `The customer asked for a license and permit check on the Thank You page.\n\nTheir note: ${row.license_note}`,
-    );
-    if (!note.ok) return note;
-    noteSynced = row.license_note;
-  }
-  return { ok: true, dealId, noteSynced };
+  const set = await deps.zoho.updateDeal(dealId, dealFieldsFor(deps.config, row));
+  return set.ok ? { ok: true, dealId } : set;
 }
 
 async function recordFailure(
@@ -272,24 +312,40 @@ async function recordFailure(
   const attempts = row.crm_attempts + 1;
   const block = permanent || attempts > RETRY_DELAYS_MS.length;
   const next = new Date(now.getTime() + RETRY_DELAYS_MS[Math.min(attempts, RETRY_DELAYS_MS.length) - 1]);
-  await deps.db.query(
-    `UPDATE post_filing_interests SET crm_attempts = $2, last_error = $3, next_sync_at = $4, crm_blocked_at = $5,
-       crm_claimed_at = NULL, updated_at = $6
-     WHERE filing_session_id = $1`,
-    [row.filing_session_id, attempts, error.slice(0, 500), next, block ? now : null, now],
+  // Only when the customer has not changed anything since the claim: a newer change
+  // (which already reset the attempts and the block) is tried again right away.
+  const recorded = await deps.db.query(
+    `UPDATE post_filing_interests SET crm_attempts = $3, last_error = $4, next_sync_at = $5, crm_blocked_at = $6,
+       crm_claimed_at = NULL, updated_at = $7
+     WHERE filing_session_id = $1 AND version = $2`,
+    [row.filing_session_id, row.version, attempts, error.slice(0, 500), next, block ? now : null, now],
   );
-  if (block) {
-    out.blocked.push(row.filing_session_id);
-    await deps
-      .alert(
-        "Post-filing interests not copied to Zoho",
-        `Filing session ${row.filing_session_id}: ${labelsFor(row).join(", ") || "(none selected)"}. ${error}. ` +
-          `The customer's choices are saved in post_filing_interests; copy them to the Deal by hand or fix the cause and clear crm_blocked_at.`,
-      )
-      .catch(() => undefined);
-  } else {
+  if ((recorded.rowCount ?? 0) === 0) {
+    await deps.db.query(
+      `UPDATE post_filing_interests SET crm_claimed_at = NULL, last_error = $2, updated_at = $3 WHERE filing_session_id = $1`,
+      [row.filing_session_id, error.slice(0, 500), now],
+    );
     out.retried.push(row.filing_session_id);
+    return;
   }
+  if (!block) {
+    out.retried.push(row.filing_session_id);
+    return;
+  }
+  out.blocked.push(row.filing_session_id);
+  // One alert per cause per ALERT_REPEAT_MS (a wrong field name would otherwise alert per customer).
+  const cause = error.replace(/\d{6,}/g, "#").slice(0, 200);
+  const last = lastAlertAt.get(cause);
+  if (last !== undefined && now.getTime() - last < ALERT_REPEAT_MS) return;
+  lastAlertAt.set(cause, now.getTime());
+  await deps
+    .alert(
+      "Post-filing interests not copied to Zoho",
+      `Filing session ${row.filing_session_id}: ${labelsFor(row).join(", ") || "(none selected)"}. ${error}. ` +
+        `The customer's choices are saved in post_filing_interests (other sessions with the same error are not alerted again for 6 hours: ` +
+        `SELECT * FROM post_filing_interests WHERE crm_blocked_at IS NOT NULL). Fix the cause, then clear crm_blocked_at to retry.`,
+    )
+    .catch(() => undefined);
 }
 
 /** Zoho rejected the record itself (bad field or value): retrying will not help. */
@@ -298,38 +354,23 @@ function permanentRecordError(error: string): boolean {
 }
 
 export const realPostFilingZohoClient: PostFilingZohoClient = {
-  async setInterests(dealId, field, labels) {
+  async updateDeal(dealId, fields) {
     try {
       const res = await zfetch(`https://www.zohoapis.com/crm/v8/Deals/${encodeURIComponent(dealId)}`, {
         method: "PUT",
         headers: { ...(await auth()), "Content-Type": "application/json" },
         ...timeout(),
-        body: JSON.stringify({ data: [{ [field]: labels }] }),
+        body: JSON.stringify({ data: [fields] }),
       });
       if (res.status === 404) return { ok: false, permanent: true, error: `Deal ${dealId} not found` };
       if (!res.ok) {
         const d = await detail(res);
-        return { ok: false, permanent: res.status === 400 && permanentRecordError(d), error: `Zoho Deal update failed: ${d}` };
+        // A missing OAuth scope is not cured by retrying.
+        const permanent = (res.status === 400 && permanentRecordError(d)) || /OAUTH_SCOPE_MISMATCH/.test(d);
+        return { ok: false, permanent, error: `Zoho Deal update failed: ${d}` };
       }
       const rec = recordOk(await res.json().catch(() => ({})));
       return rec.ok ? { ok: true } : { ok: false, permanent: permanentRecordError(rec.error), error: `Zoho Deal update failed: ${rec.error}` };
-    } catch (err) {
-      return { ok: false, error: describeError(err) };
-    }
-  },
-
-  async addDealNote(dealId, title, content) {
-    try {
-      const res = await zfetch(`https://www.zohoapis.com/crm/v8/Deals/${encodeURIComponent(dealId)}/Notes`, {
-        method: "POST",
-        headers: { ...(await auth()), "Content-Type": "application/json" },
-        ...timeout(),
-        body: JSON.stringify({ data: [{ Note_Title: title, Note_Content: content }] }),
-      });
-      if (res.status === 404) return { ok: false, permanent: true, error: `Deal ${dealId} not found` };
-      if (!res.ok) return { ok: false, error: `Zoho Deal note failed: ${await detail(res)}` };
-      const rec = recordOk(await res.json().catch(() => ({})));
-      return rec.ok ? { ok: true } : { ok: false, permanent: permanentRecordError(rec.error), error: `Zoho Deal note failed: ${rec.error}` };
     } catch (err) {
       return { ok: false, error: describeError(err) };
     }
