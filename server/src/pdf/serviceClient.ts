@@ -61,3 +61,32 @@ export async function renderTemplatePdf(template: string, context: Record<string
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
+
+/**
+ * T144 D11: fills the official IRS Form SS-4 through render_pdf.py POST
+ * /generate-ss4 with values from ein/ss4.ts buildSs4Values(). Fills only: the
+ * caller decides what happens to the PDF (never an automatic fax).
+ */
+export async function generateSs4Pdf(
+  values: { text: Record<string, string>; check: Array<[string, string]> },
+  options: { watermark?: string } = {}
+): Promise<PdfGenerationResult> {
+  const baseUrl = process.env.PDF_SERVICE_URL;
+  const apiKey = process.env.PDF_SERVICE_API_KEY;
+  if (!baseUrl) return { ok: false, error: "server misconfigured: PDF_SERVICE_URL not set" };
+  try {
+    const res = await fetch(`${baseUrl}/generate-ss4`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(apiKey ? { "X-PDF-Service-Key": apiKey } : {}) },
+      body: JSON.stringify({ values, ...(options.watermark ? { watermark: options.watermark } : {}) }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      return { ok: false, httpStatus: res.status, error: `PDF service returned ${res.status}: ${text.slice(0, 500)}` };
+    }
+    const pdfBytes = Buffer.from(await res.arrayBuffer());
+    return { ok: true, pdfBytes, sha256: createHash("sha256").update(pdfBytes).digest("hex") };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}

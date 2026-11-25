@@ -4,6 +4,7 @@ import { describeError } from "../db/describeError.js";
 import { notifyOrderEvent } from "../ops/alerts.js";
 import { verifyStripeSignature, WebhookSignatureError } from "../stripe/webhookSignature.js";
 import { orderDealFields } from "../zoho/client.js";
+import { kickoffDealFields } from "../offers/financeReadyKickoff.js";
 import { needsSunbizFiling } from "../offers/sunbizFiling.js";
 import { dispatchAcceptanceEmail } from "../registeredAgent/acceptanceEmail.js";
 import { shouldSendAfterPayment } from "../registeredAgent/acceptancePolicy.js";
@@ -213,6 +214,8 @@ stripeWebhookRouter.post("/api/webhooks/stripe", async (req, res) => {
                       // snapshot, replacing whatever the intake Deal held.
                       ...orderDealFields(sessionRow.rows[0]?.entity_name_primary, [...earlierOrders.rows, order]),
                       Payment_Status: held ? "Hold Placed" : "Payment Collected",
+                      // Finance-Ready kickoff hold only (offers/financeReadyKickoff.ts).
+                      ...kickoffDealFields(order.line_items),
                       ...(session.payment_intent ? { Stripe_Payment_Intent: session.payment_intent } : {}),
                     },
                   }),

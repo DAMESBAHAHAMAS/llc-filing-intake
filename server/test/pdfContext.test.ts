@@ -23,7 +23,7 @@ describe("buildPdfContext", () => {
     const result = buildPdfContext(validHouseRaRecord, null);
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.context.llc_name).toBe("Test Ventures LLC");
+      expect(result.context.llc_name).toBe("TEST VENTURES LLC");
       expect(result.context.registered_agent_name).toBe(HOUSE_REGISTERED_AGENT.name);
       expect(result.context.registered_agent_florida_address).toBe(HOUSE_REGISTERED_AGENT.florida_address);
     }

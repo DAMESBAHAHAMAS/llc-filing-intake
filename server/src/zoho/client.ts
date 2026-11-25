@@ -9,6 +9,7 @@
  * Gate 1; the real client below fails gracefully (a normal queued-job
  * failure, not a crash) until they are.
  */
+import { kickoffDealFields } from "../offers/financeReadyKickoff.js";
 
 export interface ZohoSyncResult {
   ok: boolean;
@@ -227,6 +228,8 @@ export function buildDealRecord(payload: OrderSyncPayload): Record<string, unkno
     UTM_Medium: payload.filing_session.utm_medium ?? undefined,
     UTM_Campaign: payload.filing_session.utm_campaign ?? undefined,
     Test_Record: isTestEmail(email),
+    // Finance-Ready kickoff hold only (offers/financeReadyKickoff.ts).
+    ...kickoffDealFields(payload.order.line_items),
   };
   for (const k of Object.keys(record)) if (record[k] === undefined) delete record[k];
   return record;

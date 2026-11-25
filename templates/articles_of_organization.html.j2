@@ -219,6 +219,25 @@
     color: rgba(255, 255, 255, 0.01);
   }
 
+  /* T144 D9: keep Article IV (table and key) on one page; it used to split,
+     leaving an empty repeated table header on page 2. */
+  #article-iv {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .esignature {
+    font-family: "Brush Script MT", "Segoe Script", cursive;
+    font-size: 16pt;
+    margin: 6px 0 2px;
+  }
+
+  .esignature-detail {
+    font-size: 8.5pt;
+    color: #334155;
+    margin: 0;
+  }
+
   .continuation {
     page-break-before: always;
   }
@@ -388,10 +407,17 @@
 
   <div class="signature-block">
     <p class="signature-label">Signature of Authorized Person / Authorized Representative</p>
+    {# 'is defined' first: render_pdf.py uses StrictUndefined, and llc-pdf-generator can deploy before llc-data-spine. #}
+    {% if esignature is defined and esignature %}
+    {# T144 D9: typed electronic signature captured at intake. The audit record (time, IP, consent) is kept by the data spine, never printed here. #}
+    <p class="esignature">/s/ {{ esignature.signer_name }}</p>
+    <p class="esignature-detail">{{ esignature.signer_name }}{% if esignature.signer_title %}, {{ esignature.signer_title }}{% endif %} &middot; Electronically signed {{ esignature.signed_date }}</p>
+    {% else %}
     {# Zoho Sign text-tag anchors must render as literal braces in the output HTML for Zoho Sign's text scanner — not resolved as Jinja variables #}
     <span class="zs-anchor">{{ '{{zs_authorized_signature}}' }}</span>
     <span class="zs-anchor">{{ '{{zs_authorized_printed_name}}' }}</span>
     <span class="zs-anchor">{{ '{{zs_date_signed}}' }}</span>
+    {% endif %}
   </div>
 </section>
 

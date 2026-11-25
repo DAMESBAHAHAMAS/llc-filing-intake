@@ -14,6 +14,8 @@ import { filingDocumentRouter } from "./routes/filingDocument.js";
 import { ordersRouter } from "./routes/orders.js";
 import { scorecardRouter } from "./routes/scorecard.js";
 import { einOnboardingRouter } from "./routes/einOnboarding.js";
+import { postFilingInterestsRouter } from "./routes/postFilingInterests.js";
+import { defaultPostFilingDeps, runPostFilingSyncOnce } from "./postFiling/interests.js";
 import { defaultEinPortalDeps, runEinPortalInvitesOnce, runEinPortalSweepOnce } from "./ein/portalJobs.js";
 import { einPortalConfig, einPortalConfigIssues } from "./ein/onboarding.js";
 import { sendOpsAlert } from "./ops/alerts.js";
@@ -67,6 +69,7 @@ app.use(filingDocumentRouter);
 app.use(ordersRouter);
 app.use(scorecardRouter);
 app.use(einOnboardingRouter);
+app.use(postFilingInterestsRouter);
 
 const port = Number(process.env.PORT ?? 3000);
 app.listen(port, () => {
@@ -191,4 +194,23 @@ if (einSweepIntervalMs > 0) {
         console.error("[ein portal sweep] tick failed", err);
       });
   }, einSweepIntervalMs);
+}
+
+/**
+ * Dispatch 13 post-filing roadmap: copies the customer's choices from the Thank You
+ * page to the Zoho Deal (postFiling/interests.ts). Every 60 seconds by default;
+ * POST_FILING_SYNC_INTERVAL_MS=0 disables. Does nothing when
+ * POST_FILING_INTERESTS_ENABLED=false.
+ */
+const postFilingSyncIntervalMs = Number(process.env.POST_FILING_SYNC_INTERVAL_MS ?? 60_000);
+if (postFilingSyncIntervalMs > 0) {
+  setInterval(() => {
+    runPostFilingSyncOnce(defaultPostFilingDeps(pool))
+      .then((r) => {
+        if (r.blocked.length > 0) console.error("[post-filing sync] needs a person", r.blocked);
+      })
+      .catch((err) => {
+        console.error("[post-filing sync] tick failed", err);
+      });
+  }, postFilingSyncIntervalMs);
 }
