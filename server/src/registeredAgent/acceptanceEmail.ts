@@ -34,7 +34,11 @@ export interface DispatchAcceptanceEmailResult {
  * this caller. Left as a known, pre-existing property of this codebase's
  * design, not something this port changes.
  */
-export async function dispatchAcceptanceEmail(pool: Pool, filingSessionId: string): Promise<DispatchAcceptanceEmailResult> {
+export async function dispatchAcceptanceEmail(
+  pool: Pool,
+  filingSessionId: string,
+  options: { email?: string } = {},
+): Promise<DispatchAcceptanceEmailResult> {
   const frontendBaseUrl = process.env.FRONTEND_BASE_URL;
   if (!frontendBaseUrl) {
     return { ok: false, reason: "server misconfigured: FRONTEND_BASE_URL not set" };
@@ -63,7 +67,10 @@ export async function dispatchAcceptanceEmail(pool: Pool, filingSessionId: strin
      WHERE filing_session_id = $1 ORDER BY created_at DESC LIMIT 1`,
     [filingSessionId]
   );
-  const registeredAgentEmail = lastAcceptance.rows[0]?.registered_agent_email || bridgedEmail;
+  // An explicit email (POST /api/registered-agent/request-acceptance) wins:
+  // that caller is asking for a send to the address the customer just gave,
+  // which may differ from the one an earlier request went to.
+  const registeredAgentEmail = options.email?.trim() || lastAcceptance.rows[0]?.registered_agent_email || bridgedEmail;
 
   if (!llcName || !registeredAgentName || !registeredAgentAddress || !registeredAgentEmail) {
     return { ok: false, reason: "incomplete registered-agent data on filing_session — nothing to send" };
