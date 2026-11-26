@@ -268,16 +268,22 @@ Show `entity_name` above the statement ("the entity listed above"); while it is 
 POST answers `409 entity_name_missing`.
 
 ### `POST /api/ein/designee-authorization`
-`{ "filing_session_id", "order_id", "statement_version": "ss4-designee-2026-11-26", "signer_name": "Ada Lovelace", "signer_title"?: "Managing Member", "consent": true }`
-→ `201 { "status": "signed", "signature": { "statement_version", "signer_name", "signer_title", "entity_name", "signed_at", "authority_expires_at" } }`,
-or `200` with the first signature unchanged if the session already signed this version.
-`400 consent_required | signer_name_required | invalid_signer_title | statement_version_required`;
-`409 statement_changed` (with the current `statement`) when the page showed an older wording.
+`{ "filing_session_id", "order_id", "entity_name": "<as the GET returned it>", "statement_version": "ss4-designee-2026-11-26", "signer_name": "Ada Lovelace", "signer_title"?: "Managing Member", "consent": true }`
+→ `201 { "status": "signed", "already_signed": false, "signature": { "statement_version", "signer_name", "signer_title", "entity_name", "signed_at", "authority_expires_at" } }`,
+or `200` with `"already_signed": true` and the **first** signature unchanged if the session
+already signed this version (tell the customer it was signed before; nothing new was stored).
+`400 consent_required | signer_name_required | invalid_signer_title | entity_name_required | statement_version_required`;
+`409 entity_name_changed` (with the current `entity_name`) when the LLC name changed since
+the page showed it; `409 statement_changed` (with the current `statement`) when the page
+showed an older wording.
 
 Stored in `ein_designee_authorizations` (one row per session and version): the typed name
 and title, the LLC name shown, the version, the full statement text and its SHA-256, the
-server's signing time, `authority_expires_at` (one year later, clause 1), the client IP
-(`True-Client-IP`) and the user agent. Not printed on the SS-4 and not copied to Zoho.
+server's signing time, `authority_expires_at` (one year later, clause 1; the EIN
+assignment end is not tracked here), the client IP (`True-Client-IP`, kept only if it is a
+valid IP address; no fallback to the proxy's address), the raw `X-Forwarded-For` chain and
+the user agent. A signature does not prove payment: a held card can later be released, so
+the SS-4 step must check the order again. Not printed on the SS-4 and not copied to Zoho.
 Still open with Damian: the designee's phone and fax for the SS-4, and whether a Form 2848
 is needed instead (O22).
 

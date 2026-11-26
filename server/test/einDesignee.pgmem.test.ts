@@ -105,6 +105,7 @@ const sign = (over: Record<string, unknown> = {}) => ({
   statement_version: SS4_DESIGNEE_STATEMENT_VERSION,
   signer_name: "Ada Lovelace",
   signer_title: "Managing Member",
+  entity_name: "Sunshine Widgets LLC",
   consent: true,
   ...over,
 });
@@ -140,6 +141,8 @@ describe("input checks", () => {
     expect(cleanSignerText("12345", 200)).toBeNull();
     expect(cleanSignerText("x".repeat(201), 200)).toBeNull();
     expect(cleanSignerText(42, 200)).toBeNull();
+    expect(cleanSignerText("Ada\u200b Love\u202elace", 200)).toBe("Ada Lovelace");
+    expect(cleanSignerText("Jose\u0301", 200)).toBe("Jos\u00e9");
   });
 
   it("needs consent, a name and the current version", () => {
@@ -148,11 +151,18 @@ describe("input checks", () => {
     expect(checkSignatureInput(sign({ signer_title: "!!" }))).toMatchObject({ ok: false, status: 400, error: "invalid_signer_title" });
     expect(checkSignatureInput(sign({ statement_version: undefined }))).toMatchObject({ ok: false, status: 400 });
     expect(checkSignatureInput(sign({ statement_version: "ss4-designee-2026-01-01" }))).toMatchObject({ ok: false, status: 409, error: "statement_changed" });
-    expect(checkSignatureInput(sign({ signer_title: undefined }))).toEqual({ ok: true, signerName: "Ada Lovelace", signerTitle: null });
+    expect(checkSignatureInput(sign({ entity_name: " " }))).toMatchObject({ ok: false, status: 400, error: "entity_name_required" });
+    expect(checkSignatureInput(sign({ signer_title: undefined }))).toEqual({
+      ok: true,
+      signerName: "Ada Lovelace",
+      signerTitle: null,
+      shownEntityName: "SUNSHINE WIDGETS LLC",
+    });
   });
 
   it("ends the authority one year after signing", () => {
     expect(authorityExpiresAt(NOW).toISOString()).toBe("2027-11-26T15:00:00.000Z");
+    expect(authorityExpiresAt(new Date("2028-02-29T12:00:00Z")).toISOString()).toBe("2029-02-28T12:00:00.000Z");
   });
 });
 
@@ -203,10 +213,15 @@ describe("POST /api/ein/designee-authorization", () => {
 
   it("stores the signature with the server's time, IP, version and the exact text", async () => {
     const t = await setup();
-    const res = await t.post(sign(), { "True-Client-IP": "203.0.113.7", "User-Agent": "TestBrowser/1.0" });
+    const res = await t.post(sign(), {
+      "True-Client-IP": "203.0.113.7",
+      "X-Forwarded-For": "203.0.113.7, 10.0.0.1",
+      "User-Agent": "TestBrowser/1.0",
+    });
     expect(res.status).toBe(201);
     expect(await res.json()).toEqual({
       status: "signed",
+      already_signed: false,
       signature: {
         statement_version: SS4_DESIGNEE_STATEMENT_VERSION,
         signer_name: "Ada Lovelace",
@@ -226,6 +241,7 @@ describe("POST /api/ein/designee-authorization", () => {
       statement_sha256: SS4_DESIGNEE_STATEMENT_SHA256,
       consent: true,
       ip: "203.0.113.7",
+      forwarded_for: "203.0.113.7, 10.0.0.1",
       user_agent: "TestBrowser/1.0",
     });
     expect(new Date(rows[0].signed_at).toISOString()).toBe(NOW.toISOString());
@@ -239,8 +255,24 @@ describe("POST /api/ein/designee-authorization", () => {
     expect((await t.post(sign())).status).toBe(201);
     const again = await t.post(sign({ signer_name: "Someone Else" }));
     expect(again.status).toBe(200);
-    expect(((await again.json()) as any).signature.signer_name).toBe("Ada Lovelace");
+    const body = (await again.json()) as any;
+    expect(body.already_signed).toBe(true);
+    expect(body.signature.signer_name).toBe("Ada Lovelace");
     expect((await t.pool.query("SELECT count(*)::int AS n FROM ein_designee_authorizations")).rows[0].n).toBe(1);
+  });
+
+  it("stores no IP when the header is missing or is not an IP address", async () => {
+    const t = await setup();
+    expect((await t.post(sign(), { "True-Client-IP": "<script>not-an-ip" })).status).toBe(201);
+    expect((await t.pool.query("SELECT ip FROM ein_designee_authorizations")).rows[0].ip).toBeNull();
+  });
+
+  it("refuses with 409 when the LLC name changed since the page showed it", async () => {
+    const t = await setup();
+    const res = await t.post(sign({ entity_name: "Old Name LLC" }));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "entity_name_changed", entity_name: "SUNSHINE WIDGETS LLC" });
+    expect((await t.post(sign({ entity_name: "  sunshine   widgets llc " }))).status).toBe(201);
   });
 
   it("refuses an older wording with 409 and sends the current statement", async () => {
@@ -268,7 +300,7 @@ describe("POST /api/ein/designee-authorization", () => {
 
   it("is 409 when the interview has no LLC name to show above the statement", async () => {
     const t = await setup();
-    const res = await t.post(sign({ filing_session_id: S_NONAME, order_id: O_NONAME }));
+    const res = await t.post(sign({ filing_session_id: S_NONAME, order_id: O_NONAME, entity_name: "Anything LLC" }));
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ error: "entity_name_missing" });
   });

@@ -21,6 +21,7 @@
  * unchanged (ein/onboarding.ts, ein/portalJobs.ts).
  */
 import { createHash } from "node:crypto";
+import { isIP } from "node:net";
 import { einIncluded } from "./onboarding.js";
 import { orderedOfferCodes } from "../offers/einUpsell.js";
 import type { Db } from "../postFiling/interests.js";
@@ -48,10 +49,16 @@ export const SS4_DESIGNEE_STATEMENT_TEXT = [
 
 export const SS4_DESIGNEE_STATEMENT_SHA256 = createHash("sha256").update(SS4_DESIGNEE_STATEMENT_TEXT, "utf8").digest("hex");
 
-/** Clause 1: the authority ends one year after signing (or at EIN assignment, if sooner). */
+/**
+ * Clause 1: the authority ends one year after signing (or at EIN assignment, if
+ * sooner; that is not tracked here, so the SS-4 step must check it). Signed on
+ * 29 February, it ends on 28 February, never on 1 March.
+ */
 export function authorityExpiresAt(signedAt: Date): Date {
   const d = new Date(signedAt.getTime());
+  const month = d.getUTCMonth();
   d.setUTCFullYear(d.getUTCFullYear() + 1);
+  if (d.getUTCMonth() !== month) d.setUTCDate(0);
   return d;
 }
 
@@ -68,26 +75,35 @@ const NAME_MAX = 200;
 const TITLE_MAX = 100;
 
 /**
- * A typed name made safe to store: control characters removed, spaces
- * collapsed, trimmed. Null when it is empty, too long, or has no letter.
+ * A typed name made safe to store: Unicode-normalized (NFC), control and
+ * invisible format characters removed, spaces collapsed, trimmed. Null when it is empty, too long, or has no letter.
  */
 export function cleanSignerText(value: unknown, max: number): string | null {
   if (typeof value !== "string") return null;
-  // eslint-disable-next-line no-control-regex
-  const t = value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+  const t = value
+    .normalize("NFC")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    // Invisible format characters (zero-width, bidirectional overrides).
+    .replace(/\p{Cf}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
   if (!t || t.length > max || !/\p{L}/u.test(t)) return null;
   return t;
 }
 
 export type SignatureInput =
-  | { ok: true; signerName: string; signerTitle: string | null }
+  | { ok: true; signerName: string; signerTitle: string | null; shownEntityName: string }
   | { ok: false; status: 400 | 409; error: string };
 
 /**
  * Checks the body of a signing request. The customer must send the version of
  * the statement they were shown (409 "statement_changed" if it is not the
  * current one, so the page reloads the new text), consent: true, and their
- * typed full legal name. The title (member, manager, officer) is optional.
+ * typed full legal name, and the LLC name the page showed above the statement
+ * (entity_name, from the GET; the route answers 409 "entity_name_changed" if the
+ * interview's LLC name has changed since). The title (member, manager, officer)
+ * is optional.
  */
 export function checkSignatureInput(body: Record<string, unknown>): SignatureInput {
   if (body.consent !== true) return { ok: false, status: 400, error: "consent_required" };
@@ -98,9 +114,18 @@ export function checkSignatureInput(body: Record<string, unknown>): SignatureInp
     signerTitle = cleanSignerText(body.signer_title, TITLE_MAX);
     if (!signerTitle) return { ok: false, status: 400, error: "invalid_signer_title" };
   }
+  const shownEntityName = normalizeEntityName(body.entity_name);
+  if (!shownEntityName) return { ok: false, status: 400, error: "entity_name_required" };
   if (typeof body.statement_version !== "string") return { ok: false, status: 400, error: "statement_version_required" };
   if (body.statement_version !== SS4_DESIGNEE_STATEMENT_VERSION) return { ok: false, status: 409, error: "statement_changed" };
-  return { ok: true, signerName, signerTitle };
+  return { ok: true, signerName, signerTitle, shownEntityName };
+}
+
+/** The LLC name as SS-4 line 1 prints it: trimmed, spaces collapsed, upper case. Null when empty. */
+export function normalizeEntityName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const t = value.normalize("NFC").replace(/\s+/g, " ").trim().toUpperCase();
+  return t && t.length <= 300 ? t : null;
 }
 
 export interface DesigneeSession {
@@ -124,8 +149,7 @@ export async function designeeSession(db: Db, filingSessionId: string, orderId: 
   );
   if (rows.length === 0) return null;
   if (!einIncluded(await orderedOfferCodes(db, filingSessionId))) return null;
-  const name = typeof rows[0].llc_name === "string" ? rows[0].llc_name.trim().toUpperCase() : "";
-  return { entityName: name || null };
+  return { entityName: normalizeEntityName(rows[0].llc_name) };
 }
 
 export interface DesigneeSignature {
@@ -163,8 +187,17 @@ export async function readSignature(db: Db, filingSessionId: string): Promise<De
 
 export interface SignatureAudit {
   now: Date;
+  /** A valid IPv4 or IPv6 address, or null. */
   ip: string | null;
+  /** The raw X-Forwarded-For chain, kept as supporting evidence. */
+  forwardedFor: string | null;
   userAgent: string | null;
+}
+
+/** The value if it is an IPv4 or IPv6 address, else null: nothing else is stored as the signer's IP. */
+export function validIp(value: string | null | undefined): string | null {
+  const v = (value ?? "").trim();
+  return v.length <= 45 && isIP(v) ? v : null;
 }
 
 /**
@@ -184,8 +217,8 @@ export async function saveSignature(
   const inserted = await db.query(
     `INSERT INTO ein_designee_authorizations
        (filing_session_id, order_id, statement_version, statement_text, statement_sha256,
-        signer_name, signer_title, entity_name, consent, signed_at, authority_expires_at, ip, user_agent)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11, $12)
+        signer_name, signer_title, entity_name, consent, signed_at, authority_expires_at, ip, forwarded_for, user_agent)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11, $12, $13)
      ON CONFLICT (filing_session_id, statement_version) DO NOTHING
      RETURNING ${SIGNATURE_COLUMNS}`,
     [
@@ -199,7 +232,8 @@ export async function saveSignature(
       input.entityName,
       audit.now.toISOString(),
       authorityExpiresAt(audit.now).toISOString(),
-      audit.ip,
+      validIp(audit.ip),
+      audit.forwardedFor ? audit.forwardedFor.slice(0, 300) : null,
       audit.userAgent ? audit.userAgent.slice(0, 300) : null,
     ],
   );

@@ -1,7 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { pool } from "../db/pool.js";
 import { describeError } from "../db/describeError.js";
-import { clientKey } from "../middleware/rateLimit.js";
 import { isUuid, type Db } from "../postFiling/interests.js";
 import {
   SS4_DESIGNEE_STATEMENT_CLAUSES,
@@ -21,13 +20,26 @@ import {
 } from "../ein/designee.js";
 
 /**
+ * The signer's IP from the header Render's edge sets (True-Client-IP, or
+ * RATE_LIMIT_CLIENT_IP_HEADER), first entry only. Unlike the rate limiter's
+ * clientKey, there is no fallback to the socket address: behind Render that is
+ * the proxy, which would look like real evidence but is not. designee.ts keeps it
+ * only if it is a valid IP address.
+ */
+function signerIp(req: Request): string | null {
+  const header = process.env.RATE_LIMIT_CLIENT_IP_HEADER ?? "true-client-ip";
+  return header ? (req.get(header)?.split(",")[0]?.trim() ?? null) : null;
+}
+
+/**
  * ST17: the IRS Form SS-4 Third-Party Designee e-signature.
  *
  *   GET  /api/ein/designee-authorization?filing_session_id=…&order_id=…
  *        -> 200 { status: "open", entity_name, statement, signature | null }
  *   POST /api/ein/designee-authorization
- *        { filing_session_id, order_id, statement_version, signer_name, signer_title?, consent: true }
- *        -> 201 { status: "signed", signature }   (200 if it was already signed)
+ *        { filing_session_id, order_id, entity_name, statement_version, signer_name, signer_title?, consent: true }
+ *        -> 201 { status: "signed", already_signed: false, signature }
+ *           (200 with already_signed: true and the first signature if it was already signed)
  *
  * Both need the filing session and one of its held or paid orders (the pair in the
  * Stripe success URL), and the session's paid or held orders must include the EIN;
@@ -35,6 +47,7 @@ import {
  * exists. 503 "not_open" while switched off (default; EIN_DESIGNEE_ESIGN_ENABLED=true
  * turns it on) or before migration 0040 is applied. 409 "entity_name_missing" when the
  * interview has no LLC name yet (the statement refers to "the entity listed above"),
+ * 409 "entity_name_changed" when the LLC name changed since the page showed it, and
  * 409 "statement_changed" when the page showed an older wording. Rate-limited per IP
  * in middleware/funnelProtection.ts.
  */
@@ -115,13 +128,23 @@ export function createEinDesigneeRouter(
         res.status(409).json({ error: "entity_name_missing" });
         return;
       }
-      const ip = clientKey(req);
+      // The record must name the LLC the customer saw above the statement.
+      if (input.shownEntityName !== session.entityName) {
+        res.status(409).json({ error: "entity_name_changed", entity_name: session.entityName });
+        return;
+      }
       const { signature, created } = await saveSignature(
         db,
         { filingSessionId: sid, orderId: oid, signerName: input.signerName, signerTitle: input.signerTitle, entityName: session.entityName },
-        { now: now(), ip: ip === "unknown" ? null : ip, userAgent: req.get("user-agent") ?? null },
+        {
+          now: now(),
+          ip: signerIp(req),
+          forwardedFor: req.get("x-forwarded-for") ?? null,
+          userAgent: req.get("user-agent") ?? null,
+        },
       );
-      res.status(created ? 201 : 200).json({ status: "signed", signature });
+      // already_signed: this session signed before; the first signature stands and this request stored nothing.
+      res.status(created ? 201 : 200).json({ status: "signed", already_signed: !created, signature });
     } catch (err) {
       failed(res, err, "save");
     }
