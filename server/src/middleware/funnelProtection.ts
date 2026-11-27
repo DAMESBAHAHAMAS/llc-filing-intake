@@ -31,6 +31,7 @@ export function applyFunnelProtection(
   // Scorecard sign-up sends email: capped like the other email-sending endpoint.
   app.use("/api/scorecard/signup", limits.scorecardSignup);
   app.use("/api/post-filing-interests", limits.postFilingInterests);
+  app.use("/api/ein/designee-authorization", limits.einDesignee);
 
   return limits;
 }

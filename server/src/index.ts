@@ -15,6 +15,7 @@ import { ordersRouter } from "./routes/orders.js";
 import { scorecardRouter } from "./routes/scorecard.js";
 import { einOnboardingRouter } from "./routes/einOnboarding.js";
 import { postFilingInterestsRouter } from "./routes/postFilingInterests.js";
+import { einDesigneeRouter } from "./routes/einDesignee.js";
 import { formationDocumentsRouter } from "./routes/formationDocuments.js";
 import { defaultOaDeps, isMissingTable, runOperatingAgreementJobOnce } from "./formation/operatingAgreementJob.js";
 import { defaultPostFilingDeps, runPostFilingSyncOnce } from "./postFiling/interests.js";
@@ -73,6 +74,7 @@ app.use(ordersRouter);
 app.use(scorecardRouter);
 app.use(einOnboardingRouter);
 app.use(postFilingInterestsRouter);
+app.use(einDesigneeRouter);
 app.use(formationDocumentsRouter);
 
 const port = Number(process.env.PORT ?? 3000);

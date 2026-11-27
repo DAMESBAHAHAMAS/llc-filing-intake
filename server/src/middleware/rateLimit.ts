@@ -125,6 +125,8 @@ export function funnelRateLimiters() {
     // Post-filing roadmap toggles on the Thank You page (Dispatch 13): a few clicks per
     // customer; each change queues one Zoho Deal update.
     postFilingInterests: createRateLimiter({ name: "post-filing-interests", windowMs: 10 * MINUTE, max: envInt("RATE_LIMIT_POST_FILING_PER_10MIN", 30) }),
+    // SS-4 Third-Party Designee e-signature (ST17): one page load and one signature per customer.
+    einDesignee: createRateLimiter({ name: "ein-designee", windowMs: 10 * MINUTE, max: envInt("RATE_LIMIT_EIN_DESIGNEE_PER_10MIN", 30) }),
     // Cheap reads.
     reads: createRateLimiter({ name: "reads", windowMs: MINUTE, max: envInt("RATE_LIMIT_READS_PER_MIN", 120) }),
   };

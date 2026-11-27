@@ -249,6 +249,44 @@ request: it is the Deal of the session's earliest held or paid order whose Deal 
 a sync job (the EIN portal's `VERIFIED_DEAL_JOIN`). Retries for about 3 days, then an ops
 alert (one per cause per 6 hours).
 
+## SS-4 Third-Party Designee e-signature (ST17)
+
+**Off by default.** Both calls answer `503 { "error": "not_open" }` until
+`EIN_DESIGNEE_ESIGN_ENABLED=true` (Damian's switch) and migration 0040 is applied. The
+customer types their full legal name under Damian's approved wording (version
+`ss4-designee-2026-11-26`, `src/ein/designee.ts`; do not edit it, add a new version).
+Both calls need the filing session **and** one of its held or paid orders (the pair in the
+Stripe success URL), and the session's held or paid orders must include the EIN (a
+Bank-Ready or Premium bundle, or an EIN add-on); anything else is `404 not_found`. `400
+invalid_request` for malformed ids, `429` past `RATE_LIMIT_EIN_DESIGNEE_PER_10MIN`
+(default 30 per IP).
+
+### `GET /api/ein/designee-authorization?filing_session_id=…&order_id=…`
+→ `{ "status": "open", "entity_name": "SUNSHINE WIDGETS LLC" | null, "statement": { "version", "title", "intro", "clauses": [3], "text", "sha256" }, "signature": {…} | null }`
+
+Show `entity_name` above the statement ("the entity listed above"); while it is null the
+POST answers `409 entity_name_missing`.
+
+### `POST /api/ein/designee-authorization`
+`{ "filing_session_id", "order_id", "entity_name": "<as the GET returned it>", "statement_version": "ss4-designee-2026-11-26", "signer_name": "Ada Lovelace", "signer_title"?: "Managing Member", "consent": true }`
+→ `201 { "status": "signed", "already_signed": false, "signature": { "statement_version", "signer_name", "signer_title", "entity_name", "signed_at", "authority_expires_at" } }`,
+or `200` with `"already_signed": true` and the **first** signature unchanged if the session
+already signed this version (tell the customer it was signed before; nothing new was stored).
+`400 consent_required | signer_name_required | invalid_signer_title | entity_name_required | statement_version_required`;
+`409 entity_name_changed` (with the current `entity_name`) when the LLC name changed since
+the page showed it; `409 statement_changed` (with the current `statement`) when the page
+showed an older wording.
+
+Stored in `ein_designee_authorizations` (one row per session and version): the typed name
+and title, the LLC name shown, the version, the full statement text and its SHA-256, the
+server's signing time, `authority_expires_at` (one year later, clause 1; the EIN
+assignment end is not tracked here), the client IP (`True-Client-IP`, kept only if it is a
+valid IP address; no fallback to the proxy's address), the raw `X-Forwarded-For` chain and
+the user agent. A signature does not prove payment: a held card can later be released, so
+the SS-4 step must check the order again. Not printed on the SS-4 and not copied to Zoho.
+Still open with Damian: the designee's phone and fax for the SS-4, and whether a Form 2848
+is needed instead (O22).
+
 ## Registered agent (Path B — customer's own RA)
 
 Path A (house RA) needs **none of these endpoints** — the server always
