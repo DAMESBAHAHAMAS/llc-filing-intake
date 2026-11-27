@@ -26,7 +26,7 @@ function operatorAuthorized(req: Request): boolean {
  * POST /api/ops/operating-agreement/:orderId
  * Body (all optional): { inputs: OperatingAgreementInputs, banking_resolution_inputs,
  * filing_date: "YYYY-MM-DD", replace: boolean }. Generates and stores the agreement
- * (and the DRAFT Banking Resolution when BANKING_RESOLUTION_ENABLED=true) for a
+ * (and the Banking Resolution when BANKING_RESOLUTION_ENABLED=true) for a
  * Bank-Ready or Finance-Ready order with proof of filing. 422 lists missing answers.
  */
 formationDocumentsRouter.post("/api/ops/operating-agreement/:orderId", async (req, res) => {

@@ -11,7 +11,8 @@ import {
   runOperatingAgreementJobOnce,
   type OaDeps,
 } from "../src/formation/operatingAgreementJob.js";
-import { buildBankingResolutionContext } from "../src/pdf/bankingResolutionContext.js";
+import { buildBankingResolutionContext, BANKING_RESOLUTION_WORDING_VERSION } from "../src/pdf/bankingResolutionContext.js";
+import { fileURLToPath } from "node:url";
 
 const S1 = "11111111-1111-4111-8111-111111111111"; // Bank-Ready, single member
 const S2 = "22222222-2222-4222-8222-222222222222"; // File It, asked for an OA at Article VI
@@ -139,6 +140,8 @@ describe("Operating Agreement job (T144 D10)", () => {
     });
     expect(r.ok).toBe(true);
     expect(r.ok && r.banking_resolution).toMatchObject({ template: "banking_resolution_multi_member" });
+    const br = (await pool.query(`SELECT draft FROM formation_documents WHERE order_id = $1 AND kind = 'banking_resolution'`, [O3])).rows;
+    expect(br).toEqual([{ draft: false }]);
     expect((await statusOf(pool, "deal-3")).status).toBe(OA_STATUS.generated);
   });
 
@@ -162,18 +165,24 @@ describe("Operating Agreement job (T144 D10)", () => {
   });
 });
 
-describe("Banking Resolution (DRAFT) context", () => {
+describe("Banking Resolution context (approved wording v1)", () => {
   const filed = { filing_date: "2026-11-30", document_number: "L26000TEST10" };
-  it("builds a single-member resolution, always marked draft", () => {
+  it("builds a single-member resolution with the approved wording version, not draft", () => {
     const r = buildBankingResolutionContext(sm as never, filed);
     expect(r.ok && r.template).toBe("banking_resolution_single_member");
-    expect(r.ok && r.context).toMatchObject({ draft: true, llc_name: "TEST DISPATCH TEN SM LLC", adopted_by: "the sole member",
+    expect(r.ok && r.context).toMatchObject({ draft: false, wording_version: BANKING_RESOLUTION_WORDING_VERSION, llc_name: "TEST DISPATCH TEN SM LLC", adopted_by: "the sole member",
       authorized_signers: [{ name: "Jordan Test Rivera", title: "Sole Member" }], signing_rule_text: "acting alone" });
   });
   it("needs the owners of a manager-managed LLC and names the managers as signers", () => {
     expect(buildBankingResolutionContext(mgr as never, filed).ok).toBe(false);
     const r = buildBankingResolutionContext(mgr as never, filed, { members: [{ name: "A" }, { name: "B" }], signing_rule: "any_one" });
     expect(r.ok && r.context).toMatchObject({ adopted_by: "the sole manager", authorized_signers: [{ name: "Casey Test Morgan", title: "Manager" }] });
+  });
+  it("prints no DRAFT marks in the approved templates", () => {
+    for (const t of ["banking_resolution_single_member.html.j2", "banking_resolution_multi_member.html.j2", "partials/banking_resolution_body.html.j2"]) {
+      const html = readFileSync(fileURLToPath(new URL(`../../templates/${t}`, import.meta.url)), "utf8").replace(/\{#-[\s\S]*?-#\}/g, "");
+      expect(html).not.toMatch(/DRAFT|draft-watermark|draft-banner|pending owner approval/);
+    }
   });
   it("names every gap", () => {
     const r = buildBankingResolutionContext({}, {}, { signing_rule: "any_two" });

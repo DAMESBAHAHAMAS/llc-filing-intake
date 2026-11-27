@@ -5,10 +5,7 @@
 <title>Banking Resolution — {{ llc_name }}</title>
 {% include "partials/agreement_styles.html.j2" %}
 <style>
-  /* DRAFT marks: always printed (T144 D10). */
-  .draft-watermark { position: fixed; top: 42%; left: -8%; width: 116%; text-align: center; transform: rotate(-30deg);
-    font-size: 34pt; font-weight: 700; color: rgba(185, 28, 28, 0.12); letter-spacing: 2px; z-index: -1; }
-  @page { @top-center { content: "DRAFT – pending owner approval"; font-size: 8pt; color: #b91c1c; } @top-right { content: "Banking Resolution"; } }
+  @page { @top-right { content: "Banking Resolution"; } }
   @page :first { @top-right { content: none; } }
   table.signers { width: 100%; border-collapse: collapse; margin: 6px 0 4px; }
   table.signers th, table.signers td { text-align: left; border-bottom: 1px solid #e2e8f0; padding: 4px 6px; font-size: 10pt; }

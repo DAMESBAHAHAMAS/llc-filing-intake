@@ -19,7 +19,7 @@
  *      member-managed LLC with one member; otherwise (owners and percentages,
  *      borrowing limit, ...) ops is alerted once and generates it with POST
  *      /api/ops/operating-agreement/:orderId. The Banking Resolution is built
- *      alongside only when BANKING_RESOLUTION_ENABLED=true (DRAFT wording).
+ *      alongside only when BANKING_RESOLUTION_ENABLED=true (approved wording v1).
  *   3. sync: the row's CURRENT status is written to the Deal field
  *      (Operating_Agreement_Stat by default) whenever it differs from what was
  *      last written, so retries can never write an older status.
@@ -317,7 +317,7 @@ export async function generateForOrder(
       const bp = await deps.renderBankingResolution(b.template, b.context);
       if (!bp.ok) bankingOut = { error: bp.error };
       else {
-        await storeDocument(deps.db, o.order_id, o.filing_session_id, "banking_resolution", b.template, true, bp);
+        await storeDocument(deps.db, o.order_id, o.filing_session_id, "banking_resolution", b.template, b.context.draft === true, bp);
         bankingOut = { sha256: bp.sha256, byte_size: bp.pdfBytes.length, template: b.template };
       }
     }
