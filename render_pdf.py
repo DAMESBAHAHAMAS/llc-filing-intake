@@ -62,8 +62,8 @@ _DOCUMENT_LABELS = {
     "formation_cover_letter": "Cover_Letter",
     "formation_next_steps": "Next_Steps",
     "formation_placeholder_page": "Placeholder",
-    "banking_resolution_single_member": "Banking_Resolution_DRAFT",
-    "banking_resolution_multi_member": "Banking_Resolution_DRAFT",
+    "banking_resolution_single_member": "Banking_Resolution",
+    "banking_resolution_multi_member": "Banking_Resolution",
 }
 
 

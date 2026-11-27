@@ -1,15 +1,19 @@
 /**
- * Banking Resolution — context builder (T144 Dispatch 10, DRAFT).
+ * Banking Resolution — context builder (T144 Dispatch 10).
  *
  * Damian asked (25 Nov 2026) for standard single- and multi-member LLC banking
- * resolutions "for my review". The wording in templates/banking_resolution_*
- * is a DRAFT: every page prints "DRAFT – pending owner approval" whatever the
- * settings, and nothing generates it unless BANKING_RESOLUTION_ENABLED=true
- * (off by default). Same contract as the Operating Agreement: a missing value
- * is a named gap, never invented.
+ * resolutions "for my review" and approved the wording in
+ * templates/banking_resolution_* on 27 Nov 2026 as version 1 ("I'm gonna have
+ * to give that a version 2 later, but for now that is approved"). The DRAFT
+ * marks are gone; nothing generates it unless BANKING_RESOLUTION_ENABLED=true
+ * (off by default; switching it on is Damian's call). Same contract as the
+ * Operating Agreement: a missing value is a named gap, never invented.
  */
 import type { FilingSessionRecord } from "./types.js";
 import { formatLegalDate, type FiledArticles } from "./operatingAgreementContext.js";
+
+/** Approved wording version. Bump it, with Damian's approval, whenever the template wording changes. */
+export const BANKING_RESOLUTION_WORDING_VERSION = "banking-resolution-v1-2026-11-27";
 
 export type BankingResolutionTemplate = "banking_resolution_single_member" | "banking_resolution_multi_member";
 export type SigningRule = "any_one" | "any_two" | "all";
@@ -27,7 +31,7 @@ export type BankingResolutionContextResult =
   | { ok: true; template: BankingResolutionTemplate; context: Record<string, unknown> }
   | { ok: false; missingFields: string[] };
 
-/** Off unless BANKING_RESOLUTION_ENABLED=true (Damian has not approved the wording). */
+/** Off unless BANKING_RESOLUTION_ENABLED=true. The wording is approved (v1); switching on is Damian's call. */
 export function bankingResolutionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.BANKING_RESOLUTION_ENABLED === "true";
 }
@@ -100,7 +104,8 @@ export function buildBankingResolutionContext(
     ok: true,
     template: single ? "banking_resolution_single_member" : "banking_resolution_multi_member",
     context: {
-      draft: true,
+      draft: false,
+      wording_version: BANKING_RESOLUTION_WORDING_VERSION,
       llc_name: llcName,
       document_number: docNo,
       filing_date: filingDate,

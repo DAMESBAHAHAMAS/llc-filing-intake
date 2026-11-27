@@ -357,7 +357,7 @@ expiring URL per decision boundary #1) is not yet built.
   - **Register:** every verified Deal of a held or paid order gets a row: "Pending Generation" for Bank-Ready (FASTTRACK) and Finance-Ready (PREMIUM), otherwise "Not Included".
   - **Generate:** after proof of filing, the agreement is generated and stored in `formation_documents`.
   - **Sync:** the current status is written to the Deal field `Operating_Agreement_Stat`. `OA_DEAL_STATUS_FIELD` overrides the field name; `off` disables the write.
-- `POST /api/ops/operating-agreement/:orderId` (header `x-operator-key`). Body: `{ inputs?, banking_resolution_inputs?, filing_date?: "YYYY-MM-DD", replace?: boolean }`. Generates and stores the agreement (plus the DRAFT Banking Resolution when `BANKING_RESOLUTION_ENABLED=true`). Responses:
+- `POST /api/ops/operating-agreement/:orderId` (header `x-operator-key`). Body: `{ inputs?, banking_resolution_inputs?, filing_date?: "YYYY-MM-DD", replace?: boolean }`. Generates and stores the agreement (plus the Banking Resolution, approved wording v1, when `BANKING_RESOLUTION_ENABLED=true`). Responses:
   - `422 { missingFields }` when answers are missing.
   - `409` when the package does not include the agreement, no proof of filing is recorded, or the agreement was already generated (pass `replace: true` to regenerate).
 - `GET /api/ops/formation-documents/:orderId/:kind` (`operating_agreement` | `banking_resolution`) returns the stored PDF. Headers: `X-Content-SHA256`, `X-Draft`.

@@ -37,7 +37,7 @@ export async function generateOperatingAgreementPdf(
   return generatePdf(template, context);
 }
 
-/** T144 D10: the Banking Resolution (DRAFT wording; generated only when BANKING_RESOLUTION_ENABLED=true). */
+/** T144 D10: the Banking Resolution (approved wording v1; generated only when BANKING_RESOLUTION_ENABLED=true). */
 export async function generateBankingResolutionPdf(
   template: "banking_resolution_single_member" | "banking_resolution_multi_member",
   context: Record<string, unknown>
